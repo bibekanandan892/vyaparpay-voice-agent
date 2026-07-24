@@ -1,0 +1,47 @@
+# --- Android / Gradle ---
+*.iml
+.gradle/
+android/local.properties
+android/build/
+android/**/build/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.keystore
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Docker / infra local state ---
+infra/docker/volumes/
