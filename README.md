@@ -1,12 +1,13 @@
 # VyaparPay Voice Support Agent
 
-> A voice AI support agent that can **see the user's screen** — real-time WebRTC voice, live Android app context, and a typed LLM tool layer, so it opens a support call already knowing what went wrong.
+> A voice AI support agent that can **see the user's screen** — raw WebRTC voice (libwebrtc ↔ aiortc, own signaling), live Android app context, and a typed LLM tool layer, so it opens a support call already knowing what went wrong.
 
 ![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?logo=kotlin&logoColor=white)
 ![Jetpack Compose](https://img.shields.io/badge/Jetpack%20Compose-4285F4?logo=jetpackcompose&logoColor=white)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
-![LiveKit](https://img.shields.io/badge/LiveKit-WebRTC-1FD5F9)
+![WebRTC](https://img.shields.io/badge/WebRTC-raw%20%7C%20libwebrtc%20%2B%20aiortc-333333?logo=webrtc&logoColor=white)
+![coturn](https://img.shields.io/badge/coturn-STUN%2FTURN-E95420)
 ![Deepgram](https://img.shields.io/badge/Deepgram-Nova--3%20STT-13EF93)
 ![ElevenLabs](https://img.shields.io/badge/ElevenLabs-Flash%20v2.5%20TTS-000000)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-Claude%20Sonnet%205-6566F1)
@@ -58,6 +59,7 @@ The full 9-turn annotated transcript — with per-turn *Knew / Tool / Latency* b
 - **The agent sees the screen, cheaply.** A raw Compose semantics tree is ~214 nodes / **~4,000+ tokens**; `SemanticSnapshotBuilder` compresses it on-device to a **≤300-token** role-based IR (`screen_context/v1`) — a >13× reduction that is *more* informative than the raw tree, because it carries the `402` decline code that was never drawn. This is a domain-specific compiler, not a JSON dump ([docs/07](docs/07-ui-semantic-context.md)).
 - **The voice loop is sub-second, with barge-in.** Everything streams — STT partials, LLM tokens, sentence-chunked TTS — for a turn budget of **p50 ≤ 1.0 s, p95 ≤ 2.0 s**, and interruption (TTS stop) within **≤ 250 ms** ([docs/06](docs/06-voice-pipeline.md)).
 - **The tool layer does not hallucinate.** Sixteen typed (Pydantic in/out) tools; the LLM never states an account fact a read tool can fetch, and every mutating tool (`request_limit_increase`, `block_card`, …) requires a voiced confirmation and an explicit "yes" before it runs — idempotency-keyed and scoped to the authenticated session user ([docs/10](docs/10-tool-calling.md)).
+- **The WebRTC stack is hand-rolled, both ends.** No managed platform: the Android app (libwebrtc via `org.webrtc`) and the Python agent (aiortc) are two direct peers, with an owned WebSocket signaling protocol (SDP offer/answer + trickle ICE), self-hosted coturn for STUN/TURN, and a native `RTCDataChannel` — the protocol-level engineering most voice stacks outsource ([docs/06](docs/06-voice-pipeline.md)).
 
 ---
 
@@ -105,12 +107,12 @@ The transform runs on the UI thread in ≤2 ms, redacts sensitive fields (card/P
 flowchart LR
     subgraph Android["Android app (Kotlin / Compose)"]
         UI["UiTreeCollector → SemanticSnapshotBuilder"]
-        RTC["WebRtcClient"]
+        RTC["WebRtcClient (libwebrtc)"]
     end
-    LK["LiveKit SFU (self-hosted)"]
+    TURN["coturn — STUN/TURN (NAT traversal)"]
     subgraph Backend["Backend (Python 3.12)"]
         API["agent-api (FastAPI)"]
-        VW["voice-worker (LiveKit Agents)"]
+        VW["voice-worker (aiortc PeerSession)"]
     end
     subgraph Providers["Providers (behind owned interfaces)"]
         STT["Deepgram STT"]
@@ -121,9 +123,10 @@ flowchart LR
     RD[("Redis 7")]
 
     UI -->|"screen_context/v1 snapshot @ POST /v1/sessions"| API
-    RTC <-->|"Opus audio"| LK
-    UI -.->|"ctx deltas + events (data channel, topic ctx)"| LK
-    LK <--> VW
+    RTC -->|"/v1/signal WS (SDP + trickle ICE)"| VW
+    RTC <-->|"Opus/SRTP audio + RTCDataChannel (label ctx)"| VW
+    RTC -.-> TURN
+    VW -.-> TURN
     VW --> STT
     VW --> LLM
     VW --> TTS
@@ -133,7 +136,7 @@ flowchart LR
     VW --> DB
 ```
 
-Two backend services share one `app/` package: **agent-api** (sessions, seeded business APIs, context ingestion) and **voice-worker** (joins the room, runs the pipeline). The initial snapshot rides REST so the greeting is ready before the room exists; in-call deltas ride the LiveKit data channel. Full topology in [docs/02](docs/02-system-architecture.md).
+Two backend services share one `app/` package: **agent-api** (sessions — mints the signaling token and HMAC TURN credentials — seeded business APIs, context ingestion) and **voice-worker** (hosts the `/v1/signal` WebSocket, owns the aiortc peer, runs the pipeline). The initial snapshot rides REST so the greeting is ready before the peer connection exists; in-call deltas ride the `ctx` data channel. Full topology in [docs/02](docs/02-system-architecture.md).
 
 ---
 
@@ -142,9 +145,10 @@ Two backend services share one `app/` package: **agent-api** (sessions, seeded b
 | Layer | Choice | Why (one line) |
 |---|---|---|
 | Android | Kotlin + Jetpack Compose | Compose's accessibility semantics tree is exactly what `UiTreeCollector` mines for ScreenContext |
-| Realtime transport | LiveKit (self-hosted SFU) | SFU + TURN + Opus + data channel in one container instead of five subsystems (ADR-001) |
+| Realtime transport | Raw WebRTC — libwebrtc (`org.webrtc`) ↔ aiortc | Two direct 1:1 peers, no media server; we own SDP offer/answer, trickle ICE, and DTLS-SRTP end to end (ADR-001) |
+| NAT traversal | coturn (self-hosted STUN/TURN) | Symmetric NAT on Indian mobile carriers needs TURN; per-session HMAC time-limited credentials (ADR-006) |
 | Backend | Python 3.12 + FastAPI | Voice-AI ecosystem gravity; async-native, Pydantic validation at the boundary |
-| Voice orchestration | LiveKit Agents | The framework moves audio; we own the intelligence (ADR-002) |
+| Voice pipeline | Hand-rolled asyncio — Silero VAD, own endpointing + barge-in | The pipeline is the deliverable; agent frameworks would re-hide it (ADR-002) |
 | STT | Deepgram Nova-3 (streaming) | Streaming partials, ~80 ms finalization after endpoint |
 | Dialogue LLM | Claude Sonnet 5 via OpenRouter | Tool-calling + tone; one wire format, per-request fallback arrays |
 | Utility LLM | Claude Haiku 4.5 | Summarization every 6 turns, intent classification, context compression |
@@ -163,21 +167,21 @@ A seventeen-document architecture set, complete for Phase 1. Start at the [docs 
 | # | Document | Covers |
 |---|---|---|
 | 01 | [Product & Use-Case](docs/01-product-and-use-case.md) | Weighted domain choice, product surface, Rajesh's incident, the 9-turn transcript |
-| 02 | [System Architecture](docs/02-system-architecture.md) | The two-service split, component map, room/request topology |
+| 02 | [System Architecture](docs/02-system-architecture.md) | The two-service split, component map, call/request topology |
 | 03 | [Android Architecture](docs/03-android-architecture.md) | Gradle module graph, call UI, foreground call service |
 | 04 | [Backend Architecture](docs/04-backend-architecture.md) | FastAPI layout, async discipline, the `app/` package split |
 | 05 | [Agent Architecture](docs/05-agent-architecture.md) | The intelligence loop: context → prompt → tool → route → safety |
-| 06 | [Voice Pipeline](docs/06-voice-pipeline.md) | LiveKit transport, streamed STT→LLM→TTS, barge-in, **the latency budget** |
+| 06 | [Voice Pipeline](docs/06-voice-pipeline.md) | Raw WebRTC transport (signaling, ICE, aiortc), streamed STT→LLM→TTS, barge-in, **the latency budget** |
 | 07 | [UI Semantic Context](docs/07-ui-semantic-context.md) | Compose tree → ScreenContext IR (**owns `screen_context/v1`**) |
 | 08 | [Context & Events](docs/08-context-and-events.md) | Snapshot/delta/event ingestion, the ring buffer, data-channel envelope |
 | 09 | [Memory Architecture](docs/09-memory-architecture.md) | Short-term / session / profile / semantic tiers, rolling summary, pgvector |
 | 10 | [Tool-Calling](docs/10-tool-calling.md) | The 16-tool catalog, typed contracts, confirm-required mutations, idempotency |
 | 11 | [Prompt Engineering](docs/11-prompt-engineering.md) | The slot budget, prefix caching, persona/voice rules (**owns token numbers**) |
 | 12 | [Data Models](docs/12-data-models.md) | Pydantic + SQLAlchemy schemas, seeded fixtures, the Redis keyspace |
-| 13 | [API Contracts](docs/13-api-contracts.md) | REST endpoints, `POST /v1/sessions`, wire formats (**co-owns schemas**) |
+| 13 | [API Contracts](docs/13-api-contracts.md) | REST endpoints, `POST /v1/sessions`, the `/v1/signal` protocol, wire formats (**co-owns schemas**) |
 | 14 | [Security](docs/14-security.md) | Prompt-injection fencing, PII redaction, token TTL, tool authorization |
 | 15 | [Scalability & Reliability](docs/15-scalability-and-reliability.md) | Failure-mode tables, degradation ladder, single-machine → multi-node |
-| 16 | [Tech Stack & ADRs](docs/16-tech-stack.md) | Five ADRs with flip conditions, model/pricing, **cost per call** |
+| 16 | [Tech Stack & ADRs](docs/16-tech-stack.md) | Six ADRs with flip conditions, model/pricing, **cost per call** |
 | 17 | [Roadmap](docs/17-roadmap.md) | Six phases, the MVP line, the post-Phase-6 catalog |
 
 ---
@@ -194,7 +198,7 @@ voice-calling-agent/
 │   │   ├── analytics/       # EventTracker — 50-entry action ring buffer
 │   │   └── ui/              # shared Compose components
 │   ├── feature/             # dashboard, payments, support (SupportButton, ConversationOverlay)
-│   └── voice/               # WebRtcClient, VoiceCallService, CallStateMachine
+│   └── voice/               # WebRtcClient (org.webrtc), SignalingClient, VoiceCallService, CallStateMachine
 ├── backend/                 # Python 3.12 — agent-api + voice-worker share one app/ package
 │   ├── app/
 │   │   ├── agent/           # SessionManager, ContextBuilder, PromptBuilder, ToolExecutor, LLMRouter, SafetyLayer
@@ -202,12 +206,12 @@ voice-calling-agent/
 │   │   ├── memory/          # short-term / session / profile / semantic (pgvector)
 │   │   ├── tools/           # 16-tool catalog, typed Pydantic contracts
 │   │   ├── providers/       # OpenRouterLLM, DeepgramStt, ElevenLabsTts, OpenAIEmbeddings
-│   │   ├── voice/           # VoiceAgentWorker — the LiveKit Agents adapter
+│   │   ├── voice/           # SignalingServer, PeerSession (aiortc), VadEndpointer — hand-rolled WebRTC + voice pipeline
 │   │   ├── api/             # FastAPI routes (POST /v1/sessions, seeded business APIs)
 │   │   └── models/          # Pydantic + SQLAlchemy
 │   └── tests/
 ├── protocol/                # Cross-language wire schemas (screen_context/v1, app_event/v1)
-├── infra/                   # docker-compose stack: LiveKit, Postgres, Redis, Grafana/Tempo
+├── infra/                   # docker-compose stack: coturn, Postgres, Redis, Grafana/Tempo
 └── docs/                    # 17-document architecture set (start at docs/README.md)
 ```
 
@@ -219,7 +223,7 @@ voice-calling-agent/
 |---|---|---|
 | 1 — Architecture | This documentation set; the design a reviewer can audit before code | ✅ |
 | 2 — Backend MVP | Compose stack, seeded business APIs, text-chat agent loop, tools end-to-end | ⬜ |
-| 3 — Voice MVP | LiveKit + Deepgram + ElevenLabs pipeline, Android call UI | ⬜ |
+| 3 — Voice MVP (raw WebRTC) | SignalingServer + coturn + aiortc PeerSession, Silero VAD pipeline, Deepgram/ElevenLabs streaming, Android `org.webrtc` call UI | ⬜ |
 | 4 — Screen-aware context | `UiTreeCollector` → ScreenContext → prompt | ⬜ |
 | 5 — Memory + RAG | Memory tiers, pgvector retrieval, observability dashboard | ⬜ |
 | 6 — Production hardening | Security pass, evals, load tests, CI/CD, docs polish | ⬜ |

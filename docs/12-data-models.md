@@ -49,7 +49,7 @@ voice-worker never touches Postgres. It reads and writes Redis; every durable ro
 | Convention | Rule | Why |
 |---|---|---|
 | Money | `BIGINT` paise, suffix `_paise`. ₹245 = `24500` | Integer arithmetic, no float drift, no NUMERIC scale bugs across app/JSON boundaries. Rejected: `NUMERIC(12,2)` rupees — correct but every serialization boundary becomes a rounding decision |
-| IDs | `TEXT` with typed prefixes: `usr_`, `wal_`, `txn_`, `setl_`, `ord_`, `cmp_`, `card_`; sessions are LiveKit-derived short ids (`a1f3c9`) | Greppable in logs; a `txn_` id pasted into the wrong query fails loudly instead of joining silently. Rejected: `UUID` everywhere — opaque in traces, and the demo gains nothing from unguessability |
+| IDs | `TEXT` with typed prefixes: `usr_`, `wal_`, `txn_`, `setl_`, `ord_`, `cmp_`, `card_`; sessions are short ids (`a1f3c9`) minted by agent-api at `POST /v1/sessions` | Greppable in logs; a `txn_` id pasted into the wrong query fails loudly instead of joining silently. Rejected: `UUID` everywhere — opaque in traces, and the demo gains nothing from unguessability |
 | Time | `TIMESTAMPTZ`, stored UTC, rendered IST at the edge | The incident is "2:14 PM" in Jaipur and `08:44Z` in the database; only one of those belongs in storage |
 | Naming seam | Business tables say `merchant_id`; agent tables say `user_id`. Same value (`usr_rajesh01`) | The agent stack is product-agnostic ([docs/09](09-memory-architecture.md) already froze `user_id`); the business schema speaks its own domain language. The seam is documented rather than papered over with a rename |
 | Enums | `TEXT` + `CHECK`, not Postgres `ENUM` types | Adding a state is an in-place `CHECK` swap in one migration; `ALTER TYPE ... ADD VALUE` has transactional sharp edges and can't be removed |
@@ -206,7 +206,7 @@ CREATE TABLE conversations (
     user_id      TEXT NOT NULL REFERENCES merchants(merchant_id),
     state        TEXT NOT NULL DEFAULT 'created'
                  CHECK (state IN ('created', 'in_call', 'wrap_up', 'ended')),
-    livekit_room TEXT NOT NULL,
+    signaling_token_hash TEXT NOT NULL,               -- SHA-256 of the one-time signaling token; the raw token is never stored
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at     TIMESTAMPTZ
 );
@@ -325,7 +325,7 @@ CREATE TABLE call_costs (
     llm_utility_usd     NUMERIC(10, 6) NOT NULL,      -- Claude Haiku 4.5
     embeddings_usd      NUMERIC(10, 6) NOT NULL,      -- text-embedding-3-small
     tts_usd             NUMERIC(10, 6) NOT NULL,      -- ElevenLabs Flash v2.5
-    livekit_usd         NUMERIC(10, 6) NOT NULL DEFAULT 0,   -- self-hosted ≈ $0 marginal
+    turn_infra_usd      NUMERIC(10, 6) NOT NULL DEFAULT 0,   -- self-hosted coturn ≈ $0 marginal
     total_usd           NUMERIC(10, 6) NOT NULL,
     -- usage drivers, so the row is auditable against provider invoices:
     stt_seconds         INT NOT NULL,
@@ -335,7 +335,7 @@ CREATE TABLE call_costs (
     tts_chars           INT NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (total_usd = stt_usd + llm_dialogue_usd + llm_utility_usd
-                     + embeddings_usd + tts_usd + livekit_usd)
+                     + embeddings_usd + tts_usd + turn_infra_usd)
 );
 ```
 

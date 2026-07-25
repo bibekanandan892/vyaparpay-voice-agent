@@ -13,21 +13,21 @@ Every document is complete for **Phase 1 — Architecture** ([docs/17](17-roadma
 | # | Document | What it covers | Status |
 |---|---|---|---|
 | 01 | [Product & Use-Case Selection](01-product-and-use-case.md) | Weighted domain choice, VyaparPay product surface, Rajesh's canonical incident, the annotated 9-turn transcript | Complete |
-| 02 | [System Architecture](02-system-architecture.md) | The two-service split (`agent-api`, `voice-worker`), component map, room and request topology | Complete |
+| 02 | [System Architecture](02-system-architecture.md) | The two-service split (`agent-api`, `voice-worker`), component map, call and request topology | Complete |
 | 03 | [Android Architecture](03-android-architecture.md) | Gradle module graph, the call UI (`SupportButton`, `ConversationOverlay`, `CallStateMachine`), foreground call service | Complete |
 | 04 | [Backend Architecture](04-backend-architecture.md) | FastAPI layout, async discipline, the `app/` package split, Postgres/Redis wiring | Complete |
 | 05 | [AI Agent Architecture](05-agent-architecture.md) | The intelligence loop: `SessionManager`, `ContextBuilder`, `PromptBuilder`, `ToolExecutor`, `LLMRouter`, `SafetyLayer` | Complete |
-| 06 | [WebRTC Voice Pipeline](06-voice-pipeline.md) | LiveKit transport, streamed STT→LLM→TTS, barge-in, **the latency budget** (owns all latency numbers) | Complete |
+| 06 | [WebRTC Voice Pipeline](06-voice-pipeline.md) | Raw WebRTC transport (SDP/ICE, aiortc), hand-rolled VAD and barge-in, streamed STT→LLM→TTS, **the latency budget** (owns all latency numbers) | Complete |
 | 07 | [UI Semantic Context](07-ui-semantic-context.md) | Compose semantics tree → ScreenContext IR, the ~4,000→≤300 token transform (**owns the `screen_context/v1` schema**) | Complete |
 | 08 | [Context & Event Pipeline](08-context-and-events.md) | Snapshot/delta/event ingestion, the event ring buffer, the data-channel envelope | Complete |
 | 09 | [Memory Architecture](09-memory-architecture.md) | Short-term / session / profile / semantic tiers, the rolling summary, pgvector retrieval | Complete |
 | 10 | [Tool-Calling Architecture](10-tool-calling.md) | The 16-tool catalog, typed Pydantic contracts, confirm-required mutations, idempotency | Complete |
 | 11 | [Prompt Engineering](11-prompt-engineering.md) | The slot budget, prefix caching, persona/voice rules (**owns all token numbers**) | Complete |
 | 12 | [Data Models](12-data-models.md) | Pydantic + SQLAlchemy schemas, seeded fixtures, the Redis keyspace | Complete |
-| 13 | [API Contracts](13-api-contracts.md) | REST endpoints, `POST /v1/sessions`, the data-channel wire formats (**co-owns the schemas**) | Complete |
+| 13 | [API Contracts](13-api-contracts.md) | REST endpoints, `POST /v1/sessions`, the signaling protocol, the data-channel wire formats (**co-owns the schemas**) | Complete |
 | 14 | [Security](14-security.md) | Prompt-injection fencing, PII redaction, token TTL, per-session tool authorization | Complete |
 | 15 | [Scalability & Reliability](15-scalability-and-reliability.md) | Failure-mode tables, the degradation ladder, single-machine → multi-node evolution | Complete |
-| 16 | [Technology Stack & Decision Records](16-tech-stack.md) | Five ADRs with flip conditions, the model/pricing table, **cost per call** (owns cost numbers) | Complete |
+| 16 | [Technology Stack & Decision Records](16-tech-stack.md) | Six ADRs with flip conditions, the model/pricing table, **cost per call** (owns cost numbers) | Complete |
 | 17 | [Roadmap & Future Enhancements](17-roadmap.md) | Six phases sized in evenings/weekends, the MVP line, the post-Phase-6 catalog | Complete |
 
 ---
@@ -69,7 +69,7 @@ Rules every doc in this set obeys, so cross-reading is frictionless:
 
 | Number | Owning doc |
 |---|---|
-| Latency budget (p50 ≤ 1.0 s, p95 ≤ 2.0 s; barge-in ≤ 250 ms) | [docs/06](06-voice-pipeline.md) |
+| Latency budget (p50 ≤ 1.0 s, p95 ≤ 2.0 s; barge-in ≤ 250 ms; call setup ≤ 1.5 s p50) | [docs/06](06-voice-pipeline.md) |
 | Token budget (≤ 2,500 in / ≤ 150 out per turn) | [docs/11](11-prompt-engineering.md) |
 | Cost per call (≈ $0.30 / ~₹25) | [docs/16](16-tech-stack.md) |
 | Wire schemas (`screen_context/v1`, `app_event/v1`, REST) | [docs/07](07-ui-semantic-context.md) + [docs/13](13-api-contracts.md) |
@@ -88,14 +88,19 @@ Terms used across the set without re-explanation. The owning doc carries the ful
 | **Semantic IR** | The intermediate representation `SemanticSnapshotBuilder` produces: the raw ~4,000-token Compose tree compressed to a ≤300-token role-based summary. |
 | **Barge-in** | The user interrupting the agent mid-sentence; TTS must stop within ≤ 250 ms ([docs/06](06-voice-pipeline.md)). |
 | **Turn** | One exchange, measured from *user stops speaking* to *agent audio starts* — the unit the latency budget is defined over. |
-| **Endpointing** | Deciding the user has finished speaking (Silero VAD + LiveKit turn detector), the event that starts the turn clock. |
-| **Data channel** | LiveKit's reliable, ordered side channel (topic `ctx`) carrying in-call ScreenContext deltas and events with client-monotonic `seq` (ADR-004). |
+| **Endpointing** | Deciding the user has finished speaking (Silero VAD + our own trailing-silence rule in `VadEndpointer`), the event that starts the turn clock ([docs/06](06-voice-pipeline.md)). |
+| **Signaling** | The out-of-band exchange the two peers use to negotiate a call — SDP offer/answer plus ICE candidates — carried over our owned WebSocket protocol at `/v1/signal` (ADR-001, [docs/13](13-api-contracts.md)). |
+| **SDP / offer–answer** | Session Description Protocol: the blob each peer sends describing its media, codecs, and transport. The app is the offerer; the aiortc peer answers. |
+| **ICE / trickle ICE** | Interactive Connectivity Establishment — how the peers discover a working network path from candidate pairs. *Trickle* ICE sends candidates as they are found, so media starts on the first working pair instead of after full gathering. |
+| **STUN / TURN** | NAT-traversal servers (self-hosted **coturn**): STUN tells a peer its public address; TURN relays media when no direct path exists (e.g. symmetric NAT). TURN credentials are 10-min-TTL HMAC, minted per session ([docs/14](14-security.md)). |
+| **DTLS-SRTP** | WebRTC's mandatory media encryption: a DTLS handshake keys SRTP, so audio is end-to-end encrypted between the two peers with no extra configuration. |
+| **aiortc** | The native-Python WebRTC implementation `voice-worker` uses as the backend peer — `RTCPeerConnection`, SDP answer, ICE, DTLS-SRTP, data channels (ADR-001). |
+| **Data channel** | The native WebRTC `RTCDataChannel` (reliable, ordered, label `ctx`) carrying in-call ScreenContext deltas and events with client-monotonic `seq` (ADR-004). |
 | **Confirm-required tool** | A mutating tool (e.g. `request_limit_increase`) the agent must voice-confirm and receive an explicit "yes" for before executing ([docs/10](10-tool-calling.md)). |
 | **Degradation ladder** | The ordered fallbacks when a component fails — e.g. a missing snapshot degrades the cold-open to a generic greeting rather than dropping the call ([docs/15](15-scalability-and-reliability.md)). |
 | **Rolling summary** | A Haiku-generated running summary that replaces older verbatim transcript in the prompt every 6 turns to hold the token budget ([docs/09](09-memory-architecture.md)). |
 | **Prefix caching** | Ordering stable prompt slots (system, persona, business rules) first so their tokens are cached across turns, cutting LLM cost and TTFT ([docs/11](11-prompt-engineering.md)). |
-| **SFU** | Selective Forwarding Unit — the LiveKit media server that routes Opus audio between the app and `voice-worker` (ADR-001). |
 | **VAD** | Voice Activity Detection (Silero) — detects speech boundaries for endpointing and barge-in. |
 | **TTFT** | Time-to-first-token: how long until the LLM emits its first token, the pipeline's largest single latency stage ([docs/06](06-voice-pipeline.md)). |
 | **Seeded data** | The staged business fixtures (Rajesh, the ₹18,450 wallet, the declined ₹245 payment) served by `agent-api` in place of a real bank — reset-scriptable, marked demo-only everywhere. |
-| **voice-worker** | The LiveKit Agents (Python) process that joins the room and runs the voice pipeline; sibling to `agent-api`. "The framework moves audio; we own the intelligence." |
+| **voice-worker** | The Python asyncio process that hosts `/v1/signal`, owns the aiortc peer per call, and runs the hand-rolled voice pipeline and agent brain; sibling to `agent-api`. "We move the audio *and* own the intelligence." |

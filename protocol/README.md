@@ -7,7 +7,8 @@ Planned contents (`schemas/`, JSON Schema):
 
 - `screen_context.v1.json` — the semantic UI snapshot the app sends to the agent
 - `app_event.v1.json` — user-action timeline events (taps, navigation, API errors)
-- `data_channel_envelope.v1.json` — the LiveKit data-channel message envelope
+- `data_channel_envelope.v1.json` — the WebRTC data channel (`RTCDataChannel`, label `ctx`) message envelope
+- `signaling_message.v1.json` — the WebSocket signaling envelope (SDP offer/answer, trickle ICE, bye, keepalive)
 - `tools/*.v1.json` — input/output contracts for every agent tool
 
 Design rules:

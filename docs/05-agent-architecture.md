@@ -1,6 +1,6 @@
 # AI Agent Architecture
 
-This document owns the agent "brain": the fourteen modules that turn a final transcript into spoken words, how they compose into one turn, and where the framework ends and our code begins. It is the map — each module gets a responsibility, a Python interface, its collaborators, and its failure behavior, with deep mechanics delegated to the specialist docs it links. The single load-bearing idea: **the framework moves audio; we own the intelligence.** LiveKit Agents ([docs/06](06-voice-pipeline.md)) handles VAD, turn detection, and barge-in inside `app/voice/`; everything that decides *what Asha says* — context, memory, prompts, routing, tools, safety, cost — is framework-agnostic custom code that could be lifted onto a different transport with only `VoiceAgentWorker` rewritten.
+This document owns the agent "brain": the fourteen modules that turn a final transcript into spoken words, how they compose into one turn, and where the media plane ends and the brain begins. It is the map — each module gets a responsibility, a Python interface, its collaborators, and its failure behavior, with deep mechanics delegated to the specialist docs it links. The single load-bearing idea: **we own both halves — `app/voice/` moves the audio, the brain decides what to say — and the boundary between them is deliberate.** The hand-rolled media plane ([docs/06](06-voice-pipeline.md)) owns the aiortc peer connection, Silero VAD, endpointing, and barge-in inside `app/voice/`; everything that decides *what Asha says* — context, memory, prompts, routing, tools, safety, cost — is transport-agnostic code below `VoiceAgentWorker` that could be lifted onto a different transport with only `app/voice/` rewritten.
 
 **Read this with:** [docs/06](06-voice-pipeline.md) for the audio pipeline and barge-in mechanics this brain plugs into, [docs/08](08-context-and-events.md) for the `ContextBuilder` that feeds each turn, [docs/09](09-memory-architecture.md) for the memory layers behind `SemanticMemory` and `Summarizer`, and [docs/10](10-tool-calling.md) for the `ToolExecutor` pipeline summarized here.
 
@@ -8,12 +8,12 @@ This document owns the agent "brain": the fourteen modules that turn a final tra
 
 ## 1. The agent brain: module map
 
-One turn touches ten modules inside the brain plus two that observe it. The boundary that matters is the box: `VoiceAgentWorker` is the only class that imports LiveKit; everything below it speaks in `ContextBundle`, `Message`, `ToolResult`, and `TurnCost`, not in audio frames or room events.
+One turn touches ten modules inside the brain plus two that observe it. The boundary that matters is the box: `VoiceAgentWorker` is the only class that touches the media plane (aiortc frames, VAD events, TTS audio); everything below it speaks in `ContextBundle`, `Message`, `ToolResult`, and `TurnCost`, not in audio frames or peer-connection events.
 
 ```mermaid
 flowchart TB
-    subgraph EDGE["app/voice/ — LiveKit Agents adapter (framework boundary)"]
-        VAW["VoiceAgentWorker: VAD, turn detection, barge-in, audio in/out"]
+    subgraph EDGE["app/voice/ — hand-rolled media plane (transport + audio, docs/06)"]
+        VAW["VoiceAgentWorker: wires PeerSession, AudioIngress, VadEndpointer, AudioEgress to the brain"]
     end
     subgraph BRAIN["Agent brain — framework-agnostic (app/agent, app/context, app/memory)"]
         direction TB
@@ -66,31 +66,32 @@ Solid arrows are the turn's critical path (numbered in execution order); dashed 
 
 Business Knowledge / Retriever is `SemanticMemory` (canon §11); Cost Optimizer is `CostTracker` (canon §9); Conversation Summary is `Summarizer` (canon §11). The names are frozen — this doc renames nothing.
 
-### 1.1 The framework boundary, and why it is where it is
+### 1.1 The media/brain boundary, and why it is where it is
 
-`app/voice/` is the only package that imports LiveKit. `VoiceAgentWorker` adapts the framework's callbacks (VAD fired, turn detected, transcript final, barge-in) into calls on `ConversationManager`, and adapts the brain's sentence chunks back into the framework's audio sink. That is the entire surface. The rule bought two concrete things:
+`app/voice/` owns everything that touches the wire or the waveform: `SignalingServer`, `PeerSession` (the aiortc `RTCPeerConnection`), `AudioIngress`, `VadEndpointer`, and `AudioEgress` — all hand-rolled, all specified in [docs/06](06-voice-pipeline.md). `VoiceAgentWorker` is the seam: it adapts media-plane events (endpoint detected, transcript final, barge-in) into calls on `ConversationManager`, and adapts the brain's sentence chunks back into `AudioEgress`. That is the entire surface — and both sides of it are our code; there is no framework on either side. The rule bought two concrete things:
 
-- **The brain is testable without a room.** Every module below the boundary is exercised in unit and replay tests by feeding a `stt.final` string and asserting on the emitted sentences, tool calls, and span — no LiveKit server, no audio, no WebRTC. The canonical call's eval fixtures ([docs/10 §8](10-tool-calling.md)) run this way.
-- **The transport is swappable.** LiveKit Agents was chosen for VAD/turn-detection/barge-in maturity (canon ADR-2), but if it were replaced — a different Agents SDK, or a telephony bridge — only `VoiceAgentWorker` is rewritten. The rejected alternatives are instructive: raw aiortc/libwebrtc ("never ships" — too much transport plumbing to own), and Pipecat, which is an *orchestration* framework that would have wanted to own the turn loop, context, and tool calls — exactly the intelligence this boundary keeps in our code. We took LiveKit for transport and turn mechanics and declined every framework that reached past that line.
+- **The brain is testable without a peer connection.** Every module below the boundary is exercised in unit and replay tests by feeding a `stt.final` string and asserting on the emitted sentences, tool calls, and span — no aiortc, no coturn, no audio, no WebRTC. The canonical call's eval fixtures ([docs/10 §8](10-tool-calling.md)) run this way.
+- **The transport is swappable.** Raw WebRTC via aiortc was chosen because owning signaling, ICE, and the voice pipeline is the point of the project (canon ADR-1/2), but if the transport ever changed — a telephony bridge, or the SFU flip condition firing (multi-party calls, per-node fan-out limits) — only `app/voice/` is rewritten; the brain never learns. The rejected alternatives are instructive: LiveKit Agents and Pipecat both couple the voice pipeline to their framework, and Pipecat in particular would have wanted to own the turn loop, context, and tool calls — exactly the intelligence this boundary keeps in our code, and exactly the transport engineering the raw stack now showcases instead of hiding.
 
 ---
 
 ## 2. Turn lifecycle
 
-A turn is: user stops speaking → agent audio starts, target **p50 ≤ 1.0 s / p95 ≤ 2.0 s** (canon §7, [docs/06](06-voice-pipeline.md) owns the budget). The brain's job runs between `stt.final` and the first sentence chunk; everything before and after is the framework's.
+A turn is: user stops speaking → agent audio starts, target **p50 ≤ 1.0 s / p95 ≤ 2.0 s** (canon §7, [docs/06](06-voice-pipeline.md) owns the budget). The brain's job runs between `stt.final` and the first sentence chunk; everything before and after belongs to the media plane in `app/voice/`.
 
 ```mermaid
 sequenceDiagram
     participant U as "User (audio)"
-    participant VAW as VoiceAgentWorker
+    participant AI as "AudioIngress + VadEndpointer"
     participant CM as ConversationManager
     participant CB as "ContextBuilder + PromptBuilder"
     participant RT as LLMRouter
     participant TE as ToolExecutor
     participant TTS as "TTS (ElevenLabs Flash)"
-    U->>VAW: speech
-    VAW->>VAW: VAD endpoint + Deepgram final
-    VAW->>CM: stt.final(text) — state THINKING
+    participant AE as AudioEgress
+    U->>AI: Opus frames over SRTP
+    AI->>AI: decode → 16 kHz PCM → VAD endpoint + Deepgram final
+    AI->>CM: stt.final(text) — state THINKING
     CM->>CB: build bundle + render prompt
     CB-->>CM: messages (untrusted slots data-fenced)
     CM->>RT: stream(messages, tier=dialogue)
@@ -103,12 +104,14 @@ sequenceDiagram
     RT-->>CM: assistant token stream — state SPEAKING
     CM->>CM: sentence chunker
     CM->>TTS: sentence N
-    TTS-->>U: audio N (LLM streams N+1 concurrently)
-    Note over U,VAW: barge-in — user speaks during SPEAKING
-    U-->>VAW: speech onset (VAD)
-    VAW->>CM: cancel turn — ≤250 ms (docs/06)
+    TTS->>AE: PCM chunks, sentence N
+    AE-->>U: Opus track audio (LLM streams N+1 concurrently)
+    Note over U,AI: barge-in — ≥200 ms caller speech during SPEAKING (docs/06)
+    U-->>AI: speech onset (Silero VAD)
+    AI->>CM: barge-in — cancel turn ≤250 ms (docs/06)
     CM->>RT: cancel LLM stream
-    CM->>TTS: stop synth + playout
+    CM->>TTS: stop synth
+    CM->>AE: cancel playout
     CM->>CM: commit partial turn → LISTENING
 ```
 
@@ -120,7 +123,7 @@ Turn 3 of the canonical call — Rajesh has asked whether his wallet even has th
 
 | Step | Owner | Work | p50 (ms) |
 |---|---|---|---|
-| `stt.final` delivered | `VoiceAgentWorker` | Deepgram finalization after VAD endpoint | 80 (post-endpoint) |
+| `stt.final` delivered | `AudioIngress` + `VadEndpointer` | Deepgram finalization after the Silero endpoint | 80 (post-endpoint) |
 | Open turn, state → THINKING | `ConversationManager` | State transition, `turn_started` event | ~0 |
 | Assemble context | `ContextBuilder` | 3 pipelined Redis reads → `ContextBundle` | 15 |
 | Render + fence prompt | `PromptBuilder` + `SafetyLayer` | Template fill, untrusted slots data-fenced | (within build) |
@@ -142,20 +145,20 @@ Each section: responsibility, key interface (illustrative signatures, not the li
 
 ### 3.1 SessionManager
 
-**Responsibility.** Owns the session lifecycle and the Redis session state (`session:{id}` hash, canon §11). One session per call, no exceptions — the session is created by agent-api at `POST /v1/sessions` before the LiveKit room exists ([docs/13](13-api-contracts.md)), attached by voice-worker when it joins the room, kept alive by heartbeats, and closed exactly once on hang-up, escalation, or timeout.
+**Responsibility.** Owns the session lifecycle and the Redis session state (`session:{id}` hash, canon §11). One session per call, no exceptions — the session is created by agent-api at `POST /v1/sessions` (which also mints the signaling token and TURN credentials) before any WebRTC signaling starts ([docs/13](13-api-contracts.md)), attached by voice-worker when the client connects to `/v1/signal` and the peer connection forms, kept alive by heartbeats, and closed exactly once on hang-up (`bye`), escalation, or timeout.
 
 ```python
 class SessionManager:
     async def create(self, user_id: str, screen_context: ScreenContext,
-                     recent_events: list[AppEvent]) -> Session: ...   # agent-api, pre-room
-    async def attach(self, session_id: str) -> Session: ...           # worker joins the room
+                     recent_events: list[AppEvent]) -> Session: ...   # agent-api, before signaling
+    async def attach(self, session_id: str) -> Session: ...           # worker, on /v1/signal connect
     async def heartbeat(self, session_id: str) -> None: ...           # liveness ping, no TTL touch
     async def end(self, session_id: str, reason: EndReason) -> None: ...  # idempotent; triggers post-call
 ```
 
-**Collaborators.** `ConversationManager` (reads/writes the hash it created), the post-call pipeline ([docs/09 §8](09-memory-architecture.md)) which `end()` kicks off, `VoiceAgentWorker` (attaches on room-join, calls `end` on room-close).
+**Collaborators.** `ConversationManager` (reads/writes the hash it created), the post-call pipeline ([docs/09 §8](09-memory-architecture.md)) which `end()` kicks off, `VoiceAgentWorker` (attaches when the peer connection is established, calls `end` on `bye` or unrecoverable ICE failure).
 
-**Failure behavior.** `create` is the only synchronous dependency before audio; if Postgres is slow the profile prefetch degrades but the session still forms. `end` is idempotent (keyed on `session_id`) so a double hang-up — room-close plus an explicit `escalate_to_human` — fires the post-call pipeline once, not twice. The `session:{id}` TTL is 24 h and never refreshed to infinity: if the worker dies the session expires on its own, the call was already dropped, and nothing leaks ([docs/09 §3](09-memory-architecture.md)).
+**Failure behavior.** `create` is the only synchronous dependency before audio; if Postgres is slow the profile prefetch degrades but the session still forms. `end` is idempotent (keyed on `session_id`) so a double hang-up — a `bye` plus an explicit `escalate_to_human` — fires the post-call pipeline once, not twice. The `session:{id}` TTL is 24 h and never refreshed to infinity: if the worker dies the session expires on its own, the call was already dropped, and nothing leaks ([docs/09 §3](09-memory-architecture.md)).
 
 ### 3.2 ConversationManager
 
@@ -324,7 +327,7 @@ class CostTracker:
     async def finalize(self, session_id: str) -> None: ...   # writes call_costs (docs/09 §8)
 ```
 
-**Attribution.** Each LLM response carries `usage` (input tokens, output tokens, and cached-prefix counts); `record_turn` multiplies by the model's per-token price and writes the result two places: as OTel span attributes on the turn (`llm.input_tokens`, `llm.output_tokens`, `llm.cost_usd`, and the model that served it) and into the running `cost_usd` field of `session:{id}`. STT and TTS cost are attributed at their own spans. The canonical 5-minute call lands at ≈ $0.30 (~₹25): STT ≈ $0.04, LLM ≈ $0.10 with prompt caching (vs $0.16 without), TTS ≈ $0.15, LiveKit self-hosted ≈ $0 (canon §9).
+**Attribution.** Each LLM response carries `usage` (input tokens, output tokens, and cached-prefix counts); `record_turn` multiplies by the model's per-token price and writes the result two places: as OTel span attributes on the turn (`llm.input_tokens`, `llm.output_tokens`, `llm.cost_usd`, and the model that served it) and into the running `cost_usd` field of `session:{id}`. STT and TTS cost are attributed at their own spans. The canonical 5-minute call lands at ≈ $0.30 (~₹25): STT ≈ $0.04, LLM ≈ $0.10 with prompt caching (vs $0.16 without), TTS ≈ $0.15, coturn/infra self-hosted ≈ $0 (canon §9).
 
 **Budget guard.** The per-call cap is **$1** — roughly 3× a normal call, a runaway guard, not a normal-operation throttle. On `call_total() > $1`: log a warning, emit a span event, and signal `ContextBuilder` to **degrade to a shorter context** (drop RAG, shrink the conversation window) so further turns cost less. A call that keeps climbing after the degrade is a signal to offer `escalate_to_human` — a call that expensive is not going well anyway.
 
@@ -381,17 +384,19 @@ One call is one **asyncio task group** (structured concurrency), rooted in `Voic
 
 Mutating tools are the deliberate exception — never parallelized, and a mutating call in a batch serializes the whole batch ([docs/10 §2](10-tool-calling.md)).
 
-**Cancellation tree on barge-in.** Barge-in (VAD detects caller speech during `SPEAKING`) cancels the turn's task subtree, target ≤ 250 ms (canon §7, mechanics [docs/06](06-voice-pipeline.md)):
+**Cancellation tree on barge-in.** Barge-in (`VadEndpointer` detects ≥200 ms of caller speech during `SPEAKING`) cancels the turn's task subtree, target ≤ 250 ms (canon §7, mechanics [docs/06](06-voice-pipeline.md)):
 
 ```mermaid
 flowchart TB
-    BI["barge-in detected (VAD)"] --> CANCEL["cancel turn task group"]
+    BI["barge-in detected (VadEndpointer)"] --> CANCEL["cancel turn task group"]
     CANCEL --> LLM["LLM stream — httpx stream closed"]
-    CANCEL --> TTS["TTS synth + playout — stopped"]
+    CANCEL --> TTS["TTS synth — stopped"]
+    CANCEL --> EG["AudioEgress playout — cancelled (docs/06)"]
     CANCEL --> RD["in-flight read tools — cancelled"]
     CANCEL -. not cancelled .-> MUT["mutating tool past confirm gate — runs to terminal + audits"]
     LLM --> COMMIT["commit partial assistant text (interrupted=True)"]
     TTS --> COMMIT
+    EG --> COMMIT
     RD --> COMMIT
     COMMIT --> LISTEN["state → LISTENING"]
 ```
@@ -400,22 +405,24 @@ The one node that resists cancellation is a mutating tool already past its confi
 
 ### 4.1 Task-group lifecycle
 
-The call's task group is spawned by `VoiceAgentWorker` on room-join and lives exactly as long as the call. Its children are few and named:
+The call's task group is spawned by `VoiceAgentWorker` once `PeerSession` has sent the SDP answer and the first ICE pair connects, and it lives exactly as long as the call. Its children are few and named:
 
 | Child task | Lifetime | Cancelled by |
 |---|---|---|
 | Turn task (the §2 critical path) | One turn | Barge-in, or completes on TTS drain |
+| Audio ingress (Opus decode → VAD → Deepgram feed) | Whole call | Call-end teardown ([docs/06](06-voice-pipeline.md)) |
+| Audio egress (TTS PCM → outbound Opus track) | Whole call | Call-end teardown ([docs/06](06-voice-pipeline.md)) |
 | Detached summary fold | ~1.5 s, fires every 6 turns | Runs to completion or call-end teardown |
 | Session heartbeat | Whole call | Call-end teardown |
 | Context ingestion (data-channel consumer) | Whole call | Call-end teardown ([docs/08 §3.2](08-context-and-events.md)) |
 
-Two teardown paths. **Clean end** (hang-up, `escalate_to_human`, or timeout): `SessionManager.end` marks `state = ended`, the task group cancels its remaining children in reverse-spawn order, and the post-call pipeline runs from the still-live Redis hash ([docs/09 §8](09-memory-architecture.md)). **Worker crash**: the group dies with the process, the call drops, and there is nothing to clean up in-band — the `session:{id}` and `ctx:{session_id}` keys expire on their TTLs (24 h / 60 min), and the post-call pipeline simply never runs for that call. Structured concurrency is what makes the crash case boring: there are no orphaned turn tasks to leak because a turn task cannot outlive the group that owns it.
+Two teardown paths. **Clean end** (`bye` from either side, `escalate_to_human`, or timeout): `SessionManager.end` marks `state = ended`, the task group cancels its remaining children in reverse-spawn order — `PeerSession` closes the peer connection last — and the post-call pipeline runs from the still-live Redis hash ([docs/09 §8](09-memory-architecture.md)). **Worker crash**: the group dies with the process, ICE fails on the client and its `CallStateMachine` ends the call, and there is nothing to clean up in-band — the `session:{id}` and `ctx:{session_id}` keys expire on their TTLs (24 h / 60 min), and the post-call pipeline simply never runs for that call. Structured concurrency is what makes the crash case boring: there are no orphaned turn tasks to leak because a turn task cannot outlive the group that owns it.
 
 ---
 
 ## 5. Extensibility recipes
 
-The framework boundary earns its keep here: three common changes touch a bounded, predictable set of modules.
+The media/brain boundary earns its keep here: three common changes touch a bounded, predictable set of modules.
 
 **Add a tool.** Four mechanical steps, fully specified in [docs/10 §8](10-tool-calling.md): JSON Schema in [protocol/](../protocol/), a Pydantic module in [backend/app/tools/](../backend/app/tools/) (input model, output model, async handler that receives the injected principal), the `@tool` decorator that auto-registers name/tier/gating, and a replay eval fixture. Nothing in the brain changes — prompt tool definitions are generated from the registry, and the executor is tool-agnostic. Roughly 120 lines including the fixture.
 
@@ -444,7 +451,7 @@ The shape across all four rows mirrors the rest of the system: **the brain degra
 
 | Fixed here | Value | Heaviest consumer |
 |---|---|---|
-| Framework boundary | `VoiceAgentWorker` is the only LiveKit-aware class; the brain is transport-agnostic | [docs/06](06-voice-pipeline.md), [docs/02](02-system-architecture.md) |
+| Media/brain boundary | `app/voice/` owns transport + audio (aiortc, VAD, egress); `VoiceAgentWorker` is the seam; the brain is transport-agnostic | [docs/06](06-voice-pipeline.md), [docs/02](02-system-architecture.md) |
 | Turn state machine | LISTENING → TRANSCRIBING → THINKING → SPEAKING → LISTENING; barge-in is a cancel, not a pause | [docs/06](06-voice-pipeline.md) |
 | Interruption policy | Partial turn committed `interrupted=True`; mutating tool past the gate runs to terminal | [docs/09](09-memory-architecture.md), [docs/10](10-tool-calling.md) |
 | LLM tiering | Dialogue → Sonnet 5; summarize/classify/compress → Haiku 4.5; IDs config-driven | [docs/16](16-tech-stack.md) |
@@ -453,4 +460,4 @@ The shape across all four rows mirrors the rest of the system: **the brain degra
 | Retrieval gating | RAG on informational + topic-shift + setup; skipped on transactional turns | [docs/09](09-memory-architecture.md) |
 | Cost attribution + guard | Per-turn from provider usage → span attrs + `call_costs`; $1 call cap → warn + shorten context | [docs/16](16-tech-stack.md), [docs/04](04-backend-architecture.md) |
 | structlog event catalog | 7 events (turn_started … call_ended) with fields, hung off named OTel spans | [docs/04](04-backend-architecture.md) |
-| Concurrency model | One task group per call; TTS N ‖ LLM N+1; parallel reads; barge-in cancellation tree | [docs/06](06-voice-pipeline.md) |
+| Concurrency model | One task group per call, audio ingress/egress as call-long tasks; TTS N ‖ LLM N+1; parallel reads; barge-in cancellation tree | [docs/06](06-voice-pipeline.md) |

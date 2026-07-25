@@ -365,7 +365,7 @@ The change process is a gate, not a push:
 | Step | What happens |
 |---|---|
 | Edit | Change a `prompts/*.md` file on a branch; bump its `prompt_version`. |
-| Golden eval | Run the **golden-conversation set** — scripted transcripts (the canonical call plus edge fixtures) replayed against the new prompt through the framework-agnostic brain ([docs/05 §1.1](05-agent-architecture.md)), no LiveKit needed. |
+| Golden eval | Run the **golden-conversation set** — scripted transcripts (the canonical call plus edge fixtures) replayed against the new prompt through the framework-agnostic brain ([docs/05 §1.1](05-agent-architecture.md)), no WebRTC transport needed. |
 | Assert | Every golden must still pass: invariant 1 (no unvoiced account facts), confirm-gate discipline, one-question-per-turn, and the opening-line fixture must still reproduce. |
 | Bump | Only a green golden set merges. The composite `prompt_version` increments; the trace stamp starts reflecting it on the next deploy. |
 

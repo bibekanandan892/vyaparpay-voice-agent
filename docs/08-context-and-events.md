@@ -1,6 +1,6 @@
 # Context Building Pipeline & Event Tracking
 
-This document owns the middle of the context story: everything between "an IR exists on the device" ([docs/07](07-ui-semantic-context.md)) and "a prompt template gets filled" ([docs/11](11-prompt-engineering.md)). Concretely: the inventory of context sources and their freshness classes, the `EventTracker` action timeline in `:core:analytics`, the transport of snapshots and events over REST and the LiveKit data channel, the backend ingestion trio in `app/context/` (`SnapshotIngestor`, `EventLog`, `ContextCompressor`), and the turn-time assembly in `ContextBuilder` that hands a deterministic, budget-enforced bundle to `PromptBuilder`.
+This document owns the middle of the context story: everything between "an IR exists on the device" ([docs/07](07-ui-semantic-context.md)) and "a prompt template gets filled" ([docs/11](11-prompt-engineering.md)). Concretely: the inventory of context sources and their freshness classes, the `EventTracker` action timeline in `:core:analytics`, the transport of snapshots and events over REST and the `RTCDataChannel`, the backend ingestion trio in `app/context/` (`SnapshotIngestor`, `EventLog`, `ContextCompressor`), and the turn-time assembly in `ContextBuilder` that hands a deterministic, budget-enforced bundle to `PromptBuilder`.
 
 **Read this with:** [docs/07](07-ui-semantic-context.md) for how the ScreenContext IR is produced, [docs/02](02-system-architecture.md) for the two-channel topology this pipeline rides on, [docs/09](09-memory-architecture.md) for the memory slots assembled alongside it, and [docs/11](11-prompt-engineering.md) for the template that consumes the output.
 
@@ -107,11 +107,11 @@ The topology is fixed by [docs/02 §2](02-system-architecture.md) (two channels,
 
 ### 3.1 Session create: context before audio
 
-The initial snapshot and the last ~15 events ride in the `POST /v1/sessions` body — `{user_id, screen_context, recent_events}` — so the agent is context-complete before the LiveKit room exists. The `screen_context` field is the *retained* last operational screen (support surfaces are excluded from capture, [docs/07 §2.1](07-ui-semantic-context.md)); `recent_events` is trimmed client-side to the newest 15 because that is all the 150-token prompt slot can hold — shipping all 50 would be bytes the server immediately discards.
+The initial snapshot and the last ~15 events ride in the `POST /v1/sessions` body — `{user_id, screen_context, recent_events}` — so the agent is context-complete before the peer connection is even offered. The `screen_context` field is the *retained* last operational screen (support surfaces are excluded from capture, [docs/07 §2.1](07-ui-semantic-context.md)); `recent_events` is trimmed client-side to the newest 15 because that is all the 150-token prompt slot can hold — shipping all 50 would be bytes the server immediately discards.
 
-### 3.2 In-call: the `ctx` topic
+### 3.2 In-call: the `ctx` data channel
 
-All in-call context messages share the canonical envelope on the LiveKit data channel, reliable and ordered, topic `ctx`:
+All in-call context messages share the canonical envelope on the native `RTCDataChannel` — reliable, ordered, label `ctx`, created by the client as part of the SDP offer so it exists the moment the peer connection does:
 
 ```json
 {"v": 1, "type": "ctx.event", "seq": 17, "ts": 1784536501340,
@@ -126,10 +126,10 @@ Three message types flow client → server (`ctx.snapshot`, `ctx.delta`, `ctx.ev
 
 ### 3.3 Gap detection and the snapshot round trip
 
-LiveKit's reliable+ordered guarantee holds **per connection, not across reconnects** — the reason `seq` exists at all. When `SnapshotIngestor` sees `seq` jump (expects `n+1`, receives `n+k`):
+The channel's SCTP reliable+ordered guarantee holds **per peer connection, not across an ICE restart or a torn-down-and-rebuilt connection** — the reason `seq` exists at all. When `SnapshotIngestor` sees `seq` jump (expects `n+1`, receives `n+k`):
 
 1. The received message is **discarded, not merged** — a delta applied over a gap can produce a screen state that never existed (a dialog marked dismissed merging onto a snapshot where it never appeared).
-2. The worker publishes `{"v":1, "type":"ctx.request_snapshot", "seq":<server counter>, "ts":…, "payload":{"last_good_seq": n}}` on topic `ctx`.
+2. The worker publishes `{"v":1, "type":"ctx.request_snapshot", "seq":<server counter>, "ts":…, "payload":{"last_good_seq": n}}` on the `ctx` channel.
 3. The client responds with a full `ctx.snapshot` at its current `seq` — a fresh capture, not a replay (walk ≤2 ms, [docs/07 §2.1](07-ui-semantic-context.md)).
 4. The snapshot **replaces** `ctx:{session_id}` wholesale; delta merging resumes from its `seq`.
 
@@ -233,8 +233,10 @@ sequenceDiagram
     Pub->>API: POST /v1/sessions {user_id, screen_context, recent_events}
     API->>API: SnapshotIngestor — envelope, size, schema checks
     API->>RD: SET ctx:{session_id} · RPUSH ctx:{session_id}:events · create session:{id}
-    API-->>Pub: {session_id, livekit_url, livekit_token}
-    Note over Pub,W: in-call — data channel, topic ctx (docs/02 §3.3)
+    API-->>Pub: {session_id, signaling_url, signaling_token, ice_servers}
+    Pub->>W: WS /v1/signal — offer + trickle ICE
+    W-->>Pub: answer + trickle ICE → DTLS-SRTP up (direct P2P, coturn relay if needed)
+    Note over Pub,W: in-call — RTCDataChannel label ctx (docs/02 §3.3)
     Pub->>W: ctx.event {"seq":16} — tap "Dismiss"
     W->>RD: EventLog append (LTRIM 200)
     Pub->>W: ctx.delta {"seq":17, "base_seq":15} — dialog hidden
@@ -256,7 +258,7 @@ Per the doc-set convention. The shared floor is inherited from [docs/07 §8](07-
 
 | Failure | Detection | Impact | Mitigation | Degradation |
 |---|---|---|---|---|
-| Data-channel drop mid-call (LiveKit reconnect, or silent death on a flaky mobile network) | LiveKit connection-state callbacks on both ends; backend-side, snapshot age crossing 30 s while events also stop | Agent reasons over a screen the user may have left; deltas and events queued during the outage are lost | On reconnect the publisher sends an unsolicited full `ctx.snapshot` at its next `seq` (fresh capture, cheap); until then the `ContextCompressor` staleness flag hedges every prompt | Asha shifts to past tense — "the last screen I could see" — and asks rather than asserts; audio and tools continue unaffected (independent-failure payoff, [docs/02 §3.4](02-system-architecture.md)) |
+| Data-channel drop mid-call (peer connection degrades — ICE disconnected on a flaky mobile network, or an ICE restart tearing the channel down) | PeerConnection/ICE connection-state callbacks on both ends (`org.webrtc` observer, aiortc `connectionstatechange`); backend-side, snapshot age crossing 30 s while events also stop | Agent reasons over a screen the user may have left; deltas and events queued during the outage are lost | On reconnect the publisher sends an unsolicited full `ctx.snapshot` at its next `seq` (fresh capture, cheap); until then the `ContextCompressor` staleness flag hedges every prompt | Asha shifts to past tense — "the last screen I could see" — and asks rather than asserts; audio and tools continue unaffected (independent-failure payoff, [docs/02 §3.4](02-system-architecture.md)) |
 | Sequence gap (`seq` skips after a reconnect) | `SnapshotIngestor` continuity check — expects `n+1` | A merged delta over a gap would fabricate a screen state that never existed | Discard the gapped message; `ctx.request_snapshot` round trip (§3.3); `ctx:{session_id}` holds the last *consistent* state throughout — the merge is all-or-nothing | One round trip of staleness (tens of ms on LAN, ≤1 mobile RTT); no turn is blocked waiting for it |
 | Malformed snapshot (schema validation fails — client/serializer version skew, corrupted payload) | jsonschema validation against [protocol/](../protocol/) in `SnapshotIngestor`; failure counter per session | None if handled — the risk is the *unhandled* path: garbage entering the prompt | Reject wholesale, never partially ingest; request a fresh snapshot (a re-capture usually validates); persistent failures mark the session context-degraded and flag the client version in the trace | Last valid `ctx` remains in use with its honest timestamp — the staleness flag applies to it as normal |
 | Oversized snapshot (payload > 8 KiB or token estimate > 300 — a client-contract violation) | Size cap and token re-verification in `SnapshotIngestor` / `ContextCompressor` | Unchecked, a single busy screen blows the 2,500-token turn budget and the cost model | Server-side re-application of the [docs/07 §7](07-ui-semantic-context.md) drop ladder from rung 1; logged as a client bug with the fixture-diff attached, because the client's own ladder should have prevented it | Minimal snapshot (~120 tokens) or the ~25-token floor — the same two worst cases downstream prompt code already handles |

@@ -14,7 +14,7 @@ Planned Gradle module map:
 :feature:dashboard        # merchant home: balance, settlements, orders
 :feature:payments         # payments, vendor payouts, failure states
 :feature:support          # floating SupportButton + ConversationOverlay
-:voice                    # LiveKit client, CallStateMachine, VoiceCallService
+:voice                    # WebRtcClient (org.webrtc/libwebrtc), SignalingClient, CallStateMachine, VoiceCallService
 ```
 
 Code lands in Phase 3 — see [docs/17-roadmap.md](../docs/17-roadmap.md).

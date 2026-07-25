@@ -1,6 +1,6 @@
 # Technology Stack & Decision Records
 
-This document justifies every technology in the stack — one summary table, five full architecture decision records (ADRs), a table of things we deliberately did *not* use with the conditions that would flip each decision, and the authoritative cost-per-call model that every other doc references. The ADRs here are locked per the canon: sibling docs cite them, they do not relitigate them.
+This document justifies every technology in the stack — one summary table, six full architecture decision records (ADRs), a table of things we deliberately did *not* use with the conditions that would flip each decision, and the authoritative cost-per-call model that every other doc references. The ADRs here are locked per the canon: sibling docs cite them, they do not relitigate them.
 
 **Read this with:** [docs/02](02-system-architecture.md) for where each piece sits, [docs/06](06-voice-pipeline.md) for the latency budget these choices must hit, [docs/09](09-memory-architecture.md) for how the data layer is used, and [docs/17](17-roadmap.md) for when the deferred pieces arrive.
 
@@ -13,14 +13,16 @@ This document justifies every technology in the stack — one summary table, fiv
 | Android language | Kotlin | The author's home turf; the Android app is the Kotlin showcase of this portfolio |
 | Android UI | Jetpack Compose | The semantics tree Compose maintains for accessibility is exactly what `UiTreeCollector` mines for ScreenContext ([docs/07](07-ui-semantic-context.md)) |
 | Android DI | Hilt | Boring, standard, lets `VoiceCallService` and `AppStateManager` share scoped state without ceremony |
-| Android RTC | LiveKit Android SDK | Client half of ADR-001; wrapped in `WebRtcClient` so the app never imports LiveKit types outside `:voice` |
-| Backend language | Python 3.12 | Voice-AI ecosystem gravity — see §4 for the honest version |
+| Android WebRTC | libwebrtc via `org.webrtc` (maintained artifact `io.github.webrtc-sdk:android`) | ADR-001: `WebRtcClient` owns `PeerConnection`, `createOffer`, trickle ICE, and the data channel directly — no platform SDK in between |
+| Backend language | Python 3.12 | Voice-AI ecosystem gravity, and aiortc — see §4 for the honest version |
 | Backend web | FastAPI | Async-native, Pydantic-integrated request validation at the boundary, OpenAPI for free on the seeded business APIs |
-| Voice orchestration | LiveKit Agents (Python) | ADR-002: the framework moves audio; we own the intelligence |
+| Backend WebRTC peer | aiortc | ADR-001: full native-Python WebRTC — SDP, ICE, DTLS-SRTP, SCTP data channels — terminating media in the worker's own asyncio loop |
+| Voice pipeline | Hand-rolled asyncio (`app/voice/`) | ADR-002: `VadEndpointer`, `AudioIngress`/`AudioEgress`, barge-in cancellation — the pipeline is a headline artifact, not framework internals |
+| VAD | Silero VAD (onnxruntime) | ADR-002: 30 ms frames feeding own endpointing (≥250 ms trailing silence) and barge-in detection |
+| STUN/TURN | coturn (self-hosted) | ADR-006: one compose container; HMAC time-limited credentials via `use-auth-secret` |
 | ORM / migrations | SQLAlchemy 2.0 async + Alembic | One async session per request/turn; migrations as code from day one, not "later" |
 | Config | pydantic-settings | Typed env parsing; missing secrets fail at startup, not at first call ([docs/14](14-security.md)) |
 | Logging | structlog | JSON logs with bound `session_id`/`turn_id` on every line; greppable, trace-correlated |
-| WebRTC SFU | LiveKit (self-hosted OSS) | ADR-001; one compose container replaces months of aiortc plumbing |
 | STT | Deepgram Nova-3 (streaming) | ~$0.0077/min, streaming partials, 80/150 ms finalization after endpoint (canon latency table) |
 | TTS | ElevenLabs Flash v2.5 | Lowest-latency tier (~75 ms model latency); TTFB 120/250 ms is the second-largest turn cost after the LLM |
 | LLM gateway | OpenRouter | One API key, one wire format, per-request fallback arrays; no vendor SDK sprawl behind `LLMProvider` |
@@ -57,36 +59,34 @@ The interfaces are not speculative generality: the embedding provider has three 
 
 Format per record: Context / Decision / Consequences / Rejected alternatives / **Flips when** — the last field is the honesty check. A decision without a flip condition is a belief, not a decision.
 
-### ADR-001 — WebRTC transport: self-hosted LiveKit
+### ADR-001 — Transport: raw WebRTC, two direct peers, no media server
 
-**Context.** The call is bidirectional low-latency audio between an Android app and a Python worker, plus a reliable ordered data channel for ScreenContext deltas. The canon latency budget allots the entire transport chain (Opus encode + SFU forward + client jitter buffer) 75 ms p50 / 140 ms p95. That requires production-grade ICE/TURN traversal, echo cancellation, adaptive jitter buffering, and session resume on network change — on mobile, over Indian cellular networks. Team size: one.
+**Context.** The call is bidirectional low-latency audio between an Android app and a Python worker, plus a reliable ordered data channel for ScreenContext deltas. The topology is strictly 1:1 — one merchant, one agent — for every call this product can make. The canon latency budget allots the transport chain (Opus encode + network path, P2P or TURN relay, + client jitter buffer) 75 ms p50 / 140 ms p95, and call setup (session POST + WS connect + SDP exchange + trickle ICE to first media) ≤ 1.5 s p50. Separately, this is a portfolio project: the protocol-level engineering — offer/answer, trickle ICE, DTLS-SRTP, NAT traversal — is signal, not overhead. Team size: one.
 
-**Decision.** Self-host the LiveKit OSS server in compose. The Android app connects via the LiveKit Android SDK (wrapped in `WebRtcClient`); the backend `voice-worker` joins the same room as a participant via the LiveKit Agents SDK. Tokens are server-minted, room-scoped, 5-minute TTL ([docs/14](14-security.md)).
+**Decision.** Two direct WebRTC peers, no media server between them. The Android app uses libwebrtc via the maintained `org.webrtc` artifact (`io.github.webrtc-sdk:android`); `WebRtcClient` owns the stack directly — `PeerConnectionFactory`, `createOffer`/`setLocalDescription`, `onIceCandidate`, ICE restart on network change, hardware AEC/NS via `JavaAudioDeviceModule`. The backend `voice-worker` runs **aiortc**, the native Python WebRTC implementation — SDP, ICE, DTLS-SRTP, and SCTP data channels, all asyncio — one `RTCPeerConnection` per call wrapped in `PeerSession`. Signaling is an owned WebSocket protocol at `/v1/signal` (offer/answer + trickle ICE, envelope and flow in [docs/13](13-api-contracts.md)); NAT traversal is self-hosted coturn (ADR-006).
 
-**Consequences.** SFU, TURN, Opus, jitter buffering, reconnection, token auth, and data channels arrive as one container instead of five subsystems. The room/participant model gives audio and context a shared lifecycle (exploited by ADR-004). Costs: one more stateful service in compose, a learning curve on LiveKit's room semantics, and protocol-level coupling to LiveKit — mitigated by confining the dependency to `WebRtcClient` on Android and `VoiceAgentWorker` on the backend; nothing above those two classes knows LiveKit exists.
-
-**Rejected alternatives.**
-- *Raw aiortc* (Python WebRTC): you own ICE edge cases, TURN deployment, echo cancellation, jitter tuning, and Android interop testing. For a solo builder that is months of plumbing before the first conversation — the option that never ships.
-- *libwebrtc via NDK directly*: same problem plus a C++ build tax on the Android side.
-- *Pipecat*: an orchestration framework, not a transport — it still needs LiveKit/Daily/WebSocket underneath, so it does not answer this question (it answers ADR-002's, where it is also rejected).
-- *Managed CPaaS (Agora, Twilio Voice)*: per-minute fees, closed source, and "integrated a CPaaS" is weaker portfolio signal than "ran an SFU."
-
-**Flips when:** PSTN dial-in/out becomes a requirement (add LiveKit SIP or a Twilio bridge), or self-hosting ops cost exceeds the LiveKit Cloud bill at real traffic — the SDKs are identical either way, which is half the reason LiveKit won.
-
-### ADR-002 — LiveKit Agents runs the media loop; the intelligence stays custom
-
-**Context.** The voice loop — VAD, endpointing, turn detection, barge-in within 250 ms, streaming STT/TTS glue — is subtle asyncio engineering with years of tuning baked into good implementations. But this project's thesis lives one layer up: context, memory, tools, prompting, routing. Frameworks in this space tend to swallow both layers; hand-rolling tends to ship neither well.
-
-**Decision.** Use LiveKit Agents for exactly the media loop: Silero VAD, the LiveKit turn detector, interruption mechanics, audio track plumbing — confined to `app/voice/VoiceAgentWorker`. Our providers (`DeepgramStt`, `ElevenLabsTts`, `OpenRouterLLM`) plug in as custom nodes. Everything above — `SessionManager`, `ConversationManager`, `PromptBuilder`, `ContextBuilder`, `ToolExecutor`, `LLMRouter`, `SafetyLayer` — is framework-agnostic owned code. The framework's own agent/function-calling abstractions are deliberately not used.
-
-**Consequences.** Barge-in ≤ 250 ms comes from battle-tested code rather than a semester of tuning; the docs/06 budget assumes mature VAD and would be dishonest otherwise. Costs: one adapter layer to maintain, framework version churn to track, and constant discipline to keep intelligence out of `app/voice/` — the module boundary is the enforcement mechanism, and code review treats an import of `livekit` outside it as a defect.
+**Consequences.** No media server in the path: one fewer hop, one fewer stateful service, and media flows handset → worker directly (or via TURN relay when NAT demands it). Every protocol layer is owned, readable code — `SignalingServer`, the ICE lifecycle, the DTLS handshake sit in the repo, not behind an SDK. Trickle ICE means media starts on the first working candidate pair, which is how the ≤ 1.5 s setup budget is met. Costs: we own ICE edge cases, reconnection (ICE restart re-offer), and Android↔aiortc interop testing — engineering a managed platform amortizes across thousands of customers; mitigated by the strictly-1:1 topology (no simulcast, no subscription logic) and by libwebrtc shipping client-side AEC/NS/AGC and jitter buffering for free. A real structural cost: the worker Opus-decodes and encodes every call, so per-node call fan-out is bounded by CPU — acceptable at demo scale, and the flip condition below is the honest ceiling.
 
 **Rejected alternatives.**
-- *Hand-rolled asyncio pipeline*: educational, and the endpoint-detection tuning alone would eat the schedule while demoing worse latency than the framework's defaults.
-- *Pipecat*: a real alternative, but its pipeline abstraction sits exactly on the layer we want to own (the agent loop), and it couples orchestration to transport choices we already made in ADR-001.
-- *LiveKit Agents' built-in `Agent` class end-to-end*: its LLM loop, tool dispatch, and prompt management would hide the ~200 lines of engineering this project exists to demonstrate.
+- *LiveKit / Daily / Agora (managed WebRTC platforms)*: they work, and that is the problem — the SDK hides exactly the engineering this project showcases (signaling, ICE, media lifecycle), adds a heavyweight infra dependency or a per-minute bill, and "integrated a platform SDK" is weaker portfolio signal than "implemented offer/answer and trickle ICE against a hand-run aiortc peer."
+- *An SFU of any kind, including self-hosted LiveKit OSS*: an SFU exists to fan media out to N subscribers. At N=1 it adds a hop, a stateful service, and a room/participant abstraction the product has no use for.
+- *libwebrtc via NDK on the server*: a C++ build and deployment tax with no asyncio integration; aiortc gives the same protocols in the language the rest of the worker already speaks.
 
-**Flips when:** the framework's node API stops exposing something the latency budget needs (e.g., per-token TTS scheduling or custom endpoint heuristics). Then the media loop gets hand-rolled and the providers survive unchanged — justified post-Phase 6, not before.
+**Flips when:** the call stops being 1:1 — multi-party (supervisor whisper, conference) — or per-node fan-out limits bite at real traffic. Both are precisely the problems SFUs solve; self-hosted LiveKit OSS would be the first candidate, and the provider seams (`WebRtcClient` on Android, `PeerSession` on the backend) are where the cut would land.
+
+### ADR-002 — Voice pipeline: hand-rolled asyncio + Silero VAD
+
+**Context.** The voice loop — VAD, endpointing, turn detection, barge-in within 250 ms, streaming STT/TTS glue — is subtle asyncio engineering, and frameworks in this space (LiveKit Agents, Pipecat) exist because it is hard. But with ADR-001 removing the managed transport, the pipeline is no longer plumbing around someone else's media loop: it is one of the two headline engineering artifacts of the project (the other is ScreenContext). Hiding it inside a framework would delete the thing the repo exists to show.
+
+**Decision.** Hand-roll the pipeline in `app/voice/`, on top of raw aiortc frames. `AudioIngress` decodes the remote Opus track and resamples to 16 kHz mono PCM; `VadEndpointer` runs Silero VAD via onnxruntime on 30 ms frames with own endpointing (≥ 250 ms trailing silence ends the turn, 200 ms minimum speech) and barge-in detection (≥ 200 ms of speech while the agent is speaking); `AudioEgress` resamples TTS PCM to 48 kHz onto an aiortc `AudioStreamTrack` with playout cancellation for barge-in; `VoiceAgentWorker` wires ingress, VAD, the agent brain (`app/agent/`), and egress into one per-call asyncio task group. Providers (`DeepgramStt`, `ElevenLabsTts`, `OpenRouterLLM`) plug into that loop; full mechanics in [docs/06](06-voice-pipeline.md).
+
+**Consequences.** The barge-in cancellation tree, the endpointing thresholds, and the pacing/jitter handling are ours to tune, instrument, and demonstrate — every stage of the docs/06 budget maps to an owned span, not a framework internal. Costs: the tuning burden is real (the canon thresholds are engineered starting points, not battle-tested defaults), and mature frameworks embody years of edge-case fixes we now re-earn one bug at a time. Mitigations are scope discipline: one language (English), one codec path (Opus 48 kHz ↔ 16 kHz PCM), strictly 1:1 audio — the narrow pipeline is tractable where a general one would not be.
+
+**Rejected alternatives.**
+- *LiveKit Agents*: couples the pipeline to the LiveKit transport that ADR-001 removed, and its media loop would re-hide the VAD/endpointing/barge-in engineering we now deliberately own.
+- *Pipecat*: transport-flexible and genuinely good, but its pipeline abstraction sits exactly on the layer this project exists to demonstrate, and it brings its own frame/processor model where we want aiortc frames and plain asyncio.
+
+**Flips when:** the hand-rolled pipeline measurably fails the docs/06 budget after honest tuning (endpointing accuracy or barge-in > 250 ms), or scope multiplies (languages, codecs, telephony legs) — at that point a framework's accumulated edge-case maturity earns its coupling, and the provider interfaces survive the swap.
 
 ### ADR-003 — Data: Postgres 16 + pgvector + Redis 7, nothing else
 
@@ -103,19 +103,20 @@ Format per record: Context / Decision / Consequences / Rejected alternatives / *
 
 **Flips when:** vector count approaches ~10M or recall/latency SLOs fail under load → Qdrant behind the existing `SemanticMemory` retriever interface. Multiple services need replayable event fan-out → Kafka or Redpanda. Neither flip touches calling code; that is what the interfaces bought.
 
-### ADR-004 — Context transport: LiveKit data channel, not a second socket
+### ADR-004 — Context transport: the call's own RTCDataChannel, not another socket
 
-**Context.** ScreenContext deltas and app events must flow app → backend *during* the call, ordered, and correlated with the audio session. The initial snapshot has a different constraint: the greeting is composed from it before any audio flows, so it must arrive at session creation, before the room exists.
+**Context.** ScreenContext deltas and app events must flow app → backend *during* the call, ordered, and correlated with the audio session; transcript and agent-state events flow the other way. The initial snapshot has a different constraint: the greeting is composed from it before any audio flows, so it must arrive at session creation, before the peer connection exists. Two other channels already exist in the architecture and could plausibly carry context: the signaling WebSocket, or a dedicated third socket.
 
-**Decision.** Split by lifecycle. The initial full snapshot rides `POST /v1/sessions` (REST, before connect). In-call deltas and events use the LiveKit data channel — reliable + ordered, topic `ctx`, envelope `{"v":1, "type":..., "seq":..., "ts":..., "payload":...}` with client-monotonic `seq`; the backend detects a `seq` gap and requests a fresh full snapshot ([docs/07](07-ui-semantic-context.md)).
+**Decision.** Split by lifecycle. The initial full snapshot rides `POST /v1/sessions` (REST, before connect). In-call traffic uses one native WebRTC `RTCDataChannel` — reliable + ordered, label `ctx`, opened by the client in the offer so it is negotiated in the same SDP round trip as audio. Envelope `{"v":1, "type":..., "seq":..., "ts":..., "payload":...}` with client-monotonic `seq`; the backend detects a `seq` gap and sends `ctx.request_snapshot` for a fresh full snapshot ([docs/07](07-ui-semantic-context.md)). The signaling WebSocket stays control-plane only: SDP, ICE, `bye`, keepalive.
 
-**Consequences.** One connection, one auth artifact (the room token), one reconnect story: if the call is alive, context flows; if the call drops, stale context is impossible by construction. Ordering is a transport guarantee; gaps are detectable, not silent. Costs: reliable data-channel messages have a ~15 KB practical payload ceiling — which is a feature, since it enforces the compact ≤300-token IR rather than permitting raw-tree dumps; and the channel dies with the room, which is why the pre-call snapshot had to go over REST.
+**Consequences.** Context shares the media session's lifecycle and its DTLS encryption: if the call is alive, context flows; if the peer connection drops, stale context is impossible by construction. SCTP provides ordering and reliability as transport guarantees; gaps are detectable, not silent. Costs: reliable data-channel messages have a ~15 KB practical payload ceiling — which is a feature, since it enforces the compact ≤ 300-token IR rather than permitting raw-tree dumps — and the channel dies with the peer connection, which is why the pre-call snapshot had to go over REST.
 
 **Rejected alternatives.**
-- *Separate WebSocket*: a second connection to authenticate, keep alive, reconnect, and correlate with the room by session ID — double the failure modes (socket up / call down, and vice versa) purchasing nothing the data channel lacks.
+- *Reusing the signaling WebSocket for context*: context belongs to the media session's lifecycle, not the signaling connection's — the WS can drop and reconnect mid-call (ICE restart re-offer) while media keeps flowing, which would silently interleave a context outage with a healthy call. It would also bloat a deliberately minimal control-plane protocol.
+- *A separate dedicated WebSocket*: a third connection to authenticate, keep alive, reconnect, and correlate with the call by session ID — double the failure modes, purchasing nothing SCTP does not already guarantee.
 - *REST polling for deltas*: latency floor and mobile battery cost, plus server-side ordering bookkeeping the data channel gives for free.
 
-**Flips when:** context needs to outlive calls — e.g., ambient pre-call context streaming so the agent is warm before the user taps Call Support. That is a persistent-channel requirement no room-scoped transport can meet; it would justify a standalone WebSocket/gRPC stream, added alongside, not replacing, this design.
+**Flips when:** context needs to outlive calls — e.g., ambient pre-call context streaming so the agent is warm before the user taps Call Support. That is a persistent-channel requirement no call-scoped transport can meet; it would justify a standalone WebSocket/gRPC stream, added alongside, not replacing, this design.
 
 ### ADR-005 — Observability: structlog + OpenTelemetry + Grafana/Tempo, evals deferred
 
@@ -132,6 +133,20 @@ Format per record: Context / Decision / Consequences / Rejected alternatives / *
 
 **Flips when:** Phase 6 begins (eval platform lands per [docs/17](17-roadmap.md)); alerting and SLOs when there are real users to page for — paging a solo developer about a demo is theater.
 
+### ADR-006 — NAT traversal: self-hosted coturn with HMAC time-limited credentials
+
+**Context.** Two direct peers must find a media path across mobile NAT. Indian mobile carriers — the demo's target network — commonly deploy CGNAT and symmetric NAT, where STUN-derived reflexive candidates fail and only a TURN relay connects. The call-setup budget is ≤ 1.5 s p50, with a TURN-relayed worst case of ≤ 3 s (canon; [docs/06](06-voice-pipeline.md)). And a TURN server with static credentials is an open relay waiting to be found.
+
+**Decision.** One self-hosted coturn container in compose serves both STUN and TURN, with UDP, TCP, and TLS (`turns:` on 5349) fallback. agent-api mints per-session time-limited TURN credentials using coturn's `use-auth-secret` HMAC scheme: username `<expiry-ts>:<session_id>`, credential = HMAC of the username with the shared secret, 10-minute TTL — returned in the `POST /v1/sessions` response `ice_servers` array alongside the STUN URL ([docs/13](13-api-contracts.md), [docs/14](14-security.md)).
+
+**Consequences.** Calls survive symmetric NAT via relay, and the reviewer can `docker compose up` the entire NAT-traversal story. The HMAC scheme means no per-user credential provisioning, nothing stored, and a leaked credential expires in minutes. Costs: one more container; a TLS cert for the `turns:` fallback; relayed calls pay extra RTT (inside the 75/140 ms transport allotment, and the ≤ 3 s setup worst case); relay bandwidth becomes the scaling cost — negligible at demo scale (§5), real at production volume.
+
+**Rejected alternatives.**
+- *Public STUN only (e.g., Google's)*: free, and fails exactly where the demo lives — symmetric NAT on Indian mobile carriers. A voice product that cannot connect on Jio is not a product.
+- *Managed TURN (Twilio NTS, Cloudflare)*: works, but one more vendor, one more bill, and one more piece of the story a reviewer cannot run locally — for a demo.
+
+**Flips when:** global production traffic — geo-distributed relay PoPs start mattering for RTT, and coturn fleet ops exceed a managed-TURN bill. Then Twilio NTS (or a relay fleet behind the same `ice_servers` contract) earns its cost; the session API shape does not change.
+
 ---
 
 ## 3. Deliberately not used
@@ -140,12 +155,13 @@ This table is a feature, not a list of omissions. Each row was considered, price
 
 | Technology | Why it is absent | Flips when |
 |---|---|---|
+| LiveKit / Daily / Agora (managed WebRTC platforms) | The transport *is* the portfolio artifact; a platform SDK hides signaling, ICE, and the media lifecycle, and adds a heavy dependency or per-minute bill (ADR-001) | PSTN dial-in/out lands (bridge or platform SIP), or transport ops outgrow a solo maintainer at real traffic |
+| SFU / media server (any, incl. self-hosted LiveKit OSS) | Built to fan media out to N subscribers; at strictly 1:1 it is a hop and a stateful service for zero benefit (ADR-001) | Multi-party calls — supervisor whisper, conference — or per-node fan-out limits |
+| LiveKit Agents / Pipecat | Their pipeline abstractions sit exactly on the VAD/endpointing/barge-in layer this project hand-rolls to demonstrate (ADR-002); LiveKit Agents also couples to a transport ADR-001 removed | The hand-rolled pipeline fails the docs/06 budget after honest tuning, or scope multiplies (languages, codecs, telephony) |
 | Kafka | Event-bus semantics with one producer and one consumer; Redis Streams cover the demo (ADR-003) | A second service needs replayable, partitioned event fan-out |
 | MongoDB | Postgres JSONB covers every document-shaped need without giving up joins (ADR-003) | Never, on current evidence — this one is a rejection, not a deferral |
 | Pinecone / Qdrant | A third stateful system to serve < 10k vectors; pgvector answers top-3 in single-digit ms (ADR-003) | ~10M vectors or failed recall/latency SLOs → Qdrant behind `SemanticMemory` |
 | Kubernetes | One machine runs the whole stack; K8s would triple the ops surface to demonstrate deployment skills this project is not about | Multi-node scale, rolling deploys, or an SRE audience; compose files are written to translate cleanly |
-| Pipecat | Orchestrates the layer we want to own, and couples to transport choices already made (ADR-001, ADR-002) | LiveKit Agents dies as a project and a migration target is needed |
-| Raw aiortc | Months of transport plumbing before the first conversation; the option that never ships (ADR-001) | Never for this project; it is the right tool for protocol research, not products |
 | LangChain / agent frameworks | The agent loop is ~200 lines of owned code — prompt build, LLM call, tool dispatch, safety gate. A framework would hide exactly the engineering this project exists to demonstrate, behind abstractions sized for problems we do not have | The loop grows genuine multi-agent orchestration needs (parallel sub-agents, complex graphs) — not before |
 | Eval platform (Langfuse / Phoenix) | No eval set exists yet to run on it (ADR-005) | Phase 6, by plan, with a transcript corpus to score |
 
@@ -153,7 +169,7 @@ This table is a feature, not a list of omissions. Each row was considered, price
 
 ## 4. Why Python on the backend, from a Kotlin developer
 
-The honest answer is ecosystem gravity, not language preference. The author's production experience is Kotlin/Android, and a Ktor backend was the comfortable option — but in voice AI, Python is where the ecosystem actually lives: LiveKit Agents is Python-first (the Node port trails it; there is no JVM port), Silero VAD ships as a Python-consumable model, and Deepgram, ElevenLabs, and OpenRouter all treat their Python SDKs as the reference implementation. Choosing Kotlin for the backend would have meant hand-porting the media loop that ADR-002 explicitly decided not to write, and debugging streaming-audio interop against SDKs whose examples, issues, and fixes are all written for Python. Two smaller reasons made it easier to accept: a portfolio that shows Compose semantics-tree work on Android *and* an async Python service demonstrates range that a single-language repo cannot, and the Android app remains the Kotlin showcase — `:core:screencontext` and the `SemanticSnapshotBuilder` are the most original Kotlin in the project. The known cost is that async Python punishes the unwary (one blocking call in the event loop stalls every session on the worker); the mitigations are structural — SQLAlchemy async end-to-end, no sync HTTP clients, and the per-turn OTel spans from ADR-005, which make an accidental stall show up as an anomalous `context.build` span rather than a mystery.
+The honest answer is ecosystem gravity, not language preference. The author's production experience is Kotlin/Android, and a Ktor backend was the comfortable option — but the deciding fact is **aiortc**: the only credible native WebRTC implementation outside C++ and the browser is a Python library, asyncio end to end, which lets the voice-worker terminate SDP, ICE, DTLS-SRTP, and the data channel in the same event loop that runs Silero VAD, the Deepgram stream, and the agent brain. There is no JVM equivalent — a Kotlin backend would have meant wrapping libwebrtc over JNI on a server, a C++ build-and-deploy tax with no maintained server-side story. The rest of the ecosystem points the same way: Silero VAD ships as an ONNX model with Python-first tooling, and Deepgram, ElevenLabs, and OpenRouter all treat their Python SDKs as the reference implementation, so streaming-audio interop bugs get debugged against examples, issues, and fixes written for Python. Two smaller reasons made it easier to accept: a portfolio that shows Compose semantics-tree work on Android *and* an async Python service demonstrates range that a single-language repo cannot, and the Android app remains the Kotlin showcase — `:core:screencontext` and the `SemanticSnapshotBuilder` are the most original Kotlin in the project. The known cost is that async Python punishes the unwary (one blocking call in the event loop stalls every session on the worker — and now the media path itself lives in that loop); the mitigations are structural — SQLAlchemy async end-to-end, no sync HTTP clients, and the per-turn OTel spans from ADR-005, which make an accidental stall show up as an anomalous `context.build` span rather than a mystery.
 
 ---
 
@@ -182,7 +198,7 @@ This section owns the canonical number every other doc cites: **≈ $0.30 (~₹2
 | LLM utility — Claude Haiku 4.5 | ~10k tokens across summaries + classification | $0.01 | $0.01 |
 | Embeddings — text-embedding-3-small | Post-call summary + retrieval queries, ~2k tokens | <$0.001 | <$0.001 |
 | TTS — ElevenLabs Flash v2.5 | ~2,300 chars at starter-tier rates | $0.15 | $0.15 |
-| LiveKit (self-hosted) | Amortized compute, ≈$0 marginal per call | $0.00 | $0.00 |
+| coturn (self-hosted) | Amortized compute ≈ $0; TURN relay bandwidth negligible at demo scale | $0.00 | $0.00 |
 | **Total** | | **≈ $0.35** | **≈ $0.30 (~₹25)** |
 
 Caching mechanics: the stable prefix (system + persona + business rules, byte-identical across turns — see the turn accounting in [docs/01](01-product-and-use-case.md) §8) is written once at 1.25× and read 19 times at 10% of input price, cutting dialogue input cost by ~45%. The remaining per-turn variable tail (screen context, window, utterance) is uncacheable by nature.
@@ -203,7 +219,7 @@ Straight multiplication (30,000 calls/month), then honest adjustments:
 | LLM (dialogue + utility) | $2,900 | Sonnet 5 intro pricing (through 2026-08) would cut ~33% |
 | TTS | $4,500 | Business-tier per-char rates are the single biggest lever; realistic target ~$2,500–3,000 |
 | Embeddings | ~$5 | — |
-| LiveKit self-hosted infra | $200–400 | 2 media VMs + TURN egress — infrastructure, not per-call |
+| Self-hosted infra (voice-worker + coturn) | $200–400 | Worker VMs (Opus decode/encode per call) + coturn TURN relay egress — infrastructure, not per-call |
 | **Total** | **≈ $8,800/mo ≈ ₹7.4 lakh** | ≈ $0.29/call before volume discounts; plausibly ≈ $0.21 after |
 
 For calibration: a human support agent handling the same 5-minute call costs an Indian BPO roughly ₹80–150 fully loaded. At ₹25 list — before volume discounts — the agent is 3–6× cheaper *and* answers at second zero with the screen already read. That arithmetic, not the technology, is the business case; the demo/production honesty caveat is that these are list-price projections from a seeded demo, and production would add real-rail costs (PSP fees, telephony if PSTN lands) that belong to VyaparPay's P&L, not the agent's.
@@ -223,7 +239,7 @@ For calibration: a human support agent handling the same 5-minute call costs an 
 
 | Fixed here | Value | Heaviest consumer |
 |---|---|---|
-| ADR-001..005 | Locked; sibling docs cite, never relitigate | [docs/02](02-system-architecture.md), [docs/06](06-voice-pipeline.md) |
+| ADR-001..006 | Locked; sibling docs cite, never relitigate | [docs/02](02-system-architecture.md), [docs/06](06-voice-pipeline.md) |
 | Model defaults + pricing | Sonnet 5 $3/$15, Haiku 4.5 $1/$5, embeddings $0.02/M — config-driven | [docs/11](11-prompt-engineering.md), [docs/09](09-memory-architecture.md) |
 | Canonical cost per call | ≈ $0.30 (~₹25) cached; ≈ $0.35 uncached | Every doc that mentions cost |
 | The not-used table | Each absence has a named flip condition | [docs/17](17-roadmap.md) |

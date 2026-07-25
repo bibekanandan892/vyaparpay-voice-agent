@@ -105,7 +105,7 @@ flowchart LR
     COL -->|"raw nodes, UI thread, ≤2ms"| BLD["SemanticSnapshotBuilder"]
     BLD -->|"screen_context/v1"| PUB["ScreenContextPublisher"]
     PUB -->|"initial snapshot"| REST["POST /v1/sessions"]
-    PUB -->|"ctx.delta / ctx.snapshot / ctx.event, topic ctx"| DC["LiveKit data channel"]
+    PUB -->|"ctx.delta / ctx.snapshot / ctx.event, label ctx"| DC["RTCDataChannel"]
 ```
 
 `SemanticSnapshotBuilder` is the only component that sees both the raw tree and the outside world's schema; everything upstream is capture, everything downstream is transport ([docs/02 §3.3](02-system-architecture.md) owns the transport sequence).
@@ -210,7 +210,7 @@ The rules compose into a one-line summary of the whole document: *prune → merg
 {"v": 1, "type": "ctx.snapshot" | "ctx.delta" | "ctx.event", "seq": 42, "ts": 1784536440000, "payload": {}}
 ```
 
-`seq` is client-monotonic across all three types; the backend's `SnapshotIngestor` detects gaps (LiveKit's reliable+ordered guarantee holds per connection, not across reconnects) and requests a full snapshot.
+`seq` is client-monotonic across all three types; the backend's `SnapshotIngestor` detects gaps (the `RTCDataChannel`'s reliable+ordered guarantee holds per peer connection, not across reconnects) and requests a full snapshot.
 
 ```mermaid
 flowchart TB
@@ -239,7 +239,7 @@ flowchart TB
 
 **Screen change → always a full snapshot.** Diffing `PaymentScreen` against `SettlementsScreen` is meaningless; `base_seq` in every delta lets the backend verify it is merging onto the snapshot the client diffed against.
 
-**Backend semantics** (owned by [docs/08](08-context-and-events.md), restated in one line): deltas merge into `ctx:{session_id}` in Redis; the *next* turn's `ContextBuilder` reads the merged state; nothing is ever pushed into a mid-flight LLM generation. The initial snapshot rides `POST /v1/sessions` so the agent is context-complete before the room exists ([docs/02 §3.1](02-system-architecture.md)).
+**Backend semantics** (owned by [docs/08](08-context-and-events.md), restated in one line): deltas merge into `ctx:{session_id}` in Redis; the *next* turn's `ContextBuilder` reads the merged state; nothing is ever pushed into a mid-flight LLM generation. The initial snapshot rides `POST /v1/sessions` so the agent is context-complete before the peer connection exists ([docs/02 §3.1](02-system-architecture.md)).
 
 `ctx.event` messages — the `app_event/v1` entries (`nav` / `tap` / `input` / `api_error` / `dialog`) from `EventTracker`'s ring buffer — share the envelope and feed `EventLog`; the last ~15 become the 150-token event-timeline prompt slot. Events are not deltas: a tap that changes nothing on screen still tells the agent the user is trying something.
 

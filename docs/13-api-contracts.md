@@ -1,6 +1,6 @@
 # API Contracts
 
-This document is the reference for every contract a client can hit: the REST envelope and error taxonomy, the session lifecycle endpoints, the seeded business APIs that both the Android app and the tool layer consume, the LiveKit data-channel message types (context up, transcript and agent state down), the internal voice-worker ↔ agent-api seam, and the LiveKit token grants. Wire-format authority is shared with [docs/07](07-ui-semantic-context.md) per the canon: the ScreenContext IR and delta semantics are defined there; this document defines everything that wraps and transports them. Where a payload appears in both, the [protocol/](../protocol/) schema is the tiebreaker.
+This document is the reference for every contract a client can hit: the REST envelope and error taxonomy, the session lifecycle endpoints, the seeded business APIs that both the Android app and the tool layer consume, the WebSocket signaling protocol (SDP offer/answer, trickle ICE), the data-channel message types (context up, transcript and agent state down), the TURN credential contract, and the internal voice-worker ↔ agent-api seam. Wire-format authority is shared with [docs/07](07-ui-semantic-context.md) per the canon: the ScreenContext IR and delta semantics are defined there; this document defines everything that wraps and transports them. Where a payload appears in both, the [protocol/](../protocol/) schema is the tiebreaker.
 
 **Read this with:** [docs/02](02-system-architecture.md) for the two-channel topology these contracts ride on, [docs/08](08-context-and-events.md) for what the backend does with context messages, [docs/10](10-tool-calling.md) for the tool contracts that front the business APIs, and [docs/12](12-data-models.md) for the tables behind them.
 
@@ -47,9 +47,9 @@ Three conventions that prevent recurring cross-doc confusion:
 | 409 | `LIMIT_REQUEST_ALREADY_PENDING` / `CARD_ALREADY_BLOCKED` / `STALE_LIMIT_VIEW` / `REFUND_WINDOW_CLOSED` | Business-state conflicts; `details` carries the existing state ([docs/10 §5](10-tool-calling.md)) | No |
 | 429 | `RATE_LIMITED` | `rate:{user_id}` window exceeded — 5 session creates/min ([docs/12 §7](12-data-models.md)); `Retry-After` header set | After the window |
 | 500 | `INTERNAL` | Unhandled server error. Message is generic by policy — stack traces go to structlog, never to clients ([docs/14](14-security.md)) | Maybe |
-| 503 | `SESSION_CAPACITY` | No voice-worker available to take the room | With backoff |
+| 503 | `SESSION_CAPACITY` | No voice-worker capacity to take the call | With backoff |
 
-Codes are grouped by prefix class (`AUTH_*`, `VALIDATION_*`, `SESSION_*`) so clients can switch on the class when they do not care about the member. New codes may be added within a class without a version bump (§8); a code's meaning is frozen forever once shipped.
+Codes are grouped by prefix class (`AUTH_*`, `VALIDATION_*`, `SESSION_*`) so clients can switch on the class when they do not care about the member. New codes may be added within a class without a version bump (§9); a code's meaning is frozen forever once shipped.
 
 ### 1.2 Authentication: demo JWT
 
@@ -78,14 +78,14 @@ The `sub` claim is the only principal in the system: it becomes the session user
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/sessions` | Mint a call session: validate + ingest the initial context, create the LiveKit room, return join credentials |
-| `POST /v1/sessions/{id}/token` | Re-mint a room token after the 5-min join window (cold rejoin; session state is intact in Redis) |
+| `POST /v1/sessions` | Mint a call session: validate + ingest the initial context, mint the signaling token and TURN credentials, return the connect bundle |
+| `POST /v1/sessions/{id}/token` | Re-mint the signaling token and fresh TURN credentials after the 5-min connect window (reconnect; session state is intact in Redis) |
 | `DELETE /v1/sessions/{id}` | Explicit hang-up; idempotent |
 | `GET /v1/sessions/{id}/summary` | Post-call summary for the in-app summary card |
 
 ### 2.1 `POST /v1/sessions`
 
-The one endpoint where context beats audio: the full ScreenContext IR and the last ~15 timeline events ride in the request body, so the agent is context-complete before the room exists ([docs/02 §3.1](02-system-architecture.md)). The request, exactly as `VoiceCallService` sends it four seconds after Rajesh taps Call Support:
+The one endpoint where context beats audio: the full ScreenContext IR and the last ~15 timeline events ride in the request body, so the agent is context-complete before the peer connection exists ([docs/02 §3.1](02-system-architecture.md)). The request, exactly as `VoiceCallService` sends it four seconds after Rajesh taps Call Support:
 
 ```json
 {
@@ -127,20 +127,27 @@ Note the `screen_context` is `PaymentScreen`, not `HelpScreen` — support surfa
   "success": true,
   "data": {
     "session_id": "a1f3c9",
-    "livekit_url": "wss://livekit.vyapar.local:7880",
-    "livekit_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.…",
-    "expires_at": "2026-07-24T14:19:22+05:30"
+    "signaling_url": "wss://voice.vyapar.local/v1/signal",
+    "signaling_token": "st_hV4nQ9pXzL2mR8cT0kWyB6uJ",
+    "ice_servers": [
+      {"urls": ["stun:turn.vyapar.local:3478"]},
+      {"urls": ["turn:turn.vyapar.local:3478?transport=udp",
+                "turns:turn.vyapar.local:5349"],
+       "username": "1784537062:a1f3c9",
+       "credential": "kWx0mB4vQ2nT8hZJc6yUq1RfLpE="}
+    ],
+    "expires": "2026-07-24T14:19:22+05:30"
   },
   "error": null,
   "meta": null
 }
 ```
 
-`expires_at` is the token's join deadline (5-min TTL, §6), not the session's lifetime. Server-side effects, in order: validate the snapshot and events against [protocol/](../protocol/) schemas (reject → `400 VALIDATION_SCHEMA`, whole body, never partial ingest), check `rate:usr_rajesh01` (`429 RATE_LIMITED` past 5/min), mint `a1f3c9`, write `ctx:a1f3c9` and the events list, create the `conversations` stub row, create the room, kick off speculative context prefetch (profile + RAG on the error code), return. The failed-call ergonomics matter: a `429` or `503` here means the app shows "couldn't start the call" — no session row, no room, nothing to clean up.
+The `ice_servers` array is passed verbatim to `PeerConnection` construction on the client — STUN first (credential-free), then the coturn TURN entry with its HMAC credential pair (§7). `expires` is the signaling token's connect deadline (5-min TTL, §6), not the session's lifetime. Server-side effects, in order: validate the snapshot and events against [protocol/](../protocol/) schemas (reject → `400 VALIDATION_SCHEMA`, whole body, never partial ingest), check `rate:usr_rajesh01` (`429 RATE_LIMITED` past 5/min), mint `a1f3c9`, write `ctx:a1f3c9` and the events list, create the `conversations` stub row, mint the one-time signaling token (stored hashed in Redis, 300 s key TTL) and compute the TURN credential pair (§7), kick off speculative context prefetch (profile + RAG on the error code), return. The failed-call ergonomics matter: a `429` or `503` here means the app shows "couldn't start the call" — no session row, no token, nothing on the voice-worker to clean up, because the worker learns a session exists only when its WebSocket connects.
 
 ### 2.2 `DELETE /v1/sessions/{id}`
 
-Explicit hang-up from the in-call UI. Marks the session ending, disconnects the room, and triggers the post-call pipeline (summarize, persist, embed, finalize cost — [docs/09 §8](09-memory-architecture.md)). Returns `200` with `{"session_id": "a1f3c9", "state": "ended"}`; a repeat call returns the same body, not a `409` — hang-up races LiveKit's participant-left event constantly and both paths converge on the same terminal state. `DELETE` on someone else's session is `404 SESSION_NOT_FOUND`, indistinguishable from a wrong id.
+Explicit hang-up from the in-call UI. Marks the session ending, tears down the peer connection and signaling WebSocket, and triggers the post-call pipeline (summarize, persist, embed, finalize cost — [docs/09 §8](09-memory-architecture.md)). Returns `200` with `{"session_id": "a1f3c9", "state": "ended"}`; a repeat call returns the same body, not a `409` — hang-up races the in-band `bye` (§6) and aiortc's connection-state teardown constantly, and every path converges on the same terminal state. `DELETE` on someone else's session is `404 SESSION_NOT_FOUND`, indistinguishable from a wrong id.
 
 ### 2.3 `GET /v1/sessions/{id}/summary`
 
@@ -194,7 +201,7 @@ These are the seeded VyaparPay product APIs. They have **two consumers by design
 | `POST /v1/cards/{last4}/block`, `POST /v1/cards/{last4}/pin-reset` | Card operations | `block_card`, `reset_pin` |
 | `POST /v1/invoices` | Enqueue GST invoice job (async, returns `job_id`) | `generate_invoice` |
 
-Compact examples for the ones the canonical call touches; the rest follow identically and live in the generated OpenAPI (§7).
+Compact examples for the ones the canonical call touches; the rest follow identically and live in the generated OpenAPI (§8).
 
 ### 3.1 `GET /v1/wallet`
 
@@ -298,23 +305,23 @@ A second submission while one is pending returns `409 LIMIT_REQUEST_ALREADY_PEND
 
 ## 4. Data-channel protocol
 
-Everything in-call rides the LiveKit data channel, reliable and ordered, wrapped in the canonical envelope (canon §10, defined jointly with [docs/07 §6](07-ui-semantic-context.md)):
+Everything in-call rides one native `RTCDataChannel` — label **`ctx`**, reliable and ordered (default SCTP settings), opened by the client inside the offer so it is negotiated in the same SDP round trip as the audio and costs zero extra setup latency (canon §10, defined jointly with [docs/07 §6](07-ui-semantic-context.md)). Every message wears the canonical envelope:
 
 ```json
 {"v": 1, "type": "<message type>", "seq": 42, "ts": 1784536440000, "payload": {}}
 ```
 
-Two topics. Topic **`ctx`** carries context (client → server, plus the server's one recovery request); topic **`ui`** carries the server → client stream that drives the `ConversationOverlay`. The split is functional, not cosmetic: `ui` subscribers never parse context traffic, and the gap-detection rules differ — the backend gap-checks the client's single `seq` counter on `ctx` ([docs/08 §3.3](08-context-and-events.md)), while the client never gap-checks `ui` (a lost caption partial is repaired by the next partial; a lost `agent.state` by the next transition).
+One channel, two streams, split by type prefix. The `ctx.*` types (client → server, plus the server's one recovery request) carry context; `transcript.*` and `agent.state` (server → client) drive the `ConversationOverlay`. Each direction runs its own `seq` counter, and the gap rules differ on purpose: the backend gap-checks the client's single counter across the `ctx.*` stream ([docs/08 §3.3](08-context-and-events.md)) because a lost delta corrupts merge state, while the client never gap-checks the server stream (a lost caption partial is repaired by the next partial; a lost `agent.state` by the next transition).
 
-| Type | Direction | Topic | Cadence | Purpose |
-|---|---|---|---|---|
-| `ctx.snapshot` | client → server | `ctx` | 300 ms debounce; forced on screen change and gap recovery | Full IR, replaces server state wholesale |
-| `ctx.delta` | client → server | `ctx` | 300 ms debounce | Changed components only, `base_seq`-verified merge |
-| `ctx.event` | client → server | `ctx` | Immediate, no debounce | One `app_event/v1` timeline entry |
-| `ctx.request_snapshot` | server → client | `ctx` | On sequence gap | Ask for a fresh capture, not a replay |
-| `transcript.partial` | server → client | `ui` | User side: STT interims throttled to ~5/s; agent side: per sentence, as dispatched to TTS | Live captions |
-| `transcript.final` | server → client | `ui` | Once per (turn, role) | Authoritative caption text |
-| `agent.state` | server → client | `ui` | On transition | Drives the overlay's listening/thinking/speaking indicator |
+| Type | Direction | Cadence | Purpose |
+|---|---|---|---|
+| `ctx.snapshot` | client → server | 300 ms debounce; forced on screen change and gap recovery | Full IR, replaces server state wholesale |
+| `ctx.delta` | client → server | 300 ms debounce | Changed components only, `base_seq`-verified merge |
+| `ctx.event` | client → server | Immediate, no debounce | One `app_event/v1` timeline entry |
+| `ctx.request_snapshot` | server → client | On sequence gap | Ask for a fresh capture, not a replay |
+| `transcript.partial` | server → client | User side: STT interims throttled to ~5/s; agent side: per sentence, as dispatched to TTS | Live captions |
+| `transcript.final` | server → client | Once per (turn, role) | Authoritative caption text |
+| `agent.state` | server → client | On transition | Drives the overlay's listening/thinking/speaking indicator |
 
 One example per type. A coherent mid-call moment — Rajesh dismisses the "Daily Limit Exceeded" dialog while Asha talks (snapshot at `seq` 42 already on the server):
 
@@ -363,13 +370,13 @@ Note `base_seq: 42`, not 43: events share the `seq` counter but do not advance s
 
 The overlay keys captions on `(turn, role)`: each `transcript.partial` replaces the previous partial for that key; `transcript.final` freezes it. Agent-side partials arrive sentence-by-sentence because that is the granularity the pipeline actually has — sentences are dispatched to TTS as they complete (canon §7) — so the caption naturally leads the audio by roughly the TTS TTFB, which reads as responsive rather than wrong.
 
-Why server-rendered captions instead of client-side STT: the client has no STT, and more importantly the caption must show what the agent *actually heard and said*. If the transcript on screen came from a second recognition pass, every disagreement between caption and behavior would be undebuggable. With this design a caption bug is an agent bug, observable in the same trace. The rejected alternative — a separate WebSocket for transcript push — died with ADR-4 ([docs/16](16-tech-stack.md)): the data channel is already reliable, ordered, and authenticated by room membership.
+Why server-rendered captions instead of client-side STT: the client has no STT, and more importantly the caption must show what the agent *actually heard and said*. If the transcript on screen came from a second recognition pass, every disagreement between caption and behavior would be undebuggable. With this design a caption bug is an agent bug, observable in the same trace. The rejected alternative — pushing transcripts over the signaling WebSocket, or opening a third connection for them — died with ADR-4 ([docs/16](16-tech-stack.md)): the data channel is already reliable, ordered, secured by the same DTLS handshake as the audio, and scoped to exactly the lifetime of the media it captions; the signaling WebSocket stays control-plane only.
 
 `agent.state` transitions map directly onto pipeline events:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Listening: room joined
+    [*] --> Listening: ctx channel open
     Listening --> Thinking: VAD endpoint detected
     Thinking --> Speaking: first TTS chunk dispatched
     Speaking --> Listening: playback complete
@@ -383,12 +390,13 @@ The overlay renders state, never infers it — inferring "speaking" from audio e
 
 ## 5. Internal contract: voice-worker ↔ agent-api
 
-The demo ships **one image with two entrypoints** — `uvicorn` for agent-api, the LiveKit Agents runner for voice-worker — both importing the same [backend/app/](../backend/app/) package. The module boundary is Python interfaces, not a network. The decision worth writing down is where the seam sits, so the production split is a config change instead of a refactor:
+The demo ships **one image with two entrypoints** — `uvicorn` for agent-api, the asyncio voice-worker entrypoint (`SignalingServer` accepting `/v1/signal`, one `VoiceAgentWorker` task group per call) — both importing the same [backend/app/](../backend/app/) package. The module boundary is Python interfaces, not a network. The decision worth writing down is where the seam sits, so the production split is a config change instead of a refactor:
 
 | Crossing | Demo binding | Production binding |
 |---|---|---|
 | Business data (tool handlers → business APIs) | **HTTP even in the demo** — handlers call `/v1/*` on localhost (~1–2 ms). [docs/02](02-system-architecture.md): "tool calls go to agent-api, not straight to tables" | Same HTTP, remote host, mTLS; or gRPC if the contract set grows past what OpenAPI comfortably describes |
 | Session/context state | Shared Redis and Postgres — network-shaped by nature, schemas in [docs/12](12-data-models.md) | Unchanged; the datastores were always remote |
+| Signaling token handoff | Shared Redis: agent-api writes the hashed one-time token at mint (§2.1); voice-worker verifies and burns it at WS accept (§6) | Unchanged mechanics; Redis was always the shared truth for session state |
 | Internal auth | Service JWT (same HS256 secret) with `sub` = the session user and `act: "svc_voice-worker"`, so business endpoints authorize the *merchant* while logging the *actor* | OAuth 2 token exchange (RFC 8693) for the on-behalf-of pattern; workload identity (SPIFFE) + mTLS between services |
 | Providers, memory, prompt code | In-process imports — these belong to the worker and never cross | Unchanged; they ship inside the worker deployable |
 
@@ -398,50 +406,129 @@ The split, when it comes (Phase 6 territory), is therefore mechanical: build two
 
 ---
 
-## 6. LiveKit token contract
+## 6. Signaling protocol
 
-agent-api mints the user's room token at session create (§2.1); the agent side joins through LiveKit Agents dispatch using the server API key, so the only token this contract governs is the client's.
+The one `/v1` route that does not terminate on agent-api: `wss://<voice-worker>/v1/signal?session_id=<id>&token=<signaling_token>`, hosted by the voice-worker's `SignalingServer` — the WebSocket must land on the process that owns the aiortc `RTCPeerConnection`, so it cannot sit behind the REST service. It is **control plane only**: SDP, ICE, teardown, keepalive. Media and context never touch it (ADR-4). Every message wears one envelope:
+
+```json
+{"v": 1, "type": "offer | answer | ice | bye | error | ping | pong", "payload": {}}
+```
+
+| Type | Direction | Payload | Purpose |
+|---|---|---|---|
+| `offer` | client → server | `{sdp}` | Initial SDP offer; also re-sent (with `iceRestart: true` at `createOffer`) for ICE restart |
+| `answer` | server → client | `{sdp}` | aiortc's answer to the current offer |
+| `ice` | both | `{candidate, sdpMid, sdpMLineIndex}` | One trickled candidate; `"candidate": null` marks end-of-candidates |
+| `bye` | both | `{reason}` | Clean teardown: `user_hangup`, `agent_hangup`, or `error` |
+| `error` | server → client | `{code, message}` | §1.1 vocabulary — same code strings as REST |
+| `ping` / `pong` | both | `{ts}` | 10 s keepalive; two missed pongs mark the WS dead |
+
+One example per type:
+
+```json
+{"v": 1, "type": "offer", "payload": {"sdp": "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\n…"}}
+```
+
+```json
+{"v": 1, "type": "answer", "payload": {"sdp": "v=0\r\no=- 3958984660 3958984660 IN IP4 0.0.0.0\r\ns=-\r\n…"}}
+```
+
+```json
+{"v": 1, "type": "ice", "payload": {
+  "candidate": "candidate:842163049 1 udp 1677729535 49.36.112.8 61042 typ srflx raddr 10.0.4.17 rport 50213 generation 0",
+  "sdpMid": "0", "sdpMLineIndex": 0}}
+```
+
+```json
+{"v": 1, "type": "bye", "payload": {"reason": "user_hangup"}}
+```
+
+```json
+{"v": 1, "type": "error", "payload": {"code": "AUTH_EXPIRED_TOKEN",
+ "message": "Signaling token expired. Re-mint via POST /v1/sessions/{id}/token."}}
+```
+
+```json
+{"v": 1, "type": "ping", "payload": {"ts": 1784536470000}}
+{"v": 1, "type": "pong", "payload": {"ts": 1784536470000}}
+```
+
+### 6.1 Connect flow
+
+```mermaid
+sequenceDiagram
+    participant App as Android WebRtcClient
+    participant Sig as voice-worker SignalingServer
+    App->>Sig: WS connect (session_id + signaling_token)
+    Note over Sig: verify + burn token before reading any SDP
+    App->>Sig: offer {sdp} — mic track + ctx data channel inside
+    Note over Sig: create aiortc RTCPeerConnection (PeerSession)
+    Sig->>App: answer {sdp}
+    par trickle ICE, both directions
+        App->>Sig: ice {candidate, sdpMid, sdpMLineIndex}
+        Sig->>App: ice {candidate, sdpMid, sdpMLineIndex}
+    end
+    Note over App,Sig: first working pair → DTLS-SRTP → media + ctx flow
+    loop every 10 s while in call
+        App->>Sig: ping
+        Sig->>App: pong
+    end
+    App->>Sig: bye {reason}
+```
+
+Three deliberate choices in that flow:
+
+- **The client is always the offerer.** It knows when mic permission landed and it creates the `ctx` data channel, so the offer describes everything the call needs in one SDP. The server never speaks first — `PeerSession` stays stateless until an offer arrives, which keeps reconnect logic single-sided and simple.
+- **Trickle ICE, not gathered-then-send.** Candidates fly as `ice` messages the moment each side discovers them; media starts on the first working pair instead of after full gathering. This is most of the call-setup budget win — ≤ 1.5 s p50 to first media, TURN-relayed worst case ≤ 3 s ([docs/06](06-voice-pipeline.md)).
+- **ICE restart rides the same protocol.** On network change (Wi-Fi ↔ cellular), `WebRtcClient` calls `createOffer({iceRestart: true})` and sends a plain `offer` over the same WebSocket; the server answers, fresh candidate pairs trickle, media resumes — the data channel and all session state survive untouched. If the network change killed the WebSocket too, the client first re-mints via `POST /v1/sessions/{id}/token` (tokens are one-time, §6.2) and reconnects — the `CallStateMachine`'s Reconnecting state in [docs/03](03-android-architecture.md).
+
+The WebSocket stays open for the whole call. Its death does not end the call — media flows peer-to-peer regardless — but it must be re-established before any operation that needs signaling (ICE restart, clean `bye`), which is why the client treats two missed pongs as a prompt to reconnect early rather than discovering the corpse mid-handover.
+
+### 6.2 Signaling token
 
 | Property | Value | Why |
 |---|---|---|
-| Room name | `session-a1f3c9` (`session-{session_id}`) | Room ↔ session is 1:1; the room name is greppable straight to the Redis keys and Postgres rows |
-| Client identity | `user-usr_rajesh01` (`user-{user_id}`) | The `user-` prefix disambiguates principals in room events. Yes, `user-usr_` stutters — the price of composing two frozen naming conventions, accepted over breaking either |
-| Agent identity | `agent`, participant name "Asha" | Stable identity for the worker's participant-left detection ([docs/02 §6](02-system-architecture.md)); the display name is the persona |
-| Grants (client) | `roomJoin`, room-scoped to `session-a1f3c9`, `canPublish` (mic), `canSubscribe`, `canPublishData` | Least privilege: no room-create, no admin, no other rooms |
-| TTL | **5 minutes** (canon §12) | Bounds the *join window*, not the call: an established connection outlives its token, and LiveKit's resume path covers brief drops. A cold rejoin past the TTL uses `POST /v1/sessions/{id}/token` — same room, fresh token |
+| Format | Opaque random (`st_…`), stored SHA-256-hashed in Redis under the session | Nothing to decode is nothing to forge offline; no second JWT contract to maintain |
+| TTL | **5 minutes** (canon §12), enforced by the Redis key's own expiry | The deadline is structural, not procedural — no code path can forget to check it |
+| Use | One-time: verified and burned at WS accept, before any SDP is read | A leaked or logged URL replays as a dead token; reconnect requires the re-mint endpoint |
+| Bounds | The *connect window*, not the call | An accepted WebSocket outlives its token; `expires` in §2.1 is this deadline |
 
-Decoded, the client token:
+Verification order is a security invariant, not a style choice: token checked → burned → only then is SDP parsed ([docs/14](14-security.md)). An unauthenticated peer never reaches the SDP parser.
 
-```json
-{
-  "iss": "APIvyapardemo",
-  "sub": "user-usr_rajesh01",
-  "name": "Rajesh Kumar",
-  "nbf": 1784536462,
-  "exp": 1784536762,
-  "video": {
-    "room": "session-a1f3c9",
-    "roomJoin": true,
-    "canPublish": true,
-    "canSubscribe": true,
-    "canPublishData": true
-  }
-}
+---
+
+## 7. TURN credential contract
+
+coturn runs with `use-auth-secret`: no user database, no provisioning calls — credentials are *computed*, by agent-api at session create, and *recomputed* by coturn at allocation time. The scheme is the standard TURN REST-API credential format:
+
+```
+username   = "<expiry_unix_ts>:<session_id>"          → "1784537062:a1f3c9"
+credential = base64( HMAC-SHA1( TURN_SECRET, username ) )
 ```
 
-`exp - nbf = 300` — the token *is* the 5-minute claim, verifiable by decoding it. Server-minted, never constructed client-side: the LiveKit API secret exists only in agent-api's environment.
+coturn verifies the HMAC with the same shared `TURN_SECRET` (compose injects it into both containers; env only, per canon) and rejects both bad signatures and expired timestamps. The pair rides back to the client inside `ice_servers` (§2.1) and goes verbatim into `PeerConnection` construction.
+
+| Property | Value | Why |
+|---|---|---|
+| Scheme | coturn `use-auth-secret` (HMAC time-limited credentials) | Zero credential state in coturn; agent-api mints, coturn verifies, nobody stores |
+| Username | `<expiry_ts>:<session_id>` | Expiry travels inside the username; the session id makes relay usage attributable in coturn logs |
+| TTL | **10 minutes** (canon §12) | Longer than the 5-min signaling TTL on purpose: the credential must stay valid through mid-call allocation refreshes, not just the connect window |
+| URLs | `turn:…:3478?transport=udp` first, `turns:…:5349` fallback | UDP is the fast path; TLS on 5349 survives carrier NATs and firewalls that eat UDP ([docs/14](14-security.md)) |
+| Rotation | Rotating `TURN_SECRET` invalidates all outstanding credentials | Acceptable blast radius at a 10-min TTL |
+
+Honest demo note: a TURN-relayed call that outlives the 10-minute credential loses its relay when the next allocation refresh fails; recovery is the §6.1 ICE-restart path with freshly minted credentials from `POST /v1/sessions/{id}/token`. The demo accepts this — the canonical call runs ~5 minutes — and the client does not preemptively re-mint. Production evolution: sliding credential refresh pushed over the data channel before expiry, and the flip condition to managed TURN (global relay traffic) recorded in [docs/16](16-tech-stack.md).
 
 ---
 
-## 7. OpenAPI and the `protocol/` authority
+## 8. OpenAPI and the `protocol/` authority
 
-FastAPI generates OpenAPI from the same Pydantic models that validate requests; Swagger UI serves at `/docs`, the raw spec at `/openapi.json`. That artifact is a **view, not the truth**. The cross-language source of truth is [protocol/](../protocol/): JSON Schemas for `screen_context/v1`, `app_event/v1`, the data-channel envelope, the session REST shapes, and the tool contracts, plus fixtures. CI round-trips both sides against it — Pydantic model exports are diffed against the schemas, Kotlin serializers are validated against the fixtures ([docs/02 §7](02-system-architecture.md)). If the generated OpenAPI and a `protocol/` schema disagree, the build fails; neither side gets to win silently. The rejected alternative — treat OpenAPI as the master spec — loses because half the contract surface (data-channel messages, tool schemas) never appears in OpenAPI at all, and a source of truth that covers 60% of the truth is a source of confusion.
+FastAPI generates OpenAPI from the same Pydantic models that validate requests; Swagger UI serves at `/docs`, the raw spec at `/openapi.json`. That artifact is a **view, not the truth**. The cross-language source of truth is [protocol/](../protocol/): JSON Schemas for `screen_context/v1`, `app_event/v1`, the data-channel and signaling envelopes, the session REST shapes, and the tool contracts, plus fixtures. CI round-trips both sides against it — Pydantic model exports are diffed against the schemas, Kotlin serializers are validated against the fixtures ([docs/02 §7](02-system-architecture.md)). If the generated OpenAPI and a `protocol/` schema disagree, the build fails; neither side gets to win silently. The rejected alternative — treat OpenAPI as the master spec — loses because half the contract surface (data-channel and signaling messages, tool schemas) never appears in OpenAPI at all, and a source of truth that covers 60% of the truth is a source of confusion.
 
 ---
 
-## 8. Versioning and compatibility
+## 9. Versioning and compatibility
 
-**Additive within `/v1`.** Allowed without any version change: new endpoints; new optional request fields; new response fields; new error codes within an existing prefix class; new data-channel message types. This only works if clients hold up their half, so the client rules are part of the contract and coded from day one: ignore unknown response fields, ignore unknown envelope `type`s, switch on error-code prefix when the member is unknown.
+**Additive within `/v1`.** Allowed without any version change: new endpoints; new optional request fields; new response fields; new error codes within an existing prefix class; new data-channel or signaling message types. This only works if clients hold up their half, so the client rules are part of the contract and coded from day one: ignore unknown response fields, ignore unknown envelope `type`s, switch on error-code prefix when the member is unknown.
 
 **Breaking changes** — removing or renaming a field, changing a type or unit, changing the semantics of an existing code, making an optional field required — get `/v2` and a payload version bump in lockstep: `screen_context/v2`, `app_event/v2`, envelope `"v": 2`. The REST path version and the schema versions move together because a client speaking `/v2` REST but `v1` deltas is a support nightmare nobody should be able to construct.
 
@@ -454,11 +541,12 @@ Demo honesty: `/v2` will almost certainly never exist in this repo. The policy i
 | Fixed here | Value | Heaviest consumer |
 |---|---|---|
 | Response envelope | `{success, data, error{code, message, details?}, meta}` on every endpoint | Android `core:network`, all business handlers |
-| Error vocabulary | §1.1 taxonomy; one set of codes across REST, tool results, and timeline events; prefix classes extensible, meanings frozen | [docs/10](10-tool-calling.md), [docs/08](08-context-and-events.md) |
+| Error vocabulary | §1.1 taxonomy; one set of codes across REST, tool results, signaling `error`, and timeline events; prefix classes extensible, meanings frozen | [docs/10](10-tool-calling.md), [docs/08](08-context-and-events.md) |
 | Units on the wire | Integer paise on REST (`*_paise`); rupees exist only at the tool boundary | [docs/12](12-data-models.md), [docs/10](10-tool-calling.md) |
-| Session lifecycle | §2 endpoints; `expires_at` = join deadline; summary polled with `SESSION_SUMMARY_PENDING`; idempotent hang-up | Android `:feature:support`, [docs/09](09-memory-architecture.md) |
+| Session lifecycle | §2 endpoints; `expires` = signaling-token connect deadline; summary polled with `SESSION_SUMMARY_PENDING`; idempotent hang-up | Android `:feature:support`, [docs/09](09-memory-architecture.md) |
 | Two-consumer business API | App and tools hit the same `/v1` endpoints; `Idempotency-Key` header carries the [docs/10](10-tool-calling.md) key | [docs/10](10-tool-calling.md), [docs/12](12-data-models.md) |
-| `ui` topic + message types | `transcript.partial` / `transcript.final` keyed on (turn, role); `agent.state` ∈ listening/thinking/speaking; client never gap-checks `ui` | `ConversationOverlay`, [docs/06](06-voice-pipeline.md) |
-| LiveKit token contract | Room `session-{id}`, identities `user-{user_id}` / `agent`, data-channel + mic grants only, 5-min join TTL, re-mint endpoint | [docs/14](14-security.md), [docs/02](02-system-architecture.md) |
+| Data-channel message set | One client-opened `RTCDataChannel`, label `ctx`; `transcript.partial` / `transcript.final` keyed on (turn, role); `agent.state` ∈ listening/thinking/speaking; client never gap-checks the server stream | `ConversationOverlay`, [docs/06](06-voice-pipeline.md) |
+| Signaling protocol | `/v1/signal` WS on voice-worker; envelope `{v, type, payload}`; client offers (mic + `ctx` channel), trickle ICE, re-offer for ICE restart; ping/pong 10 s | [docs/03](03-android-architecture.md), [docs/02](02-system-architecture.md) |
+| Token + TURN credentials | Signaling token opaque, 5-min TTL, one-time, Redis-burned; TURN via coturn `use-auth-secret`, username `<ts>:<session_id>`, 10-min HMAC credential | [docs/14](14-security.md) |
 | Contract authority order | `protocol/` schemas > generated OpenAPI; CI fails on divergence | [docs/02](02-system-architecture.md), CI |
 | Compatibility policy | Additive-within-v1 with mandatory client ignore-rules; breaking → `/v2` + schema bump in lockstep | Android app, [protocol/](../protocol/) |

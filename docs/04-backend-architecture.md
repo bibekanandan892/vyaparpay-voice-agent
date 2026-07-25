@@ -26,17 +26,19 @@ flowchart TB
     APP --> PG[("Postgres 16 + pgvector")]
     APP --> RD[("Redis 7")]
     W -. "tool calls over HTTP (localhost)" .-> API
-    W --> LK["LiveKit room (Asha participant)"]
+    AND["Android peer (libwebrtc)"] <-. "WSS /v1/signal + DTLS-SRTP media + ctx data channel" .-> W
+    AND -. "TURN relay when P2P fails" .-> CT["coturn (STUN + TURN)"]
+    CT -.-> W
 ```
 
 | Entrypoint | Command | Owns | Never does |
 |---|---|---|---|
-| **agent-api** | `uvicorn app.main:app` | Session mint/teardown, seeded business APIs, initial-context ingestion, post-call persistence | Joins a LiveKit room or touches audio |
-| **voice-worker** | LiveKit Agents runner (`app.voice.run`) | Joins the room as "Asha", runs the per-turn brain, calls agent-api's business APIs over HTTP for tool data | Owns business data directly — it reads through the API, never straight from tables |
+| **agent-api** | `uvicorn app.main:app` | Session mint (signaling token + TURN credentials), seeded business APIs, initial-context ingestion, post-call persistence | Terminates a WebRTC peer or touches audio |
+| **voice-worker** | `python -m app.voice.run` (asyncio service) | Hosts the `/v1/signal` WebSocket, owns one aiortc `RTCPeerConnection` per call, runs the per-call `VoiceAgentWorker` and the per-turn brain, calls agent-api's business APIs over HTTP for tool data | Owns business data directly — it reads through the API, never straight from tables |
 
 **Why one deployable for the demo.** Two images, service discovery, and mTLS between them is production plumbing for a system that runs on one `docker compose up`. Splitting now would force a third shared-library package for `ConversationManager` and `SnapshotIngestor`, which both entrypoints use, at zero benefit at demo scale (rejected in [docs/02 §7](02-system-architecture.md)). The seam is kept honest anyway: even in the demo, tool handlers reach business data over HTTP to `localhost` (~1–2 ms), never by importing the business modules. That ~2 ms is the cheapest insurance in the repo — the production split becomes a build-pipeline change (build twice, repoint the worker's base URL, swap the shared-secret JWT for exchanged tokens), not a refactor ([docs/13 §5](13-api-contracts.md)).
 
-**Async-first, end to end.** Every I/O path is `asyncio`: FastAPI on `uvicorn`, SQLAlchemy 2.0 async with `asyncpg`, `redis.asyncio`, and `httpx.AsyncClient` for every provider (OpenRouter, Deepgram, ElevenLabs, OpenAI embeddings). The discipline is load-bearing on the worker: one blocking call in the event loop stalls *every* concurrent call on that process ([docs/16 §4](16-tech-stack.md)). The structural mitigations — no sync HTTP client anywhere, no sync DB driver, CPU-bound work (none on the hot path) offloaded to a thread — are enforced in review, and the per-turn spans (§7) turn an accidental stall into an anomalous `context.build` duration instead of a mystery hang.
+**Async-first, end to end.** Every I/O path is `asyncio`: FastAPI on `uvicorn`, SQLAlchemy 2.0 async with `asyncpg`, `redis.asyncio`, and `httpx.AsyncClient` for every provider (OpenRouter, Deepgram, ElevenLabs, OpenAI embeddings). The discipline is load-bearing on the worker: one blocking call in the event loop stalls *every* concurrent call on that process ([docs/16 §4](16-tech-stack.md)). The structural mitigations — no sync HTTP client anywhere, no sync DB driver, and the per-frame CPU work the hand-rolled pipeline does own (Opus codec via PyAV, Silero inference via onnxruntime) confined to native code that releases the GIL, with anything heavier pushed to a thread — are enforced in review, and the per-turn spans (§7) turn an accidental stall into an anomalous `context.build` duration instead of a mystery hang.
 
 ---
 
@@ -60,7 +62,9 @@ backend/
 │   ├── tools/           # tool registry + one module per tool (16 tools, docs/10)
 │   ├── providers/       # LLMProvider→OpenRouterLLM, SttProvider→DeepgramStt,
 │   │                    #   TtsProvider→ElevenLabsTts, EmbeddingProvider→OpenAIEmbeddings
-│   ├── voice/           # VoiceAgentWorker — the only LiveKit-aware package (docs/06)
+│   ├── voice/           # hand-rolled WebRTC + voice pipeline (docs/06): SignalingServer,
+│   │                    #   PeerSession, AudioIngress, VadEndpointer, AudioEgress,
+│   │                    #   VoiceAgentWorker
 │   ├── data/            # repositories, SQLAlchemy engine/session, Redis client (§5)
 │   ├── obs/             # structlog config, OTel setup, PII redactor (§7)
 │   └── models/          # Pydantic schemas + SQLAlchemy ORM (docs/12)
@@ -69,7 +73,9 @@ backend/
 └── scripts/             # seed.py, dev helpers (§9)
 ```
 
-The boundary that matters most is `app/voice/`: per [docs/05 §1.1](05-agent-architecture.md) it is the only package allowed to `import livekit`. Everything else speaks in `ContextBundle`, `Message`, `ToolResult`, `TurnCost` — which is why every module below it is testable without a room (§8).
+The boundary that matters most is `app/voice/`: per [docs/05 §1.1](05-agent-architecture.md) it is the only package allowed to import `aiortc`, `av`, or `onnxruntime`. Everything else speaks in `ContextBundle`, `Message`, `ToolResult`, `TurnCost` — which is why every module below it is testable without a peer connection (§8).
+
+**Audio dependencies.** `aiortc` pulls in PyAV (ffmpeg bindings) for Opus encode/decode and resampling, and `onnxruntime` (CPU) runs the Silero VAD model — all confined to `app/voice/`. Because both entrypoints share one image (§1), agent-api carries ffmpeg it never uses; the extra image weight is accepted for the single-image simplicity, and a production split would trim it out of the api image as a side effect.
 
 ---
 
@@ -92,15 +98,17 @@ The boundary that matters most is `app/voice/`: per [docs/05 §1.1](05-agent-arc
 | `DEEPGRAM_API_KEY` / `DEEPGRAM_MODEL` | STT provider | key / `nova-3` |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` | TTS provider (Flash v2.5) | key / voice id |
 | `OPENAI_API_KEY` / `EMBEDDING_MODEL` | Embeddings ([docs/09](09-memory-architecture.md)) | key / `text-embedding-3-small` |
-| `LIVEKIT_URL` | SFU websocket | `wss://livekit.vyapar.local:7880` |
-| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Server-side token minting | *(required)* |
+| `SIGNALING_PUBLIC_URL` | Public `wss` base of the voice-worker `/v1/signal` endpoint, returned in the session response ([docs/13 §2.1](13-api-contracts.md)) | `wss://voice.vyapar.local/v1/signal` |
+| `SESSION_TOKEN_SECRET` | HMAC secret for one-time signaling tokens (5-min TTL; minted by agent-api, verified by voice-worker) | *(required)* |
+| `TURN_SECRET` | coturn `use-auth-secret` shared secret; agent-api mints 10-min HMAC TURN credentials with it (canon §12) | *(required)* |
+| `COTURN_HOST` | Public host stamped into the `turn:`/`turns:` URLs in `ice_servers` | `turn.vyapar.local` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Trace export target | `http://tempo:4317` |
 | `OTEL_SERVICE_NAME` | Service label on spans | `agent-api` / `voice-worker` |
 | `SESSION_TTL_SECONDS` | `session:{id}` expiry (canon §11) | `86400` |
 | `RATE_LIMIT_SESSIONS_PER_MIN` | Session-create window (§6) | `5` |
 | `CALL_COST_CAP_USD` | Runaway guard ([docs/05 §3.8](05-agent-architecture.md)) | `1.00` |
 
-Model IDs are **current defaults, not constants** (canon §5): the router reads `settings.dialogue_model` at request time, and the fallback slugs live in `models: [...]`, so a model swap is an env edit and a redeploy, never a code change. The one place this rule visibly pays off is the `.env.example` diff a reviewer reads to understand the whole external surface — ten provider keys and two model IDs, and nothing hidden in source.
+Model IDs are **current defaults, not constants** (canon §5): the router reads `settings.dialogue_model` at request time, and the fallback slugs live in `models: [...]`, so a model swap is an env edit and a redeploy, never a code change. The one place this rule visibly pays off is the `.env.example` diff a reviewer reads to understand the whole external surface — the provider keys, the two transport secrets (`SESSION_TOKEN_SECRET`, `TURN_SECRET`), and two model IDs, with nothing hidden in source.
 
 ---
 
@@ -228,7 +236,7 @@ class Repository(Protocol[T]):
 
 ## 6. Rate limiting
 
-A Redis **sliding-window** counter per user, keyed `rate:{user_id}` (canon §11). It guards the two surfaces that can be abused into cost: session creation (the expensive one — it mints a room, prefetches context, and warms the LLM cache) and the mutating business endpoints. Session creation is capped at **5 per minute** per user (`RATE_LIMIT_SESSIONS_PER_MIN`, [docs/13 §1.1](13-api-contracts.md)); exceeding it returns `429 RATE_LIMITED` with a `Retry-After` header, and the app shows "couldn't start the call" with no room and nothing to clean up.
+A Redis **sliding-window** counter per user, keyed `rate:{user_id}` (canon §11). It guards the two surfaces that can be abused into cost: session creation (the expensive one — it mints signaling and TURN credentials, prefetches context, and warms the LLM cache) and the mutating business endpoints. Session creation is capped at **5 per minute** per user (`RATE_LIMIT_SESSIONS_PER_MIN`, [docs/13 §1.1](13-api-contracts.md)); exceeding it returns `429 RATE_LIMITED` with a `Retry-After` header, and the app shows "couldn't start the call" with no session minted and nothing to clean up.
 
 ```python
 # app/api/deps.py — sorted-set sliding window (atomic via pipeline)
@@ -336,13 +344,14 @@ Doc-set convention: Failure | Detection | Impact | Mitigation | Degradation.
 
 ## 8. Testing
 
-Coverage target **80%** (repo rule), enforced in CI. The framework boundary (§2) is what makes the target reachable: the brain is exercised without a LiveKit room, audio, or WebRTC.
+Coverage target **80%** (repo rule), enforced in CI. The package boundary (§2) is what makes the target reachable: the brain is exercised without a peer connection, audio, or the WebRTC stack.
 
 | Layer | Scope | Tooling |
 |---|---|---|
 | **Unit** | Each `app/agent`, `app/context`, `app/memory` module against fake providers | `pytest`, `pytest-asyncio`, fakes implementing the provider `Protocol`s |
 | **Contract** | Every Pydantic model round-tripped against the [protocol/](../protocol/) JSON Schemas + fixtures | `pytest` + `jsonschema`; fails on any drift ([docs/13 §7](13-api-contracts.md)) |
 | **Integration** | Repositories + API routes against real Postgres/Redis | `testcontainers` (postgres:16 w/ pgvector, redis:7), Alembic `upgrade head` in fixture |
+| **Fake-peer** | `SignalingServer` + `PeerSession` + audio path against a real second peer | In-process **aiortc client peer** over a loopback WS, driving PCM fixtures |
 | **Provider mocking** | OpenRouter/Deepgram/ElevenLabs HTTP stubbed at the wire | `respx` over `httpx` — asserts the request bodies (fallback array, `usage.include`) |
 | **E2E** | One scripted conversation over **text**, bypassing audio | Drives `ConversationManager` with `stt.final` strings; asserts sentences, tool calls, spans |
 
@@ -351,6 +360,8 @@ Coverage target **80%** (repo rule), enforced in CI. The framework boundary (§2
 **Contract tests** are the seam that keeps Python and Kotlin honest: Pydantic model exports are diffed against `screen_context/v1`, `app_event/v1`, the data-channel envelope, and the tool schemas in [protocol/](../protocol/); if a model and a schema disagree, the build fails and neither side wins silently ([docs/13 §7](13-api-contracts.md)).
 
 **Integration** uses `testcontainers` so tests run against a real Postgres 16 with the pgvector extension and a real Redis 7 — the transaction boundaries (§5), the sliding-window ZSET (§6), and the HNSW top-3 retrieval ([docs/09](09-memory-architecture.md)) are all things a mock would fake wrongly.
+
+**Fake-peer integration** is the transport's own test, made possible by aiortc being a library rather than a hosted service: the test spins up an in-process aiortc *client* peer that dials the `SignalingServer` over a local WebSocket, completes the real offer/answer + trickle-ICE handshake, opens the `ctx` data channel, and streams canned PCM fixtures (the canonical utterances) through actual Opus encode. Assertions cover `VadEndpointer` endpoint timing against the fixtures' known silence gaps, the `transcript.*` and `agent.state` frames coming back on the data channel, and clean teardown on `bye` — the whole WebRTC surface exercised in one process, no phone, no network ([docs/06](06-voice-pipeline.md)).
 
 **E2E over text** is the highest-value cheap test: it runs the full brain — context build, prompt, LLM (via `respx`-stubbed OpenRouter), tool loop, safety checks, cost — end to end for the canonical `DAILY_LIMIT_EXCEEDED` scenario, and asserts the resolution path (`request_limit_increase` → confirm → summary) and that no voiced number is absent from a tool result ([docs/05 §3.6](05-agent-architecture.md)). Audio, VAD, and barge-in timing are out of scope here and covered in the voice-pipeline tests ([docs/06](06-voice-pipeline.md)).
 
@@ -361,7 +372,7 @@ Coverage target **80%** (repo rule), enforced in CI. The framework boundary (§2
 The whole stack is one compose file; the loop from clone to a live curl'd session is five commands.
 
 ```bash
-# 1. bring up the stack — postgres(+pgvector), redis, livekit, tempo, loki, grafana,
+# 1. bring up the stack — postgres(+pgvector), redis, coturn, tempo, loki, grafana,
 #    agent-api, voice-worker. Migrations run on agent-api start.
 cp backend/.env.example backend/.env          # fill provider keys
 docker compose up -d
@@ -377,12 +388,12 @@ docker compose logs -f voice-worker
 curl -s http://localhost:8000/v1/sessions \
   -H "Authorization: Bearer $RAJESH_JWT" -H 'Content-Type: application/json' \
   -d @scripts/fixtures/session_create.json | jq
-#   → { session_id, livekit_url, livekit_token, expires_at }
+#   → { session_id, signaling_url, signaling_token, ice_servers, expires }
 ```
 
 The seed script is the demo's backbone: it writes the exact canonical fixtures (canon §2) so every worked example in the doc set is reproducible against a fresh database, and it prints one long-lived JWT per merchant since there is no login flow ([docs/13 §1.2](13-api-contracts.md)). The `session_create.json` fixture is byte-identical to the request in [docs/13 §2.1](13-api-contracts.md), so the curl above reproduces the canonical incident.
 
-**Device testing over ngrok.** The Android app needs to reach agent-api and LiveKit from a physical phone. `ngrok http 8000` fronts agent-api for the REST channel; LiveKit's `wss` endpoint is exposed the same way (or via a LAN IP with the app pointed at it). This is a **demo-only** convenience — production terminates TLS at a real gateway with the LiveKit SFU behind proper TURN/ICE, not an ngrok tunnel — and it is called out as such so nobody mistakes the tunnel for architecture.
+**Device testing on a real phone.** The Android app needs three reachable surfaces: agent-api (REST), the voice-worker `/v1/signal` WebSocket, and coturn. `ngrok http 8000` fronts agent-api, and a second `ngrok http` tunnel (or a LAN IP) fronts the signaling WS — `SIGNALING_PUBLIC_URL` is set to whatever the phone can reach. Media does not tunnel: the phone reaches coturn directly on the host's LAN IP (compose maps coturn's UDP/TCP listening ports), with `COTURN_HOST` pointed at that IP so the minted `ice_servers` resolve. This is a **demo-only** convenience — production terminates TLS at a real gateway with coturn on a public IP and real DNS, not an ngrok tunnel — and it is called out as such so nobody mistakes the tunnel for architecture.
 
 ---
 
@@ -390,7 +401,7 @@ The seed script is the demo's backbone: it writes the exact canonical fixtures (
 
 | Fixed here | Value | Heaviest consumer |
 |---|---|---|
-| Process model | One image, two entrypoints (uvicorn agent-api / LiveKit worker); tool data over HTTP even in demo | [docs/02](02-system-architecture.md), [docs/13](13-api-contracts.md) |
+| Process model | One image, two entrypoints (uvicorn agent-api / asyncio voice-worker hosting `/v1/signal` + aiortc peers); tool data over HTTP even in demo | [docs/02](02-system-architecture.md), [docs/13](13-api-contracts.md) |
 | Async-first stack | asyncio + SQLAlchemy 2 async/asyncpg + `httpx.AsyncClient`; no sync I/O on any path | [docs/16](16-tech-stack.md) |
 | Provider DI | `Protocol`-typed singletons in lifespan; request scope via `Depends`; fakes in tests | [docs/05](05-agent-architecture.md), [docs/06](06-voice-pipeline.md) |
 | OpenRouter call shape | `chat.completions` stream, `models:[...]` fallback array, `usage` frame → `CostTracker` | [docs/05](05-agent-architecture.md), [docs/16](16-tech-stack.md) |
@@ -398,4 +409,4 @@ The seed script is the demo's backbone: it writes the exact canonical fixtures (
 | Rate limiting | Redis sliding-window ZSET `rate:{user_id}`; 5 session-creates/min; fail-closed on Redis down | [docs/13](13-api-contracts.md) |
 | Observability stack | structlog JSON→Loki, OTel one-trace-per-turn→Tempo, Grafana; frozen span names + 7-event catalog | [docs/05](05-agent-architecture.md), [docs/16](16-tech-stack.md) |
 | Dashboard spec | 6 panels, each with a source query and a canonical reference line to drift from | [docs/16](16-tech-stack.md) |
-| Testing | Unit (fake providers) / contract (protocol/) / integration (testcontainers) / text e2e; 80% + respx | CI, [docs/13](13-api-contracts.md) |
+| Testing | Unit (fake providers) / contract (protocol/) / integration (testcontainers) / fake-peer (in-process aiortc client) / text e2e; 80% + respx | CI, [docs/13](13-api-contracts.md) |

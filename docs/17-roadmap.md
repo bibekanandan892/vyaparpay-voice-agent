@@ -21,12 +21,12 @@ Estimates below are ranges, and they are the estimates of someone who has been w
 |---|---|---|---|
 | 1 — Architecture | The doc set you are reading | ~15 evenings | ~15 ev |
 | 2 — Backend MVP | The brain works over text | ~6 weekends + ~8 ev | +~44 h |
-| 3 — Voice MVP | It is a real voice agent | ~9 weekends | +~54 h |
+| 3 — Voice MVP (raw WebRTC) | It is a real voice agent, on a transport we own | ~12 weekends | +~72 h |
 | 4 — Screen-aware context | The signature capability | ~5 weekends | +~30 h |
 | 5 — Memory + RAG + dashboard | It remembers and it is observable | ~4 weekends | +~24 h |
 | 6 — Production hardening | Evals, load, CI, security pass | ~5 weekends | +~30 h |
 
-Total after Phase 1: roughly **200 hours** of evenings and weekends — call it four to five calendar months at a sustainable part-time pace. That number is deliberately unglamorous; a roadmap that claims a screen-aware voice agent ships in three weekends is lying to the reviewer reading it.
+Total after Phase 1: roughly **220 hours** of evenings and weekends — call it five to six calendar months at a sustainable part-time pace. That number is deliberately unglamorous; a roadmap that claims a screen-aware voice agent on a hand-rolled WebRTC stack ships in three weekends is lying to the reviewer reading it. Phase 3 in particular is priced for owning signaling, NAT traversal, and the VAD/endpointing pipeline ourselves (ADR-001, ADR-002) — the three problem classes a managed platform would otherwise have absorbed.
 
 ### 1.2 Why this order
 
@@ -34,16 +34,16 @@ The dependency spine is not arbitrary. Two ordering choices carry the most weigh
 
 **Text agent before voice (Phase 2 before Phase 3).** The entire thesis of this project lives above the media loop — context assembly, prompt building, tool dispatch, safety gating, LLM routing ([docs/05](05-agent-architecture.md), ADR-002 in [docs/16](16-tech-stack.md)). That logic is identical whether the transport is a WebSocket text frame or an Opus audio stream. Building it first against a text harness means every bug is a *logic* bug reproduced instantly and deterministically, not a heisenbug hiding behind audio flakiness, VAD timing, and a 1-second turn budget. Debugging a hallucinated balance is hard; debugging it while also fighting jitter buffers is masochism. So the brain gets built and proven in a REPL-speed loop, then the voice pipeline wraps a component that already works.
 
-**Voice before screen-context (Phase 3 before Phase 4).** This is the counter-intuitive one — the screen-aware opener is the headline capability, so why not build it first? Because it is a *multiplier on a working call*, not a prerequisite for one. A voice call that greets Rajesh with profile context alone already demos as a competent agent; the screen-aware cold-open makes that same call extraordinary. Sequencing puts the highest-risk, everything-depends-on-it integration (mobile WebRTC, the latency budget, barge-in) first, so it is de-risked while the schedule still has slack, and layers the signature capability onto a proven call rather than betting the signature capability on an unproven transport. There is also a hard dependency: the in-call ScreenContext delta channel is the LiveKit data channel (ADR-004), which does not exist until the room does — Phase 3 has to build the room before Phase 4 can stream context through it.
+**Voice before screen-context (Phase 3 before Phase 4).** This is the counter-intuitive one — the screen-aware opener is the headline capability, so why not build it first? Because it is a *multiplier on a working call*, not a prerequisite for one. A voice call that greets Rajesh with profile context alone already demos as a competent agent; the screen-aware cold-open makes that same call extraordinary. Sequencing puts the highest-risk, everything-depends-on-it integration (signaling, ICE/NAT traversal, the latency budget, barge-in) first, so it is de-risked while the schedule still has slack, and layers the signature capability onto a proven call rather than betting the signature capability on an unproven transport. There is also a hard dependency: the in-call ScreenContext delta channel is the native `RTCDataChannel` (label `ctx`, ADR-004), which does not exist until the peer connection does — Phase 3 has to establish the call before Phase 4 can stream context through it.
 
 ```mermaid
 flowchart LR
     P1["Phase 1<br/>Architecture ✅"] --> P2["Phase 2<br/>Backend MVP (text)"]
-    P2 --> P3["Phase 3<br/>Voice MVP — MVP line"]
+    P2 --> P3["Phase 3<br/>Voice MVP (raw WebRTC) — MVP line"]
     P3 --> P4["Phase 4<br/>Screen-aware context"]
     P4 --> P5["Phase 5<br/>Memory + RAG + dashboard"]
     P5 --> P6["Phase 6<br/>Production hardening"]
-    P2 -.->|"data channel needs the room"| P4
+    P3 -.->|"ctx data channel needs the peer connection"| P4
 ```
 
 Each phase below ends with a **portfolio milestone**: a demo artifact worth recording, because a phase that produces nothing showable is a phase that is easy to abandon.
@@ -56,13 +56,13 @@ The components are frozen by name in the canon before any of them exist; this ma
 |---|---|---|---|---|---|
 | Agent loop ([docs/05](05-agent-architecture.md)) | `SessionManager`, `ConversationManager`, `ContextBuilder`, `PromptBuilder`, `ToolExecutor`, `LLMRouter`, `SafetyLayer`, `CostTracker` | — | context slots wired | `Summarizer` | eval hooks, redaction |
 | Providers ([docs/16](16-tech-stack.md)) | `OpenRouterLLM` | `DeepgramStt`, `ElevenLabsTts` | — | `OpenAIEmbeddings` | fallback arrays proven |
-| Voice ([docs/06](06-voice-pipeline.md)) | — | `VoiceAgentWorker`, `voice-worker` | data-channel deltas | — | load-tested |
-| Android call ([docs/03](03-android-architecture.md)) | — | `SupportButton`, `VoiceCallService`, `WebRtcClient`, `CallStateMachine`, `ConversationOverlay`, `PermissionManager` | — | — | debug-build polish |
+| Voice ([docs/06](06-voice-pipeline.md)) | — | `SignalingServer`, `PeerSession`, `AudioIngress`, `VadEndpointer`, `AudioEgress`, `VoiceAgentWorker` (the `voice-worker` service) | data-channel deltas | — | load-tested |
+| Android call ([docs/03](03-android-architecture.md)) | — | `SupportButton`, `VoiceCallService`, `SignalingClient`, `WebRtcClient`, `CallStateMachine`, `ConversationOverlay`, `PermissionManager` | — | — | debug-build polish |
 | Android context ([docs/07](07-ui-semantic-context.md)) | — | — | `UiTreeCollector`, `SemanticSnapshotBuilder`, `NavigationTracker`, `EventTracker`, `ScreenContextPublisher`, `AppStateManager` | — | injection hardening |
 | Backend context ([docs/08](08-context-and-events.md)) | — | — | `SnapshotIngestor`, `EventLog`, `ContextCompressor` | — | — |
 | Memory ([docs/09](09-memory-architecture.md)) | `ShortTermMemory`, `SessionMemory` | — | — | `UserProfileMemory`, `SemanticMemory`, `ConversationSummaryStore` | — |
 
-Two things this matrix makes honest. First, Phase 3 is the widest column on the Android side — six new components at once — which is why it is the largest effort estimate. Second, the memory subsystem is genuinely absent until Phase 5; the earlier phases run on `SessionMemory` (a Redis transcript window) alone, and the docs that describe the full memory model are describing a Phase 5 target, not Phase 2 reality.
+Two things this matrix makes honest. First, Phase 3 is the widest column on *both* sides — seven new Android components and the entire hand-rolled `voice/` package at once — which is why it is the largest effort estimate. Second, the memory subsystem is genuinely absent until Phase 5; the earlier phases run on `SessionMemory` (a Redis transcript window) alone, and the docs that describe the full memory model are describing a Phase 5 target, not Phase 2 reality.
 
 ### 1.4 Not on this roadmap at all
 
@@ -90,7 +90,7 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 
 - The document set in [docs/](.) — product selection, system and per-layer architecture, voice pipeline, screen context, memory, tools, prompting, data models, API contracts, tech stack and ADRs, and this roadmap.
 - The single source of truth (`CANON.md`) that every doc is checked against — one owning doc per number (latency [docs/06](06-voice-pipeline.md), tokens [docs/11](11-prompt-engineering.md), cost [docs/16](16-tech-stack.md)).
-- Five locked ADRs ([docs/16](16-tech-stack.md)) with explicit flip conditions.
+- Six locked ADRs ([docs/16](16-tech-stack.md)) with explicit flip conditions.
 
 **Out of scope.** Any runnable code. The repo skeleton and module layout exist; the modules are empty shells.
 
@@ -114,7 +114,7 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 - A text harness (WebSocket or CLI) that stands in for the voice front end — the Phase 2 development surface only, never a shipped feature ([docs/01](01-product-and-use-case.md) §9).
 - Per-turn OpenTelemetry spans emitting from day one (ADR-005), so latency instrumentation predates the latency-sensitive code.
 
-**Out of scope.** LiveKit, STT, TTS, the Android app, screen context, RAG retrieval, the memory subsystem beyond a transcript window in Redis.
+**Out of scope.** The WebRTC transport (signaling, coturn, aiortc), STT, TTS, the Android app, screen context, RAG retrieval, the memory subsystem beyond a transcript window in Redis.
 
 **Exit criteria.** A scripted text conversation resolves the canonical scenario end to end: the agent explains the wallet-vs-bank-limit contradiction using **real** `get_wallet_balance` + `get_payment_status` tool calls against seeded Postgres data (no hallucinated figures — the canon rule holds), then executes `request_limit_increase` only after an explicit confirmation, and returns a reference number. Each turn emits one OTel trace with the canon span names.
 
@@ -127,29 +127,29 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 
 **Portfolio milestone.** A screen recording of a text chat (or terminal) resolving Rajesh's incident with real tool calls, ending on the Grafana trace for the turn. Proves the brain works before any audio exists.
 
-### 2.3 Phase 3 — Voice MVP (the MVP line)
+### 2.3 Phase 3 — Voice MVP (raw WebRTC) — the MVP line
 
-**Goal.** Turn the text agent into a real phone call: the merchant taps a button and talks to Asha, who answers with **profile** context. This is the [minimal demo-able product](#3-mvp-what-the-minimum-viable-demo-is) — see §3.
+**Goal.** Turn the text agent into a real phone call on a transport we own end to end: the merchant taps a button and talks to Asha, who answers with **profile** context. This is the [minimal demo-able product](#3-mvp-what-the-minimum-viable-demo-is) — see §3.
 
 **Scope.**
 
-- LiveKit OSS server in compose; `voice-worker` running LiveKit Agents with Silero VAD and the turn detector (ADR-001, ADR-002).
-- The pipeline: `DeepgramStt` (Nova-3 streaming) → the Phase 2 agent loop → `ElevenLabsTts` (Flash v2.5), wired through `VoiceAgentWorker` ([docs/06](06-voice-pipeline.md)).
-- Android call surface: `SupportButton`, `VoiceCallService` (foreground), `WebRtcClient` (LiveKit SDK wrapper), `CallStateMachine`, `ConversationOverlay` with live transcript, `PermissionManager` for mic ([docs/03](03-android-architecture.md)).
-- `POST /v1/sessions` minting a short-lived room token ([docs/13](13-api-contracts.md)); the greeting composed from **user profile only** at this phase.
+- Signaling and NAT traversal: `SignalingServer` hosting the `/v1/signal` WebSocket (offer/answer, trickle ICE, `bye`, keepalive — [docs/13](13-api-contracts.md)); **coturn** in compose serving STUN+TURN with UDP/TCP/TLS fallback (ADR-006); `POST /v1/sessions` minting the one-time signaling token plus 10-min HMAC TURN credentials in `ice_servers`.
+- The backend peer: aiortc `PeerSession` per call — SDP answer, trickle ICE, DTLS-SRTP, audio tracks in/out, the `ctx` data channel accepted for later phases (ADR-001).
+- The hand-rolled pipeline (ADR-002, [docs/06](06-voice-pipeline.md)): `AudioIngress` (Opus → 16 kHz PCM) → `VadEndpointer` (Silero VAD, endpointing, barge-in detection) → `DeepgramStt` (Nova-3 streaming) → the Phase 2 agent loop → `ElevenLabsTts` (Flash v2.5) → `AudioEgress` (48 kHz outbound track, playout cancellation), all wired by `VoiceAgentWorker` in one asyncio task group.
+- Android call surface: `SupportButton`, `VoiceCallService` (foreground), `SignalingClient` (OkHttp WS), `WebRtcClient` (`org.webrtc` directly — `PeerConnection`, `createOffer`, trickle ICE, ICE restart on network change), `CallStateMachine`, `ConversationOverlay` with live transcript, `PermissionManager` for mic ([docs/03](03-android-architecture.md)).
 - Streaming discipline throughout: STT partials, LLM tokens, sentence-level TTS dispatch, barge-in ([docs/06](06-voice-pipeline.md)).
 
 **Out of scope.** Screen context (Phase 4) — the opening line is a profile-aware greeting ("Hi Rajesh, how can I help?"), not the screen-aware cold-open yet. RAG, semantic memory, multi-turn summarization beyond the raw window.
 
-**Exit criteria.** On a side-loaded debug APK, Rajesh taps `SupportButton`, the overlay opens, and the canonical 9-turn conversation ([docs/01](01-product-and-use-case.md) §8) completes over real bidirectional audio — the merchant *speaks* the problem, the agent answers with tool-fetched figures, the confirm-gated `request_limit_increase` executes, and the call ends on a summary card. Barge-in stops TTS within the ≤250 ms target and a demo run holds turn p50 ≤ 1.0 s / p95 ≤ 2.0 s ([docs/06](06-voice-pipeline.md)).
+**Exit criteria.** On a side-loaded debug APK, Rajesh taps `SupportButton`, the overlay opens, and the canonical 9-turn conversation ([docs/01](01-product-and-use-case.md) §8) completes over real bidirectional audio — the merchant *speaks* the problem, the agent answers with tool-fetched figures, the confirm-gated `request_limit_increase` executes, and the call ends on a summary card. The call connects **both** peer-to-peer via STUN **and** with the client forced to relay-only, proving the coturn path works before a symmetric-NAT carrier network forces it in a live demo. Call setup (session POST → first media) lands within the ≤1.5 s p50 budget ([docs/06](06-voice-pipeline.md)), barge-in stops TTS within the ≤250 ms target **measured** from the `VadEndpointer` trigger to the last emitted audio frame, and a demo run holds turn p50 ≤ 1.0 s / p95 ≤ 2.0 s.
 
-**Effort.** ~9 weekends — the largest single phase, because it is the highest-risk integration and spans two languages and a mobile device.
+**Effort.** ~12 weekends — the largest single phase by a wide margin, and honestly larger than a managed-platform build would have been. The premium is the point of ADR-001: signaling, ICE/NAT traversal, and VAD/endpointing/barge-in are problems a platform SDK would have absorbed, and here each is owned, debugged, and tunable code. Roughly a third of the estimate is the WebRTC plumbing (signaling protocol, coturn, aiortc session lifecycle), a third the pipeline (`AudioIngress`/`VadEndpointer`/`AudioEgress` and their tuning), and a third the Android call surface.
 
 **Key risks.**
 
-- *The latency budget is a claim that can fail.* Seven stages must sum under ~1 s p50 ([docs/06](06-voice-pipeline.md)). Mitigation: the OTel spans from Phase 2 decompose any miss into a stage; prompt-prefix caching and speculative prefetch are in the design, not bolted on.
-- *Mobile WebRTC on real networks* — ICE/TURN, reconnection, echo. Mitigation: this is exactly what buying LiveKit (ADR-001) instead of hand-rolling aiortc was meant to avoid.
-- *Barge-in tuning* fighting against TTS already in flight. Mitigation: LiveKit Agents' battle-tested interruption mechanics rather than a hand-rolled endpointer.
+- *The latency budget is a claim that can fail.* Seven stages must sum under ~1 s p50, and call setup has its own ≤1.5 s budget ([docs/06](06-voice-pipeline.md)). Mitigation: the OTel spans from Phase 2 decompose any miss into a stage; prompt-prefix caching, speculative prefetch, and trickle ICE (media on the first working candidate pair) are in the design, not bolted on.
+- *NAT traversal is now ours to get wrong* — symmetric NAT on Indian mobile carriers, TURN credential expiry mid-call, ICE restart on Wi-Fi↔cellular handoff. Mitigation: coturn's TCP/TLS fallback, the forced-relay exit criterion above, and `WebRtcClient`'s ICE-restart re-offer path exercised deliberately (airplane-mode toggles), not discovered in a demo.
+- *Hand-rolled barge-in and endpointing tuning* — the Silero thresholds (≥250 ms trailing silence, 200 ms min-speech, ≥200 ms barge-in) interact with TTS already in flight, and bad tuning reads as an agent that interrupts or dawdles. Mitigation: thresholds are config, not constants; the barge-in cancellation tree is a single owned code path in `VadEndpointer`/`AudioEgress` ([docs/06](06-voice-pipeline.md)), measured per-turn by the same spans that police latency.
 
 **Portfolio milestone (the MVP demo).** A phone-screen recording of a genuine voice call resolving the incident. This is the first artifact that reads as "a working AI voice agent" to a non-technical viewer.
 
@@ -162,7 +162,7 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 - Android capture: `UiTreeCollector` (Compose semantics tree) → `SemanticSnapshotBuilder` (raw tree → ScreenContext IR — the signature transform), `NavigationTracker`, `EventTracker` ring buffer, `ScreenContextPublisher`, `AppStateManager` ([docs/03](03-android-architecture.md), [docs/07](07-ui-semantic-context.md)).
 - The `:core:screencontext` module producing `screen_context/v1` and `app_event/v1` payloads.
 - Backend ingestion: `SnapshotIngestor`, `EventLog`, `ContextCompressor` ([docs/08](08-context-and-events.md)); the snapshot slot wired into `PromptBuilder`.
-- Two-channel delivery per ADR-004: the initial full snapshot on `POST /v1/sessions`; in-call deltas/events over the LiveKit data channel (topic `ctx`, client-monotonic `seq`, gap detection).
+- Two-channel delivery per ADR-004: the initial full snapshot on `POST /v1/sessions`; in-call deltas/events over the native `RTCDataChannel` (label `ctx`, client-monotonic `seq`, gap detection) that Phase 3's peer connection already carries.
 - Support-screen capture exclusion so the agent sees the *problem* screen, not the Help menu ([docs/01](01-product-and-use-case.md) §7, [docs/07](07-ui-semantic-context.md)).
 
 **Out of scope.** Semantic memory / RAG (Phase 5). Emotion, multilingual, intent prediction (future enhancements).
@@ -207,7 +207,7 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 
 - Evaluation pipeline: a set of golden conversations, an LLM-judge scoring transcripts for correctness/tone/groundedness, wired into CI with **latency and cost regression gates** ([docs/16](16-tech-stack.md), ADR-005 flip; §4 below).
 - Load test: sustain a target of concurrent calls, watching the media VMs and the turn budget under contention.
-- Security pass ([docs/14](14-security.md)): prompt-injection fence verification, PII redaction (card/Aadhaar/PAN) before LLM and in logs, token TTL and room-scoping, tool allowlist + per-session authorization, secrets-via-env audit.
+- Security pass ([docs/14](14-security.md)): prompt-injection fence verification, PII redaction (card/Aadhaar/PAN) before LLM and in logs, signaling-token and TURN-credential TTL enforcement, WS origin/auth checks before SDP acceptance, tool allowlist + per-session authorization, secrets-via-env audit.
 - CI/CD: test suites (unit/integration/E2E) at the coverage bar, container builds, `docker compose up` reproducibility for reviewers.
 - Docs polish: reconcile any drift between the built system and this set; fill the `escalate_to_human` handoff stub note ([docs/10](10-tool-calling.md)).
 
@@ -232,9 +232,10 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 | Pinecone / Qdrant | ~10M vectors or failed recall SLOs | §4.2 hybrid RAG is the precursor; swap is post-6 |
 | Kafka / Redpanda | A second service needs replayable fan-out | §4.3 session replay tests the seam; swap is post-6 |
 | LangChain / agent frameworks | Genuine multi-agent orchestration need | §4.2 multi-agent is the trigger, `LLMRouter` the seam |
-| LiveKit SIP / Twilio bridge (PSTN) | Outbound or dial-in calling required | §4.4 proactive support — the ADR-001 flip |
+| PSTN bridge (Twilio SIP trunk / media gateway) | Outbound or dial-in calling required | §4.4 proactive support |
+| SFU / managed platform (LiveKit, Daily) | Multi-party calls (supervisor whisper, conference) or per-node fan-out limits — the ADR-001 flip | Post-Phase 6, not scheduled; 1:1 topology holds |
+| Managed TURN (Twilio NTS) | Global production traffic — the ADR-006 flip | Not scheduled; self-hosted coturn suffices |
 | MongoDB | Never on current evidence | Not scheduled — a rejection, not a deferral |
-| Raw aiortc | Never for this project | Not scheduled |
 
 The pattern is deliberate: the hard scaling flips (dedicated vector DB, Kafka, a framework) are each preceded by a lighter enhancement (§4) that exercises the *seam* before committing to the swap — hybrid RAG before Qdrant, session replay before Kafka, a router before a framework. That is what the interfaces in [docs/16](16-tech-stack.md) §1 bought: the ability to test the pressure before paying for the migration.
 
@@ -262,14 +263,14 @@ The honesty contract from [docs/01](01-product-and-use-case.md) §5 applies to t
 
 | At the Phase 3 MVP | Real engineering | Staged / faked | Becomes real in |
 |---|---|---|---|
-| Voice transport | Self-hosted LiveKit SFU, real Opus audio, real barge-in | — | — |
+| Voice transport | Raw WebRTC peer link (libwebrtc ↔ aiortc), owned signaling, self-hosted coturn, real Opus over DTLS-SRTP, hand-rolled barge-in | — | — |
 | STT / LLM / TTS | Live Deepgram, Sonnet 5 via OpenRouter, ElevenLabs | — | — |
 | Agent loop | Real context build, prompt, tool dispatch, safety gate | — | — |
 | Business data | — | Seeded Postgres fixtures, reset script | Production: real merchant DB ([docs/01](01-product-and-use-case.md) §5) |
 | Payment rail | — | `POST /payments` returns scripted decline codes | Production: PSP/bank integration |
 | Limit increase | Real confirm-gated tool call + idempotency | Auto-approves after a seeded SLA | Production: real bank workflow |
 | Greeting context | Real profile lookup | Screen context not yet wired (Phase 4) | Phase 4 |
-| Auth | Real short-lived room token, session scoping | Demo JWT, no device binding | Production: OAuth + step-up |
+| Auth | Real one-time signaling token + HMAC TURN credentials, session scoping | Demo JWT, no device binding | Production: OAuth + step-up |
 
 The point of publishing this at the MVP line rather than burying it at Phase 6 is that the most common way portfolio demos mislead is by letting a seeded backend read as a real one. Stating the split up front is what lets the *real* parts — the voice pipeline, the tool safety gate, the latency budget — be taken at face value.
 
@@ -315,7 +316,7 @@ Everything here is **post-Phase 6**, out of scope for the build above, and inclu
 
 **Human handoff console — warm transfer.** Give `escalate_to_human` (a stub in the demo, per [docs/10](10-tool-calling.md)) a real destination: a live agent console that receives the conversation summary, the screen context, and the tool history, so the human starts warm instead of asking the merchant to repeat everything. Impressive because warm transfer is the single feature customers notice most in real support. It extends the `escalate_to_human` contract in [docs/10](10-tool-calling.md) and reuses the summary from [docs/09](09-memory-architecture.md).
 
-**Proactive support — outbound calls.** Have the agent place *outbound* calls: "your settlement failed — here is what happened and what I can do." This flips support from reactive to proactive and is the highest-value product move in the catalog. It requires PSTN, which is precisely the ADR-001 flip condition ([docs/16](16-tech-stack.md) §2 — LiveKit SIP or a Twilio bridge), and it extends the product surface in [docs/01](01-product-and-use-case.md). The architecture already supports outbound *reasoning*; only the transport is missing, and the ADR said so in advance.
+**Proactive support — outbound calls.** Have the agent place *outbound* calls: "your settlement failed — here is what happened and what I can do." This flips support from reactive to proactive and is the highest-value product move in the catalog. It requires a PSTN leg — a Twilio SIP trunk or media gateway bridging phone audio into the aiortc peer, a deliberately deferred item in [docs/16](16-tech-stack.md) §3 — and it extends the product surface in [docs/01](01-product-and-use-case.md). The architecture already supports outbound *reasoning*; only the telephony transport is missing, and the deferral said so in advance.
 
 ### 4.5 Prioritizing the catalog
 
@@ -330,7 +331,7 @@ If I picked up this project again after Phase 6, I would not build the catalog i
 | Intent prediction | Medium-High | ~3 weekends | Yes — `EventLog` | Later — flashy but subtle to demo |
 | Session replay | Medium | ~2 weekends | Yes — timeline + snapshots | Later — ops value, low demo punch |
 | Hybrid RAG | Medium | ~2 weekends | Yes — retriever interface | Later — quality, hard to show on tiny KB |
-| Proactive outbound | High | ~4 weekends | No — needs PSTN | Later — gated on the ADR-001 transport flip |
+| Proactive outbound | High | ~4 weekends | No — needs PSTN | Later — gated on the deferred PSTN bridge |
 | Emotion / prosody | Medium | ~3 weekends | Partly — STT seam | Later — evaluation surface is large |
 | Human handoff console | Medium | ~4 weekends | Partly — stub tool | Later — a second product, effectively |
 

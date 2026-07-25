@@ -278,13 +278,13 @@ This is the single scenario used in every worked example across the doc set (fro
    *Behind the screen:* `NavigationTracker` records the back-stack (`Dashboard → Payments → Help`); `PermissionManager` confirms mic permission (granted at onboarding — no prompt interrupts the flow).
 
 4. **Session creation.** The app calls `POST /v1/sessions` with `{user_id, screen_context, recent_events}`.
-   *Behind the screen:* the `screen_context` payload is the **retained `PaymentScreen` snapshot** from step 2, not the Help menu — support screens are excluded from capture so the agent sees the problem, not the act of asking for help. `recent_events` carries the last ~15 timeline entries. Response: `{session_id, livekit_url, livekit_token}`; the token is short-lived (5-min TTL) and room-scoped ([docs/14](14-security.md)).
+   *Behind the screen:* the `screen_context` payload is the **retained `PaymentScreen` snapshot** from step 2, not the Help menu — support screens are excluded from capture so the agent sees the problem, not the act of asking for help. `recent_events` carries the last ~15 timeline entries. Response: `{session_id, signaling_url, signaling_token, ice_servers, expires}` — the signaling token is short-lived (5-min TTL, one-time use) and the `ice_servers` entry carries HMAC time-limited TURN credentials for the self-hosted coturn server (10-min TTL, [docs/14](14-security.md)).
 
 5. **Speculative context prefetch.** Before any audio flows, `SessionManager` creates `session:{id}` in Redis and `ContextBuilder` pre-warms the turn context: user profile from Postgres, top-3 KB snippets for `DAILY_LIMIT_EXCEEDED` from pgvector, and the stable prompt prefix for cache reuse ([docs/09](09-memory-architecture.md), [docs/11](11-prompt-engineering.md)).
 
-6. **Call setup.** `VoiceCallService` starts as a foreground service; `WebRtcClient` joins the LiveKit room; `CallStateMachine` walks `Requesting → Connecting → InCall`; the `ConversationOverlay` appears with a live transcript. Server-side, the `voice-worker`'s `VoiceAgentWorker` joins the same room.
+6. **Call setup.** `VoiceCallService` starts as a foreground service; `SignalingClient` connects the WebSocket to the voice-worker's `/v1/signal` endpoint, `WebRtcClient` sends the SDP offer and trickles ICE candidates until DTLS-SRTP media flows; `CallStateMachine` walks `Requesting → Signaling → Connecting → InCall`; the `ConversationOverlay` appears with a live transcript. Server-side, the `voice-worker`'s `SignalingServer` accepts the offer and its `PeerSession` (aiortc) answers as the second peer.
 
-7. **~2 seconds after the tap, Asha speaks first** — the canonical opening (transcript, §8, turn 1). No user speech was needed; the greeting is composed entirely from prefetched context during connection setup, so perceived wait is the connection time, not a model round-trip.
+7. **~2 seconds after the tap, Asha speaks first** — the canonical opening (transcript, §8, turn 1). No user speech was needed; the greeting is composed entirely from prefetched context during the handshake (call-setup budget: ≤ 1.5 s p50 from session POST to first media, [docs/06](06-voice-pipeline.md)), so perceived wait is the connection time, not a model round-trip.
 
 8. **Explanation turn.** Rajesh challenges the failure ("I have money in my wallet"); Asha resolves the wallet-vs-bank-limit contradiction using two read tools (§8, turn 3). Per the canon rule, the agent never states an account fact a read tool can fetch — no hallucinated balances.
 
@@ -306,11 +306,12 @@ sequenceDiagram
     participant W as voice-worker
     R->>App: taps Call Support (HelpScreen)
     App->>API: POST /v1/sessions (snapshot + last 15 events)
-    API-->>App: session_id, livekit_url, livekit_token (5-min TTL)
+    API-->>App: session_id, signaling_url, signaling_token, ice_servers (TURN creds)
     par prefetch while connecting
         API->>API: profile (Postgres), KB top-3 (pgvector), prompt prefix warm
-    and join room
-        App->>W: LiveKit room — audio + data channel (topic ctx)
+    and signal and connect
+        App->>W: WS /v1/signal — SDP offer/answer + trickle ICE
+        App->>W: DTLS-SRTP media + data channel (label ctx)
     end
     W-->>R: Asha speaks the opening line (~2 s after tap)
 ```
@@ -345,7 +346,7 @@ The full failure catalog lives with the owning docs ([docs/06](06-voice-pipeline
 |---|---|---|---|---|
 | Mic permission denied at Call Support tap | `PermissionManager` result callback | No voice call possible | Rationale dialog + settings deep-link | Merchant files a complaint from `HelpScreen` manually |
 | Snapshot missing or stale (app restarted after the error) | `SnapshotIngestor` validation; `seq` gap on data channel | Opening line degrades to a generic greeting | Agent asks one clarifying question; event timeline usually survives | Context-blind but fully functional call |
-| Network drop between confirmation and execution | `CallStateMachine → Reconnecting`; LiveKit session resume | Merchant fears a double submission | Idempotency key + pending-confirmation state in Redis `session:{id}` | On reconnect Asha restates the pending action before executing |
+| Network drop between confirmation and execution | `CallStateMachine → Reconnecting`; ICE restart (client re-offers with `iceRestart: true`) | Merchant fears a double submission | Idempotency key + pending-confirmation state in Redis `session:{id}` | On reconnect Asha restates the pending action before executing |
 | Business API down during a tool call | `tool.exec.<name>` span error | Cannot fetch decline detail | Agent answers from screen context only, offers `raise_complaint` or `escalate_to_human` | Partial-knowledge answer, honestly labeled |
 
 ---
@@ -463,7 +464,7 @@ confirmation. Merchant declined further help; sentiment positive.
 | `status` | `submitted` (demo: auto-approves after seeded SLA) |
 | `initiated_by` | `agent`, session-scoped, idempotency-keyed |
 
-**3. Cost row** — finalized by `CostTracker`. The canonical per-call budget is owned by [docs/16](16-tech-stack.md) (5-minute call, ~15 agent turns): STT ≈ $0.04, LLM ≈ $0.10 with prompt caching, TTS ≈ $0.15, LiveKit self-hosted ≈ $0 — **total ≈ $0.30 (~₹25)**. This demo call is shorter (about 3 minutes, 5 agent turns) and lands below that budget; the per-call row records actuals per provider alongside the per-turn OTel spans.
+**3. Cost row** — finalized by `CostTracker`. The canonical per-call budget is owned by [docs/16](16-tech-stack.md) (5-minute call, ~15 agent turns): STT ≈ $0.04, LLM ≈ $0.10 with prompt caching, TTS ≈ $0.15, coturn/infra self-hosted ≈ $0 — **total ≈ $0.30 (~₹25)**. This demo call is shorter (about 3 minutes, 5 agent turns) and lands below that budget; the per-call row records actuals per provider alongside the per-turn OTel spans.
 
 ---
 

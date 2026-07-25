@@ -2,7 +2,7 @@
 
 This document is authoritative for the VyaparPay voice agent's security posture (canon §12): the threat model, the layered prompt-injection defense that is the whole reason a screen-aware, voice-driven agent is trustworthy at all, the authentication and authorization model, the PII redaction pipeline and what leaves the building to which third party, the sensitive-tool re-verification story, transport and secret handling, abuse limits, retention, and an honest accounting of the fintech compliance work a real deployment would carry that this demo does not. The rule that governs everything below is one sentence: **screen content and user speech are untrusted input, and the only thing that authorizes an action is the permission system, never a string the model read.**
 
-**Read this with:** [docs/10](10-tool-calling.md) for the tool authorization invariants the threat model rests on, [docs/13](13-api-contracts.md) for the JWT and LiveKit token contracts, [docs/11](11-prompt-engineering.md) for the injection-defense fencing implemented in the prompt, and [docs/07](07-ui-semantic-context.md) for redaction at the point of screen capture.
+**Read this with:** [docs/10](10-tool-calling.md) for the tool authorization invariants the threat model rests on, [docs/13](13-api-contracts.md) for the JWT, signaling-token, and TURN-credential contracts, [docs/11](11-prompt-engineering.md) for the injection-defense fencing implemented in the prompt, and [docs/07](07-ui-semantic-context.md) for redaction at the point of screen capture.
 
 ---
 
@@ -39,7 +39,9 @@ The model is *semi-trusted*: it decides what to attempt, but it cannot self-auth
 |---|---|---|---|
 | Malicious payee / compromised contact / attacker-controlled UI text | **Prompt injection** — an instruction hidden in a screen label or field value inside the ScreenContext IR | The agent's tool-calling authority | Screen text is data-fenced in the system slot, never in the user stream ([docs/11 §3](11-prompt-engineering.md)); on-device char-strip + 120-char cap ([docs/07 §5](07-ui-semantic-context.md) rule 6); `SafetyLayer` imperative-pattern flag; tools allowlisted + server-authorized regardless of model intent (§3) |
 | Caller, or anyone holding the unlocked phone | **Adversarial speech** — "ignore previous instructions", social-engineering the confirm gate | Account-state mutation | Instruction hierarchy: spoken words cannot skip a confirmation or a tool call (fencing rule, §3.2); mutations confirm-gated; sensitive tier adds re-auth; affirmation classified explicitly, not inferred from sentiment |
-| Network attacker / token thief | **Stolen LiveKit token** | The call's audio room | 5-min TTL bounds the join window; room-scoped to `session-{id}`; identity-bound; server-minted (API secret only in agent-api env); WSS/SRTP in transit (§6) |
+| Network attacker / token thief | **Stolen signaling token** — replaying `wss://…/v1/signal?session_id=…&token=…` | The call's signaling plane (and, through it, the media session) | 5-min TTL + **one-time use** bounds the window to a single WS accept; token is session-bound; server-minted (`JWT_SECRET` only in agent-api env); WSS + origin check before any SDP is processed (§4.2, §6) |
+| TURN credential thief / freeloader | **TURN credential abuse** — using leaked `username:credential` to relay arbitrary traffic through our coturn (bandwidth theft) | coturn relay bandwidth and egress cost | 10-min TTL HMAC (`use-auth-secret`); username is `ts:session_id`, so expiry is verifiable and credentials are per-session; relay quotas/`total-quota` in coturn config; the relay only carries encrypted SRTP anyway (§4.2) |
+| On-path network attacker | **SDP / signaling tampering** — injecting or rewriting offer/answer/ICE to hijack or degrade the media path | Call integrity and confidentiality | WSS (TLS) on the signaling channel; token-gated accept; server validates SDP shape (audio + one `ctx` data channel, expected codecs) before applying it; DTLS-SRTP fingerprints in the SDP mean a tampered exchange fails the DTLS handshake instead of silently redirecting media |
 | Replay attacker / buggy client retry | **Replayed session op** or re-sent mutation | Duplicate money-movement or state change | Idempotency key `{session}:{tool}:{turn}` — Redis fast path + `UNIQUE` backstop ([docs/10 §4.2](10-tool-calling.md)); terminal-state guard (`SESSION_ALREADY_ENDED`); `ctx` sequence-gap detection |
 | Any authenticated user | **Tool abuse** — read or mutate on another user's account | Cross-tenant data and funds | No principal in tool args; executor injects the session user (invariant 3, [docs/10 §1](10-tool-calling.md)); `RESOURCE_NOT_FOUND` is indistinguishable from wrong-owner (§3.3); every mutation scoped and audited |
 | LLM / provider / log sink | **PII leakage** — PAN, Aadhaar, PIN reaching a third party or a log | Cardholder and identity data | Redact-at-source ([docs/07 §5](07-ui-semantic-context.md) rule 6); pattern redaction before every transcript/summary/log write; `structlog` secret denylist (§6); no PAN column exists at all ([docs/12 §3.4](12-data-models.md)) |
@@ -126,28 +128,32 @@ Decoded, Rajesh's demo token — the entire identity surface of the system:
 
 The one authorization rule that matters everywhere: `POST /v1/sessions` carries a `user_id` in the body, but the server **verifies it equals `sub` and rejects a mismatch** rather than honoring it. No request body anywhere is trusted to name its own principal.
 
-### 4.2 Room identity — LiveKit token
+### 4.2 Call identity — signaling token, TURN credential, and media security
 
-agent-api server-mints the client's room token at session create ([docs/13 §6](13-api-contracts.md)). The properties are all security properties:
+We own the whole transport, so we own its auth objects too. `POST /v1/sessions` returns both ([docs/13 §2](13-api-contracts.md)); each is a security object with deliberate properties.
+
+**Signaling token** — gates the `wss://<voice-worker>/v1/signal` connection:
 
 | Property | Value | Security purpose |
 |---|---|---|
-| TTL | **5 minutes** (canon §12); `exp - nbf = 300` | Bounds the join window; a stolen token expires fast, and an established call outlives it via LiveKit's resume path |
-| Room scope | `session-{session_id}` only | A leaked token grants one room, never the fleet |
-| Identity | `user-{user_id}`, identity-bound | Room events attribute to a principal; a token can't impersonate `agent` |
-| Grants | `roomJoin`, `canPublish` (mic), `canSubscribe`, `canPublishData` | Least privilege: no room-create, no admin, no other rooms |
-| Minting | Server-side only; API secret in agent-api env | The client can never forge or widen a token |
+| TTL | **5 minutes** (canon §12) | Bounds the window between session create and WS connect; a stolen token expires fast |
+| One-time use | Consumed on first successful WS accept | A leaked token that was already used is worthless; a replay races a single accept, not an open door |
+| Binding | Bound to `session_id` (both in the query string; server checks they match) | A token grants one call's signaling, never another session's |
+| Checked when | **Before any SDP is processed** — WSS handshake + origin check + token validation happen before the server parses a single signaling frame | Unauthenticated peers never reach the SDP/ICE code path; malformed-offer attacks require a valid token first |
+| Minting | Server-side only, in agent-api | The client can never forge or widen a token |
 
-Decoded, the client token — the 5-minute claim is verifiable by inspection (`exp - nbf = 300`):
+An expired token is a re-mint (`POST /v1/sessions/{id}/token`, same session, fresh token), not a lost call — session state in Redis is untouched. Mid-call, the WS stays open (ping/pong keepalive), so the 5-minute TTL only ever gates the *initial* accept, and an ICE restart on network change rides the already-authenticated connection.
 
-```json
-{"iss": "APIvyapardemo", "sub": "user-usr_rajesh01", "name": "Rajesh Kumar",
- "nbf": 1784536462, "exp": 1784536762,
- "video": {"room": "session-a1f3c9", "roomJoin": true,
-           "canPublish": true, "canSubscribe": true, "canPublishData": true}}
-```
+**TURN credential** — coturn's `use-auth-secret` HMAC scheme, minted per session:
 
-A cold rejoin past the 5-min TTL uses `POST /v1/sessions/{id}/token` (same room, fresh token) — the session state in Redis is untouched, so token expiry is a re-mint, not a lost call.
+| Property | Value | Security purpose |
+|---|---|---|
+| Format | `username = <expiry_ts>:<session_id>`, `credential = HMAC-SHA1(TURN_SECRET, username)` | Stateless verification: coturn checks the HMAC and the timestamp with no DB and no API call to agent-api |
+| TTL | **10 minutes** (canon §12) — the timestamp *is* the expiry | Long enough to cover call setup + one ICE restart; short enough that a leaked credential is a brief bandwidth-theft window, not a standing open relay |
+| Scope | Per-session username | Abuse is attributable to a session in coturn logs; quotas (`total-quota`, `user-quota`) cap relay bandwidth per credential |
+| Secret | `TURN_SECRET` shared only between agent-api and coturn, env-only | The client receives a derived credential, never the secret |
+
+**Media security** — DTLS-SRTP is *mandatory* in WebRTC, not optional: the SDP exchange carries certificate fingerprints, the peers run a DTLS handshake, and all audio and data-channel traffic is SRTP/SCTP-over-DTLS. Two consequences worth stating: media is encrypted **end-to-end between the two peers** (the Android client and the aiortc worker — there is no SFU that terminates and re-encrypts), and the TURN server, when a call relays through it, sees **only encrypted SRTP packets** — coturn moves ciphertext and learns nothing but flow metadata. The relay path costs bandwidth, never confidentiality.
 
 ### 4.3 Every tool is scoped to the session user
 
@@ -214,8 +220,9 @@ The demo's voiced last-4 exists to prove the **state-machine slot** where step-u
 | Surface | Control |
 |---|---|
 | REST (`/v1`) | TLS everywhere; JWT bearer; stack traces never reach clients — `500 INTERNAL` returns a generic message, the trace goes to `structlog` ([docs/13 §1.1](13-api-contracts.md)) |
-| Media (audio) | WSS signaling + SRTP media via LiveKit ([docs/06](06-voice-pipeline.md)); room membership authenticates the data channel, so no separate transcript socket to secure ([docs/13 §4](13-api-contracts.md)) |
-| Secrets | Environment only; `.env.example` documents every key (`JWT_SECRET`, `OPENROUTER_API_KEY`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, LiveKit API key/secret); nothing hardcoded (canon §12) |
+| Signaling (`/v1/signal`) | WSS only; origin check + one-time 5-min signaling token validated before any SDP is parsed (§4.2); ping/pong keepalive, `bye` for clean teardown |
+| Media (audio + `ctx` data channel) | DTLS-SRTP, mandatory in WebRTC ([docs/06](06-voice-pipeline.md)); the `ctx` data channel is SCTP inside the same DTLS session, so the media handshake authenticates it — no separate transcript socket to secure ([docs/13 §4](13-api-contracts.md)); TURN relays carry only encrypted SRTP (§4.2) |
+| Secrets | Environment only; `.env.example` documents every key (`JWT_SECRET`, `TURN_SECRET`, `OPENROUTER_API_KEY`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`); nothing hardcoded (canon §12) |
 | Logs | `structlog` JSON with a **secret + PII denylist** processor: API keys, JWTs, and the §5.1 patterns are scrubbed before emission; no secret ever appears in a prompt or a log line |
 
 The denylist is a processor in the `structlog` chain, not a grep over output — it runs on the structured event dict before rendering, so a key can't leak through an f-string that predates the redaction. Prompts are held to the same rule: secrets are never interpolated into a prompt slot, which is enforced by keeping all provider credentials in the `providers/` layer, never in `PromptBuilder`.
@@ -228,7 +235,7 @@ Three limits bound what a single caller (or a runaway loop) can cost or trigger.
 
 | Limit | Value | Enforced by | On breach |
 |---|---|---|---|
-| Session creation | **5 / minute** per user | `rate:{user_id}` sliding window in Redis ([docs/12 §7](12-data-models.md)) | `429 RATE_LIMITED` with `Retry-After`; no session row, no room created ([docs/13 §2.1](13-api-contracts.md)) |
+| Session creation | **5 / minute** per user | `rate:{user_id}` sliding window in Redis ([docs/12 §7](12-data-models.md)) | `429 RATE_LIMITED` with `Retry-After`; no session row, no signaling token or TURN credential minted ([docs/13 §2.1](13-api-contracts.md)) |
 | Per-call cost | Soft cap tracked live | `CostTracker` accumulates per-turn STT/LLM/TTS spend against the ≈ $0.30/call baseline (canon §9) | Cap breach flags the call and can force `escalate_to_human` rather than looping the LLM indefinitely |
 | Call duration | **15 minutes** hard | `VoiceCallService` / worker timer | Graceful wind-down + hang-up; bounds both cost and a stuck-session denial-of-wallet |
 
@@ -274,7 +281,8 @@ Doc-set convention: Failure | Detection | Impact | Mitigation | Degradation.
 | Failure | Detection | Impact | Mitigation | Degradation |
 |---|---|---|---|---|
 | `JWT_SECRET` leaks (env exposure) | Anomalous `sub`/issuer patterns in agent-api logs; out-of-band secret scanning | Any user token forgeable → full impersonation | Env-only storage, rotate on suspicion; 24 h expiry bounds pre-rotation window; production RS256 + JWKS makes rotation instantaneous and per-key | Rotate secret → every live token invalidated at once; users re-auth, no data lost |
-| LiveKit API secret leaks | LiveKit server room-event audit; unexpected token issuers | Attacker mints room tokens → joins or eavesdrops calls | Secret env-only, rotate; rooms are ephemeral and 5-min-TTL-scoped, so forged tokens have a short life | Blast radius is live calls only — no stored account secret is reachable from a room |
+| `TURN_SECRET` leaks | coturn logs show credentials for unknown session ids; relay-bandwidth anomaly in Grafana | Attacker mints valid TURN credentials → free relay bandwidth (never plaintext audio — relayed media is SRTP, §4.2) | Secret shared only between agent-api and coturn, env-only; rotate in both places at once; coturn quotas cap the burn rate meanwhile | Blast radius is bandwidth cost only — no call content and no account secret is reachable through the relay |
+| Signaling token replayed or leaked pre-use | voice-worker logs a second accept attempt for a consumed token; unexpected origins rejected at handshake | Attacker connects to `/v1/signal` for that one session before the real client does | One-time use means the race has a single winner; the legitimate client's failed connect surfaces immediately as a call-setup error → re-mint; token is session-bound, so no lateral movement | One session's setup is disrupted, retried with a fresh token; established calls are untouched (their WS is already authenticated) |
 | Redaction miss (novel PII format the patterns don't match) | Log-sampling review; eval fixtures seed odd formats and assert masking | Raw PII reaches an LLM prompt or a log line | Two independent nets — field-class classification (rule 6) *and* pattern backstop — must both miss; `structlog` denylist is a third | Production DPA + zero-retention endpoints bound what a leaked value can become downstream |
 | `SafetyLayer` affirmation false-positive (non-yes read as yes) | Confirm-gate audit rows show the voiced action; eval fixtures replay ambiguous replies | A mutation fires the caller didn't confirm | Explicit-affirmation classifier (not sentiment); the gate voices the *action and consequence* first, so the user hears it before it happens; idempotency prevents a double | Sensitive tier adds re-auth; a wrong single mutation is reversible via the same tools + `escalate_to_human` |
 | Injection evades layers 1–3 (model fully manipulated) | `SafetyLayer` slot flags on the trace; `tool_invocations` denial rows | None realized — the model can only *request* | Layer 4 authorizes against the session user; layer 5 filters output; no `user_id` in any arg | A denied `tool_call` costs one turn; the audit trail shows the attempt for later review |
@@ -289,7 +297,8 @@ Doc-set convention: Failure | Detection | Impact | Mitigation | Degradation.
 | Untrusted-input stance | Screen text + speech are data; only the permission system authorizes actions | [docs/10](10-tool-calling.md), [docs/11](11-prompt-engineering.md) |
 | Layered injection defense | 5 layers; server-side authorization (layer 4) is the backstop | [docs/11](11-prompt-engineering.md), [docs/05](05-agent-architecture.md) |
 | Principal handling | No `user_id` in any tool arg; executor injects the session `sub`; body `user_id` verified against `sub` | [docs/10](10-tool-calling.md), [docs/13](13-api-contracts.md) |
-| LiveKit token as a security object | 5-min TTL, room-scoped, identity-bound, server-minted, least-privilege grants | [docs/13](13-api-contracts.md), [docs/02](02-system-architecture.md) |
+| Signaling token as a security object | 5-min TTL, one-time use, session-bound, server-minted, validated before any SDP is parsed | [docs/13](13-api-contracts.md), [docs/02](02-system-architecture.md) |
+| TURN credential as a security object | 10-min TTL HMAC (`use-auth-secret`), username `ts:session_id`, per-session, quota-capped; relay sees only SRTP | [docs/13](13-api-contracts.md), [docs/02](02-system-architecture.md) |
 | Redaction placements | On-device (rule 6), transcript/summary processor, `structlog` denylist; PAN column designed out | [docs/07](07-ui-semantic-context.md), [docs/12](12-data-models.md) |
 | Sensitive-tool re-auth | Voiced last-4 (demo, weak) → biometric step-up off-channel (production) | [docs/10](10-tool-calling.md) |
 | Abuse limits | 5 session-creates/min, live per-call cost cap, 15-min hard duration | [docs/13](13-api-contracts.md), [docs/16](16-tech-stack.md) |

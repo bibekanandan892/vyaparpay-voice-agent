@@ -8,11 +8,11 @@ Planned compose services:
 
 | Service    | Image                  | Purpose                                    |
 |------------|------------------------|--------------------------------------------|
-| livekit    | livekit/livekit-server | WebRTC SFU + data channels                 |
+| coturn     | coturn/coturn          | STUN + TURN — NAT traversal for the WebRTC peers |
 | postgres   | pgvector/pgvector      | Business data, conversations, embeddings   |
 | redis      | redis                  | Session state, memory cache, rate limiting |
 | agent-api  | ./backend              | FastAPI service                            |
-| voice-worker | ./backend            | LiveKit Agents worker (the AI agent)       |
+| voice-worker | ./backend            | Signaling + aiortc peer + voice pipeline (the AI agent) |
 | grafana    | grafana/grafana        | Latency/cost dashboard                     |
 | tempo      | grafana/tempo          | OpenTelemetry trace storage                |
 

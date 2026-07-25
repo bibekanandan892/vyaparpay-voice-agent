@@ -272,7 +272,7 @@ Every mutating execution carries a deterministic key: **`{session_id}:{tool}:{tu
 
 Why turn number and not an args hash? The unit of exactly-once is **the confirmed decision**, and a decision is anchored to a turn:
 
-- Transport replays — a LiveKit reconnect mid-execution (the [docs/01 §7](01-product-and-use-case.md) failure variant), an executor retry after a timeout — re-run the *same turn*, hit the same key, and get the stored result instead of a double submission.
+- Transport replays — a WebRTC ICE-restart reconnect mid-execution (the [docs/01 §7](01-product-and-use-case.md) failure variant), an executor retry after a timeout — re-run the *same turn*, hit the same key, and get the stored result instead of a double submission.
 - An args hash would make a deliberately repeated identical action later in the call (raise a second complaint with the same subject; retry the same payment tomorrow via a fresh confirmation) silently impossible — the hash collides, the dedupe eats a legitimate request.
 - Debuggability: the key is greppable straight to the turn that caused it; a hash is not.
 
@@ -405,7 +405,7 @@ What it captures at the moment of hand-off — the things a human agent otherwis
 
 The `summary` is a fresh Haiku fold of the rolling summary plus the last turns — not the raw transcript, which respects the transcript-non-persistence stance ([docs/12 §4.2](12-data-models.md)). `screen_ctx` is the latest IR from `ctx:{session_id}`; `tools_attempted` is a digest of the session's `tool_invocations` rows.
 
-Demo honesty: there is no human console. The tool writes the hand-off record, returns `{handoff_id, status: "queued", eta_minutes: null}`, and Asha voices a callback promise — the stub is marked as such in [docs/01 §9](01-product-and-use-case.md). The warm-transfer production evolution (human joins the same LiveKit room, agent whispers the briefing, then drops) is specified in [docs/17](17-roadmap.md); the hand-off contract above is designed so that evolution changes the *consumer* of the record, not its shape.
+Demo honesty: there is no human console. The tool writes the hand-off record, returns `{handoff_id, status: "queued", eta_minutes: null}`, and Asha voices a callback promise — the stub is marked as such in [docs/01 §9](01-product-and-use-case.md). The warm-transfer production evolution (human joins the call as a third peer — the multi-party scenario that is the SFU flip condition in [docs/16](16-tech-stack.md) — agent whispers the briefing, then drops) is specified in [docs/17](17-roadmap.md); the hand-off contract above is designed so that evolution changes the *consumer* of the record, not its shape.
 
 ---
 
