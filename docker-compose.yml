@@ -1,0 +1,68 @@
+# docker-compose.yml — local Phase-2 stack (postgres + redis + agent-api).
+#
+# `version:` is intentionally omitted — obsolete in current Compose Spec.
+#
+# Hostname note: agent-api loads backend/.env via `env_file:` below, but the
+# agent-api service's own `environment:` block explicitly overrides
+# DATABASE_URL/REDIS_URL to the compose service hostnames (`postgres`,
+# `redis`) — Compose `environment:` wins over `env_file:`, so it doesn't
+# matter what host segment backend/.env has for those two vars under this
+# stack. backend/.env.example ships `localhost` values because that file
+# also doubles as the template for running the backend directly on the
+# host (outside Docker), where the override above doesn't apply.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: vyapar
+      POSTGRES_PASSWORD: vyapar
+      POSTGRES_DB: vyapar
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Loopback-only: this is a local dev stack, no auth hardening beyond
+      # the dev password, no reason to bind 0.0.0.0.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vyapar -d vyapar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      # Loopback-only: redis:7 ships with zero auth configured, so an
+      # exposed-to-LAN port would be unauthenticated read/write access.
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  agent-api:
+    build: ./backend
+    env_file:
+      - backend/.env
+    environment:
+      # Overrides whatever backend/.env has (compose `environment:` wins
+      # over `env_file:`) — inside this network, agent-api MUST reach the
+      # other services by their compose hostnames, never `localhost`
+      # (that would resolve to the agent-api container itself). Set
+      # explicitly here so a developer who copied .env.example verbatim
+      # without editing the host segment still gets a working stack
+      # instead of a silent connect-to-self failure at startup.
+      DATABASE_URL: postgresql+asyncpg://vyapar:vyapar@postgres:5432/vyapar
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
