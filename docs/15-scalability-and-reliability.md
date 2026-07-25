@@ -164,7 +164,7 @@ The one thing multi-region does **not** change is the per-call brain: a call is 
 
 ### 3.5 The flip condition this scale-out does not trigger
 
-Everything above scales the strictly 1:1 topology — one merchant, one agent peer, more of both. The moment the product needs **multi-party media** — a supervisor whispering into a live call, three-way conferencing, silent call monitoring — the two-peer model stops working, and an SFU (LiveKit, mediasoup) re-enters the architecture as the media hub between N parties. That, plus per-node fan-out limits, is the flip condition recorded in the transport ADR ([docs/16](16-tech-stack.md), canon §4.1). Until it triggers, an SFU adds a hop and a service for zero benefit; when it does, the signaling protocol and voice pipeline this doc scales are the pieces that survive the flip, because we own them.
+Everything above scales the strictly 1:1 topology — one merchant, one agent peer, more of both. The moment the product needs **multi-party media** — a supervisor whispering into a live call, three-way conferencing, silent call monitoring — the two-peer model stops working, and an SFU (e.g. mediasoup) re-enters the architecture as the media hub between N parties. That, plus per-node fan-out limits, is the flip condition recorded in the transport ADR ([docs/16](16-tech-stack.md), canon §4.1). Until it triggers, an SFU adds a hop and a service for zero benefit; when it does, the signaling protocol and voice pipeline this doc scales are the pieces that survive the flip, because we own them.
 
 ---
 

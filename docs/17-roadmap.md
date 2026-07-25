@@ -233,7 +233,7 @@ The line between §1.4 and §4 is the line between "the architecture forbids the
 | Kafka / Redpanda | A second service needs replayable fan-out | §4.3 session replay tests the seam; swap is post-6 |
 | LangChain / agent frameworks | Genuine multi-agent orchestration need | §4.2 multi-agent is the trigger, `LLMRouter` the seam |
 | PSTN bridge (Twilio SIP trunk / media gateway) | Outbound or dial-in calling required | §4.4 proactive support |
-| SFU / managed platform (LiveKit, Daily) | Multi-party calls (supervisor whisper, conference) or per-node fan-out limits — the ADR-001 flip | Post-Phase 6, not scheduled; 1:1 topology holds |
+| SFU / managed WebRTC platform (Daily, mediasoup, …) | Multi-party calls (supervisor whisper, conference) or per-node fan-out limits — the ADR-001 flip | Post-Phase 6, not scheduled; 1:1 topology holds |
 | Managed TURN (Twilio NTS) | Global production traffic — the ADR-006 flip | Not scheduled; self-hosted coturn suffices |
 | MongoDB | Never on current evidence | Not scheduled — a rejection, not a deferral |
 
