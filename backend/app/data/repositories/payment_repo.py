@@ -168,6 +168,43 @@ class PaymentRepo(SqlAlchemyRepository[Transaction]):
             resets_at=_midnight_ist_after(limit_row.window_date),
         )
 
+    async def record_daily_usage(
+        self, merchant_id: str, amount_paise: int, *, limit_type: str = _DAILY_LIMIT_TYPE
+    ) -> None:
+        """Increments `used_paise` for a payment whose caller has ALREADY
+        confirmed, in this same transaction, that it (a) passes
+        `check_daily_limit(..., with_for_update=True)` and (b) passes a
+        wallet-balance check — added after review (CRITICAL: nothing
+        anywhere incremented `used_paise`, so the daily-limit control was
+        inert after the seeded state; docs/12 §3.2's own invariant is
+        `SUM(successful payouts today) == used_paise`, which is exactly
+        why this must not be called until a payment is confirmed to
+        actually succeed, not merely attempted).
+
+        Deliberately not folded into `check_daily_limit` itself: that
+        method is a pure check other Phase-2 callers rely on staying
+        read-only (`check_daily_limit`'s own tests, PR #7), and a payment
+        can still fail the *wallet* balance check after passing the daily-
+        limit one — incrementing here, only once both checks are known to
+        have passed, is what keeps a declined-for-insufficient-balance
+        payment from being charged against the daily limit it never used.
+
+        No new lock is taken: `session.get()` on the same primary key
+        within the same session/transaction returns the already-managed
+        instance the caller's earlier `with_for_update=True` fetch
+        loaded (SQLAlchemy's identity map), not a fresh unlocked read —
+        so this issues no additional `SELECT` and can only ever mutate a
+        row `check_daily_limit` already locked.
+        """
+        limit_row = await self._session.get(MerchantLimit, (merchant_id, limit_type))
+        if limit_row is None:
+            raise RuntimeError(
+                f"record_daily_usage({merchant_id!r}, {limit_type!r}): no merchant_limits "
+                "row found — the caller's own check_daily_limit call should already have "
+                "found (or None-returned on) this row before reaching here"
+            )
+        limit_row.used_paise += amount_paise
+
     async def get_payment_status(self, txn_id: str, merchant_id: str) -> PaymentStatus | None:
         """docs/10 §3.1's `get_payment_status` tool, minus the rupee
         conversion the tool-handler layer applies. One query — a LEFT
