@@ -43,6 +43,7 @@ from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.obs import configure_logging, setup_observability
 from app.providers.openrouter import OpenRouterLLM
+from app.tools.registry import configure as configure_tools
 
 
 @asynccontextmanager
@@ -69,16 +70,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = redis_client
     app.state.llm = OpenRouterLLM(http, settings)
 
-    # TODO(known gap, flagged in review): once app/tools/registry.py
-    # lands (task 3.2, a sibling PR not yet merged as of this PR — it
-    # doesn't exist on `main` yet, so it can't be imported here without
-    # coupling this PR's merge order to that one), add:
-    #     from app.tools.registry import configure as configure_tools
-    #     configure_tools(sessionmaker)
-    # here, wiring the tool-invocation bridge to this SAME sessionmaker
-    # rather than a second one. Until this line is added, calling any
-    # registered tool raises a clear RuntimeError (by that module's own
-    # design) rather than silently building an unmanaged connection pool.
+    # Wires the tool-invocation bridge (app/tools/registry.py) to this
+    # SAME sessionmaker, not a second one — see that module's own
+    # `configure()` docstring for why a second pool would leak.
+    configure_tools(sessionmaker)
 
     try:
         yield
