@@ -1,0 +1,17 @@
+{
+  "name": "get_wallet_balance",
+  "input": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "balance": { "type": "integer", "description": "INR whole rupees" },
+      "currency": { "type": "string" },
+      "updated_at": { "type": "string", "format": "date-time" }
+    },
+    "required": ["balance", "currency", "updated_at"]
+  }
+}

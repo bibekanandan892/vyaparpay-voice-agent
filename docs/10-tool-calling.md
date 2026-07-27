@@ -414,12 +414,14 @@ Demo honesty: there is no human console. The tool writes the hand-off record, re
 The extensibility claim in [docs/01](01-product-and-use-case.md) is only real if adding a tool is mechanical. It is four steps; worked example: `get_fee_summary` (per-batch fee breakdown — `settlements.fees_paise` already holds the data, and "why was I charged ₹97?" is a real contact reason).
 
 1. **Schema in [protocol/](../protocol/).** Add `protocol/tools/get_fee_summary.json` — input/output JSON Schema in the §3.1 format. This is the language-neutral contract; CI verifies the Pydantic models round-trip against it.
-2. **Pydantic module in [backend/app/tools/](../backend/app/tools/).** One file: input model, output model, async handler. The handler receives the injected principal — it never parses one:
+2. **Pydantic module in [backend/app/tools/](../backend/app/tools/).** One file: input model, output model, async handler. The handler receives the injected principal — it never parses one. The implemented decorator also takes `repo_type` — the concrete repository class the handler needs (Phase-2 plan decision #4: tools call repositories directly, in-process), which the registry's session bridge constructs per call and hands the handler as its third argument:
 
    ```python
-   @tool(name="get_fee_summary", tier=Tier.READ, latency_class="read-single")
-   async def get_fee_summary(principal: SessionUser, args: GetFeeSummaryIn) -> GetFeeSummaryOut:
-       row = await settlements.fetch(merchant_id=principal.user_id, batch_date=args.batch_date)
+   @tool(name="get_fee_summary", tier=Tier.READ, latency_class="read-single", repo_type=SettlementRepo)
+   async def get_fee_summary(
+       principal: SessionUser, args: GetFeeSummaryIn, repo: SettlementRepo
+   ) -> GetFeeSummaryOut:
+       row = await repo.fetch(merchant_id=principal.user_id, batch_date=args.batch_date)
        ...
    ```
 
