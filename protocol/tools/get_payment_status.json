@@ -1,0 +1,30 @@
+{
+  "name": "get_payment_status",
+  "input": {
+    "type": "object",
+    "properties": {
+      "payment_id": { "type": "string", "pattern": "^txn_[a-z0-9_]+$" }
+    },
+    "required": ["payment_id"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "payment_id": { "type": "string" },
+      "status": { "enum": ["succeeded", "declined", "pending", "refunded"] },
+      "amount": { "type": "integer", "description": "INR whole rupees" },
+      "counterparty": { "type": "string" },
+      "decline_code": { "type": ["string", "null"] },
+      "limit_context": {
+        "type": ["object", "null"],
+        "properties": {
+          "limit": { "type": "integer" },
+          "used_today": { "type": "integer" },
+          "resets_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "Populated only when decline_code is limit-related"
+      }
+    }
+  }
+}

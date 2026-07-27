@@ -1,0 +1,20 @@
+{
+  "name": "request_limit_increase",
+  "input": {
+    "type": "object",
+    "properties": {
+      "current_limit": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+      "requested_limit": { "type": "integer", "minimum": 1, "maximum": 10000000 }
+    },
+    "required": ["current_limit", "requested_limit"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "request_id": { "type": "string", "pattern": "^LMT-\\d{4}-\\d{4}-\\d{4}$" },
+      "status": { "enum": ["submitted"] },
+      "eta_hours": { "type": "integer" }
+    }
+  }
+}
