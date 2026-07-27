@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from decimal import Decimal
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -33,7 +33,7 @@ _FROZEN = ConfigDict(frozen=True)
 # --------------------------------------------------------------------------
 
 
-class Role(str, Enum):
+class Role(StrEnum):
     """Chat message role. Mirrors OpenAI-compatible `messages[].role`.
 
     NOT the same vocabulary as `conversation_turns.role` (docs/12 §4.2),
@@ -50,14 +50,14 @@ class Role(str, Enum):
     TOOL = "tool"
 
 
-class TaskKind(str, Enum):
+class TaskKind(StrEnum):
     """What kind of work a turn needs — input to LLMRouter.route()."""
 
     DIALOGUE = "dialogue"
     UTILITY = "utility"
 
 
-class ModelTier(str, Enum):
+class ModelTier(StrEnum):
     """Which model tier LLMRouter.route() selected. Phase 2 only ever
     reaches DIALOGUE (Sonnet 5) on the hot path; UTILITY (Haiku 4.5) is
     wired for the classify_affirmation upgrade path (decision #5) but not
@@ -68,7 +68,7 @@ class ModelTier(str, Enum):
     UTILITY = "utility"
 
 
-class TurnState(str, Enum):
+class TurnState(StrEnum):
     """ConversationManager's per-turn state machine (docs/05 §3.2)."""
 
     LISTENING = "listening"
@@ -77,7 +77,7 @@ class TurnState(str, Enum):
     SPEAKING = "speaking"
 
 
-class SessionState(str, Enum):
+class SessionState(StrEnum):
     """Mirrors conversations.state CHECK (docs/12 §4.1)."""
 
     CREATED = "created"
@@ -86,7 +86,7 @@ class SessionState(str, Enum):
     ENDED = "ended"
 
 
-class EndReason(str, Enum):
+class EndReason(StrEnum):
     """Why SessionManager.end() was called."""
 
     HANGUP = "hangup"
@@ -95,7 +95,7 @@ class EndReason(str, Enum):
     ERROR = "error"
 
 
-class Tier(str, Enum):
+class Tier(StrEnum):
     """Tool authorization tier (docs/10 §1). Phase 2 only registers READ and
     CONFIRM_REQUIRED tools; SENSITIVE/CONTROL exist so the enum doesn't need
     to change shape when block_card/reset_pin-style tools land later.
@@ -107,7 +107,7 @@ class Tier(str, Enum):
     CONTROL = "control"
 
 
-class ToolInvocationStatus(str, Enum):
+class ToolInvocationStatus(StrEnum):
     """Mirrors tool_invocations.status CHECK (docs/12 §4.4)."""
 
     OK = "ok"
@@ -194,7 +194,8 @@ class ToolResult(BaseModel):
     # DB error strings (this re-enters the conversation via to_llm_message() below
     # and is voiced/shown to the end user).
     error: dict[str, Any] | None = None
-    gate: dict[str, Any] | None = None  # {"status":"pending_confirm","instruction":...,"action":{...}}
+    # {"status":"pending_confirm","instruction":...,"action":{...}}
+    gate: dict[str, Any] | None = None
     status: ToolInvocationStatus
     latency_ms: int
     idempotency_key: str | None = None
@@ -204,7 +205,7 @@ class ToolResult(BaseModel):
         the conversation (docs/11 §5). Compression/truncation to ≤120
         tokens is ToolExecutor's job before this is called, not this
         method's."""
-        payload = {"ok": self.ok}
+        payload: dict[str, Any] = {"ok": self.ok}
         if self.data is not None:
             payload["data"] = self.data
         if self.error is not None:
