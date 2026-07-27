@@ -23,7 +23,7 @@ from app.data.repositories.payment_repo import (
     PaymentStatus,
 )
 from app.data.repositories.tool_audit_repo import ToolAuditRepo
-from app.data.repositories.wallet_repo import WalletRepo
+from app.data.repositories.wallet_repo import WalletDebitResult, WalletRepo
 
 __all__ = [
     "ConversationRepo",
@@ -37,5 +37,6 @@ __all__ = [
     "PaymentStatus",
     "SqlAlchemyRepository",
     "ToolAuditRepo",
+    "WalletDebitResult",
     "WalletRepo",
 ]
