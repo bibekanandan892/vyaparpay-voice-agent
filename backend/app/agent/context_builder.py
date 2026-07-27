@@ -126,17 +126,21 @@ class ContextBuilder:
         )
 
     async def _build_user_profile(self, merchant_id: str) -> str:
+        # _format_profile inside the try (review MEDIUM): today every
+        # column it reads is NOT NULL so it can't raise, but the module's
+        # stated policy is degrade-the-slot-never-the-turn — a future
+        # nullable column must hit the same fallback, not crash the turn.
         try:
             async with self._sessionmaker() as db:
                 merchant = await MerchantRepo(db).get(merchant_id)
-        except SQLAlchemyError:
+            if merchant is None:
+                log.warning("context.user_profile.merchant_missing", merchant_id=merchant_id)
+                return _PROFILE_UNAVAILABLE
+            return _format_profile(merchant)
+        except (SQLAlchemyError, AttributeError, TypeError, ValueError):
             # Judgment call #3: degrade the slot, never the turn (docs/05 §3.3).
             log.warning("context.user_profile.db_error", merchant_id=merchant_id, exc_info=True)
             return _PROFILE_UNAVAILABLE
-        if merchant is None:
-            log.warning("context.user_profile.merchant_missing", merchant_id=merchant_id)
-            return _PROFILE_UNAVAILABLE
-        return _format_profile(merchant)
 
     async def _get_window(self, session_id: str) -> list[Message]:
         try:

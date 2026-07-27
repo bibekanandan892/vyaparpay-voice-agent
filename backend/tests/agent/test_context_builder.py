@@ -262,3 +262,36 @@ async def test_corrupt_transcript_degrades_the_window_to_empty() -> None:
     bundle = await builder.build(make_call_session(), current_utterance="hi")
 
     assert bundle.conversation == ()
+
+
+# --------------------------------------------------------------------------
+# Verbatim-block pinning (Batch-4.2 code-review MEDIUM): the earlier
+# spot-check test catches dropped load-bearing phrases; these hash pins
+# catch EVERY byte change — a reworded bullet, a swapped dash, a
+# reordered rule. docs/11 §7 treats prompt text as code behind a golden
+# gate; a failing hash here means "re-verify the file against docs/11
+# §2/§3/§5 (§4 for business_rules), then update the pin in the same
+# diff" — never just update the pin.
+# --------------------------------------------------------------------------
+
+_PERSONA_SHA256 = "231fb88a117dc7b12184ecacd43910dda21a6c0b61be85d314ad5d4ab605d8f3"
+_BUSINESS_RULES_SHA256 = "1a00fab586c103856c966cbd45f50ecd84a212c5bc8ee05a46e3c4a6660d07f9"
+
+
+def _prompt_file_sha256(name: str) -> str:
+    import hashlib
+    from pathlib import Path
+
+    prompts_dir = Path(__file__).resolve().parents[2] / "app" / "agent" / "prompts"
+    # Same text-mode read (universal newlines) _load_prompt uses, so the
+    # pin is checkout-eol-independent on Windows and Linux alike.
+    text = (prompts_dir / name).read_text(encoding="utf-8")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_persona_md_bytes_are_pinned_verbatim() -> None:
+    assert _prompt_file_sha256("persona.md") == _PERSONA_SHA256
+
+
+def test_business_rules_md_bytes_are_pinned_verbatim() -> None:
+    assert _prompt_file_sha256("business_rules.md") == _BUSINESS_RULES_SHA256

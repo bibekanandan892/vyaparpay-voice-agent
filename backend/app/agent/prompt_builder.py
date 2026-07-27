@@ -31,6 +31,16 @@ of docs/11 §4's version (plan decision #2: profile-only greeting — there
 is no screen issue to address yet); "greet by name" was dropped because
 the Phase-2 profile slot carries no personal name (see
 context_builder.py judgment call #2).
+
+Accepted residual risk (review MEDIUM, deliberately not "fixed"): if a
+Redis failure degrades the window to empty (context_builder judgment
+call #4) on the same mid-call turn whose utterance is ALSO empty, the
+two emptinesses are indistinguishable from call-open and the trigger
+renders again. Threading an explicit turn number through would mean
+changing the frozen `PromptBuilderProto`/`ContextBundle` contracts for a
+double-degenerate edge whose worst case is a redundant greeting — the
+regression test pins the behavior so it is a documented choice, not an
+accident.
 """
 
 from __future__ import annotations
@@ -76,9 +86,17 @@ class PromptBuilder:
         is_call_open = not bundle.conversation and not bundle.current_utterance
         final_text = CALL_OPEN_TRIGGER if is_call_open else bundle.current_utterance
 
+        # Defense-in-depth (review MEDIUM): the one-system-message design
+        # is what the docs/11 §3 injection fence leans on — if a SYSTEM-
+        # role entry ever leaked into the Redis window (a bug elsewhere),
+        # splicing it here would mint a second pseudo-authoritative
+        # region. Filtered, logged loudly upstream by whoever wrote it;
+        # dropping it beats voicing it.
+        window = tuple(m for m in bundle.conversation if m.role is not Role.SYSTEM)
+
         return [
             Message(role=Role.SYSTEM, content=system_text),
-            *bundle.conversation,
+            *window,
             Message(role=Role.USER, content=final_text),
         ]
 
