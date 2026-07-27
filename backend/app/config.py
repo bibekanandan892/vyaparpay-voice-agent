@@ -29,7 +29,12 @@ class Settings(BaseSettings):
     # decode, SQLAlchemy engine construction, the OpenRouter HTTP client).
     jwt_secret: SecretStr
     database_url: SecretStr
-    redis_url: str = "redis://redis:6379/0"
+    # SecretStr (not str, fixed after review): today's compose Redis has no
+    # auth, so nothing leaks yet — but any real deployment needs
+    # redis://:password@host or rediss://user:pass@host, and this field sat
+    # unprotected right next to database_url/openrouter_api_key, which
+    # already get the masking documented above.
+    redis_url: SecretStr = SecretStr("redis://redis:6379/0")
 
     openrouter_api_key: SecretStr
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
