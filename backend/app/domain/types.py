@@ -342,4 +342,24 @@ class UsageEvent(BaseModel):
     usage: dict[str, Any]
 
 
-LLMEvent = TokenEvent | UsageEvent
+class ToolCallsEvent(BaseModel):
+    """Whole, reassembled tool calls for one completion — yielded only by
+    `LLMRouter.stream()` (app/agent/llm_router.py) after it stitches the
+    per-index `tool_calls` fragments carried raw in `TokenEvent.delta`
+    back together (docs/05 §3.4's interface pin). `OpenRouterLLM` never
+    emits this event.
+
+    Contract note (task 4.3): `LLMRouterProto.stream()`'s frozen docstring
+    requires yielding reassembled whole `ToolCall`s, but the original
+    `LLMEvent = TokenEvent | UsageEvent` union had no shape to carry them
+    — per app/domain/interfaces.py's header rule ("a deviation updates
+    the contract file first"), the union gains this member here rather
+    than the implementation inventing a private event type.
+    """
+
+    model_config = _FROZEN
+
+    tool_calls: tuple[ToolCall, ...]
+
+
+LLMEvent = TokenEvent | UsageEvent | ToolCallsEvent
