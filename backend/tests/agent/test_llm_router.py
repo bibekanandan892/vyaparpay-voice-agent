@@ -462,3 +462,91 @@ async def test_ttft_stall_on_retry_propagates_after_exactly_two_attempts(
 
     assert provider.call_count == 2  # never a third attempt
     assert provider.cancelled_streams == 2
+
+
+# --------------------------------------------------------------------------
+# Review hardening — security HIGH (unbounded memory growth), M-1 (duplicate
+# tool-call ids), code-review MEDIUM (first-attempt stream-close symmetry)
+# --------------------------------------------------------------------------
+
+
+async def test_index_count_beyond_limit_fails_loudly(
+    fake_llm: FakeLLM, settings: Settings
+) -> None:
+    from app.agent.llm_router import _MAX_TOOL_CALL_INDICES
+
+    fragments = [
+        _fragment_event(i, call_id=f"c{i}", name="get_wallet_balance", arguments="{}")
+        for i in range(_MAX_TOOL_CALL_INDICES + 1)
+    ]
+    fake_llm.script_turn(*fragments, _usage_event())
+    router = _router(fake_llm, settings)
+
+    with pytest.raises(ValueError, match="distinct"):
+        await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+
+async def test_argument_bytes_beyond_limit_fails_loudly(
+    fake_llm: FakeLLM, settings: Settings
+) -> None:
+    from app.agent.llm_router import _MAX_ARGUMENT_BYTES_PER_INDEX
+
+    oversized = "1" * (_MAX_ARGUMENT_BYTES_PER_INDEX + 1)
+    fake_llm.script_turn(
+        _fragment_event(0, call_id="c1", name="request_limit_increase", arguments=oversized),
+        _usage_event(),
+    )
+    router = _router(fake_llm, settings)
+
+    with pytest.raises(ValueError, match="accumulated argument bytes"):
+        await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+
+async def test_duplicate_tool_call_id_across_indices_fails_loudly(
+    fake_llm: FakeLLM, settings: Settings
+) -> None:
+    fake_llm.script_turn(
+        _fragment_event(0, call_id="dup", name="get_wallet_balance", arguments="{}"),
+        _fragment_event(
+            1, call_id="dup", name="get_payment_status", arguments='{"payment_id":"txn_1"}'
+        ),
+        _usage_event(),
+    )
+    router = _router(fake_llm, settings)
+
+    with pytest.raises(ValueError, match="reused across multiple indices"):
+        await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+
+async def test_ttft_first_attempt_cancellation_still_closes_its_stream(
+    settings: Settings,
+) -> None:
+    """Code-review MEDIUM: a non-TimeoutError failure (e.g. the router's
+    own generator being aclose()'d mid-TTFT-wait) on the FIRST attempt
+    must still tear down that attempt's stream, not just the retry's."""
+
+    class _CancelsOnFirstEvent:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[LLMEvent]:
+            return self._gen()
+
+        async def _gen(self) -> AsyncIterator[LLMEvent]:
+            try:
+                await asyncio.sleep(10)
+                yield _usage_event()  # pragma: no cover — never reached
+            finally:
+                self.closed = True
+
+    provider = _CancelsOnFirstEvent()
+    router = _router(provider, settings)
+    agen = router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE, ttft_deadline_s=10)
+
+    task = asyncio.ensure_future(anext(agen))
+    await asyncio.sleep(0)  # let the router open the stream and start waiting
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert provider.closed is True

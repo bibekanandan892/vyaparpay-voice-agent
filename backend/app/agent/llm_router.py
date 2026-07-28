@@ -79,6 +79,19 @@ _TASK_TIER: Final[dict[TaskKind, ModelTier]] = {
     TaskKind.UTILITY: ModelTier.UTILITY,
 }
 
+# Security-review HIGH, fixed: nothing bounded how many distinct
+# `tool_calls[i].index` values or how many argument bytes per index this
+# accumulator would hold — a misbehaving or compromised upstream could
+# grow it unboundedly for as long as the connection stayed open (no
+# per-call wall-clock cap exists past the TTFT deadline). The 16-tool
+# catalog (docs/10-tool-calling.md §3) bounds legitimate parallelism; a
+# generous multiple covers any real batch with headroom, and per-index
+# argument bytes are bounded well above the largest real tool schema
+# (docs/10 §3's `update_business_address`, still under 1 KB serialized).
+# Both fail loudly (house rule) rather than silently truncating.
+_MAX_TOOL_CALL_INDICES: Final = 32
+_MAX_ARGUMENT_BYTES_PER_INDEX: Final = 16_384
+
 
 @dataclass
 class _PartialToolCall:
@@ -135,7 +148,14 @@ class _ToolCallAssembler:
             out.append(event)
             return out
         if isinstance(event, ToolCallsEvent):
-            return [event]
+            # Security-review LOW, hardened: an already-whole event (not
+            # something OpenRouterLLM emits today, but the Protocol
+            # admits a future provider that does) must not silently
+            # strand any partials this instance already accumulated —
+            # flush them first so nothing is dropped.
+            out = [ToolCallsEvent(tool_calls=self.flush())] if self.has_pending else []
+            out.append(event)
+            return out
         fragments = event.delta.get("tool_calls")
         if not fragments:
             return [event]
@@ -151,6 +171,7 @@ class _ToolCallAssembler:
         context attached (house rule: never silently swallow — mirrors
         `OpenRouterLLM`'s malformed-chunk handling one layer down)."""
         calls: list[ToolCall] = []
+        seen_ids: set[str] = set()
         for index in sorted(self._partials):
             partial = self._partials[index]
             raw_arguments = "".join(partial.argument_parts)
@@ -167,6 +188,24 @@ class _ToolCallAssembler:
                     f"(id={partial.id!r}, name={partial.name!r}) — first-fragment "
                     "fields never arrived"
                 )
+            if partial.id in seen_ids:
+                # Security-review M-1: a provider that violates its own
+                # documented "id arrives only on an index's first
+                # fragment" invariant by reusing an id across indices
+                # would otherwise silently produce two ToolCalls sharing
+                # one id — corrupting tool-result correlation downstream
+                # (ToolExecutor, the follow-up LLM message). Fail loudly
+                # instead of guessing which one is real.
+                log.error(
+                    "llm_router.tool_call_id_reused_across_indices",
+                    index=index,
+                    tool_call_id=partial.id,
+                )
+                raise ValueError(
+                    f"streamed tool_call id {partial.id!r} reused across multiple "
+                    "indices — expected one id per index"
+                )
+            seen_ids.add(partial.id)
             arguments = self._parse_arguments(partial, index, raw_arguments)
             calls.append(ToolCall(id=partial.id, name=partial.name, arguments=arguments))
         self._partials = {}
@@ -184,6 +223,17 @@ class _ToolCallAssembler:
                 raise ValueError(
                     f"streamed tool_call fragment has no integer 'index': {fragment!r}"
                 )
+            if index not in self._partials and len(self._partials) >= _MAX_TOOL_CALL_INDICES:
+                log.error(
+                    "llm_router.tool_call_index_limit_exceeded",
+                    index=index,
+                    limit=_MAX_TOOL_CALL_INDICES,
+                )
+                raise ValueError(
+                    f"streamed tool_calls exceeded {_MAX_TOOL_CALL_INDICES} distinct "
+                    "indices — refusing to accumulate further (docs/10 §3's 16-tool "
+                    "catalog bounds any legitimate batch well under this)"
+                )
             partial = self._partials.setdefault(index, _PartialToolCall())
             if partial.id is None and fragment.get("id"):
                 partial.id = fragment["id"]
@@ -192,6 +242,19 @@ class _ToolCallAssembler:
                 partial.name = function["name"]
             arguments_part = function.get("arguments")
             if arguments_part:
+                accumulated = sum(len(p) for p in partial.argument_parts) + len(arguments_part)
+                if accumulated > _MAX_ARGUMENT_BYTES_PER_INDEX:
+                    log.error(
+                        "llm_router.tool_call_argument_bytes_exceeded",
+                        index=index,
+                        tool_call_id=partial.id,
+                        accumulated=accumulated,
+                        limit=_MAX_ARGUMENT_BYTES_PER_INDEX,
+                    )
+                    raise ValueError(
+                        f"streamed tool_call at index {index} exceeded "
+                        f"{_MAX_ARGUMENT_BYTES_PER_INDEX} accumulated argument bytes"
+                    )
                 partial.argument_parts.append(arguments_part)
 
     @staticmethod
@@ -317,6 +380,16 @@ class LLMRouter:
                 attempt=1,
             )
             await _close_quietly(upstream)
+        except BaseException:
+            # Code-review MEDIUM, fixed: only TimeoutError closed the
+            # first attempt's stream; a CancelledError from the router's
+            # own generator being aclose()'d while still awaiting the
+            # first token (a realistic barge-in/hangup-during-TTFT
+            # scenario) propagated straight out, before stream()'s own
+            # try/finally is even entered. Now symmetric with the retry
+            # branch below.
+            await _close_quietly(upstream)
+            raise
         retry_upstream = await self._open_stream(wire_messages, models=models, tools=tools)
         try:
             return retry_upstream, await _first_event(retry_upstream, ttft_deadline_s)

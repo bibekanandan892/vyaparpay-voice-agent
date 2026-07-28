@@ -217,6 +217,13 @@ class CostTracker:
                     session_id,
                     {
                         "turn_no": turn_no,  # tracker sequence — see judgment call #2
+                        # Code-review CRITICAL, fixed: every record_turn()
+                        # call prices an LLM completion the agent produced
+                        # — always the agent's turn. SessionManager.end()'s
+                        # drain reads this key unconditionally
+                        # (docs/12 §4.2's role CHECK requires it); omitting
+                        # it raised KeyError on every real call's drain.
+                        "role": "agent",
                         "model": turn.model,
                         "input_tokens": turn.input_tokens,
                         "cached_input_tokens": turn.cached_input_tokens,

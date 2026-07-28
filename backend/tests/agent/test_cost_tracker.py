@@ -365,6 +365,12 @@ async def test_finalize_appends_one_redis_turn_record_per_recorded_turn(
     assert first_record["output_tokens"] == 100
     assert first_record["cost_usd"] == str(_DIALOGUE_COST)  # lossless Decimal-as-text
     assert first_record["cost_estimated"] is False
+    # Code-review CRITICAL, fixed: every drained record must carry
+    # "role" — SessionManager.end()'s drain (task 4.1) reads it
+    # unconditionally (docs/12 §4.2's role CHECK requires it) and every
+    # record_turn() call prices an LLM completion, always the agent's.
+    assert first_record["role"] == "agent"
+    assert harness.redis.turns[1][1]["role"] == "agent"
 
 
 async def test_finalize_retry_re_upserts_but_never_duplicates_turn_records(
