@@ -12,13 +12,13 @@ Judgment calls, flagged per house style rather than silently guessed at:
 1. **Tool-call events are detected structurally, not by isinstance.**
    Task 4.3's `LLMRouter` yields reassembled whole tool calls in an
    event type (`ToolCallsEvent`) added to `app/domain/types.py` on a
-   sibling branch that may merge before or after this one. Importing it
-   here would couple this PR's merge order to that one — the exact
-   hazard PR #11 documented against PR #10. Instead the loop checks
-   `getattr(event, "tool_calls", None)`: any event carrying a non-None
-   `tool_calls` sequence of `ToolCall`s is the router's reassembled
-   batch. Tighten to an `isinstance` check in a follow-up once both
-   branches are on `main`.
+   sibling branch (PR #15) not yet merged to `main` as of this branch.
+   Importing it here would couple this PR's merge order to that one —
+   the exact hazard PR #11 documented against PR #10. Instead the loop
+   checks `getattr(event, "tool_calls", None)`: any event carrying a
+   non-None `tool_calls` sequence of `ToolCall`s is the router's
+   reassembled batch. Tighten to an `isinstance` check in a follow-up
+   once both branches are on `main`.
 2. **The tool loop is bounded at 2 execution rounds** (docs/05 §2: "the
    loop bound is small (typically 0–2 iterations)"; the Phase-2 plan
    pins "0–2"). If the model emits tool calls a third time, the loop
@@ -38,8 +38,6 @@ Judgment calls, flagged per house style rather than silently guessed at:
    offer** (docs/05 §3.2's failure behavior: "a spoken apology plus an
    `escalate_to_human` offer rather than dropping silence on the
    call") — logged server-side with the real exception, never voiced.
-   The user's utterance still lands in the transcript window so the
-   next turn has honest context; the apology line does too.
 6. **Affirmation is classified once, at turn open**, from the utterance
    against the pending confirm present at that moment, and the same
    flag is passed to every `execute()` this turn — the gate semantics
@@ -48,6 +46,31 @@ Judgment calls, flagged per house style rather than silently guessed at:
 7. **`on_barge_in` is a Phase-2 no-op** — kept in the contract for
    shape-stability into Phase 3 (`ConversationManagerProto`'s own
    docstring); there is no audio to cancel yet.
+8. **Transcript writes are split into an early user-turn append and a
+   late assistant-turn append, each independently best-effort** (fixed
+   after review — MEDIUM). The earlier single `_append_transcript(user,
+   assistant)` call at turn-end meant a Redis hiccup on the *second*
+   (assistant) write inside that call raised past the point where a
+   correctly-computed `reply_text` already existed, discarding it in
+   favor of the generic apology — and the top-level except-handler's
+   retry then re-appended the user's utterance a SECOND time (the first
+   append had already succeeded). Now: the user turn is appended once,
+   immediately, before any of the rest of the turn runs; the assistant
+   turn is appended once, at the very end, wrapped in its own
+   best-effort try/except that never discards an already-computed
+   `reply_text` on a logging-layer failure. The top-level except-handler
+   in `on_stt_final` therefore only ever needs to append the apology as
+   the assistant turn — never the user turn again.
+9. **`state` transitions to `SPEAKING` only from the round that actually
+   produces the returned reply** (fixed after review — MEDIUM). The tool
+   loop discards every round's `content_parts` except the last (only the
+   final round's text becomes `reply_text`); the state flag now follows
+   that same rule instead of firing on the first content token of *any*
+   round, including one whose narration is later thrown away because
+   that round also carried `tool_calls`. Kept correct now rather than
+   guessed right later — docs/05 §3.2 calls the SPEAKING transition
+   safety-critical for Phase 3 barge-in cancellation, even though
+   nothing reads `state` yet in Phase 2.
 """
 
 from __future__ import annotations
@@ -56,7 +79,7 @@ import inspect
 from collections.abc import AsyncIterator
 from typing import cast
 
-from opentelemetry import trace
+from opentelemetry.trace import Span
 
 from app.domain.interfaces import (
     ContextBuilderProto,
@@ -76,16 +99,17 @@ from app.domain.types import (
     TaskKind,
     TokenEvent,
     ToolCall,
+    ToolResult,
     TurnState,
     UsageEvent,
 )
 from app.memory.session_memory import SessionMemory
 from app.memory.short_term import ShortTermMemory
 from app.obs.logging import get_logger
-from app.obs.tracing import safe_set_attribute
+from app.obs.tracing import SPAN_TURN, get_tracer, safe_set_attribute
 
 log = get_logger(__name__)
-tracer = trace.get_tracer(__name__)
+tracer = get_tracer(__name__)
 
 # Judgment call #2 (module docstring): docs/05 §2's "typically 0-2".
 _MAX_TOOL_ROUNDS = 2
@@ -103,6 +127,18 @@ _TURN_FAILURE_APOLOGY = (
     "Would you like me to try again, or connect you to a human agent?"
 )
 
+# Judgment call #11 (security review HIGH, fixed): a safety BACKSTOP, not
+# an enforcement of docs/11 §1's ~150-token voice-output budget (that's a
+# separate, not-yet-built mechanism). Nothing anywhere in the pipeline —
+# the OpenRouter request body (no max_tokens), LLMRouter, or this class —
+# bounded how much text a single streamed completion could accumulate
+# before joining, screening, and persisting it; a misbehaving/compromised
+# upstream or a model stuck in a repetition loop could grow this
+# unboundedly, mirroring the tool-call-fragment issue task 4.3 already
+# fixed for the same reason. ~16x the real voice budget — never trips on
+# a legitimate answer, bounds the pathological case.
+_MAX_REPLY_CHARS = 8_000
+
 
 class ConversationManager:
     """docs/05 §3.2. One instance per call/session; `on_stt_final` is
@@ -110,9 +146,12 @@ class ConversationManager:
     `VoiceAgentWorker` takes over that role unchanged — the brain/media
     boundary docs/05 §1.1 exists to keep this class transport-blind).
 
-    All collaborators arrive as their frozen Protocols (docs/04 §4's DI
-    split); this class never constructs one, so the E2E harness swaps
-    any of them for a fake without touching this file.
+    Collaborators arrive as their frozen Protocols (docs/04 §4's DI
+    split) with one exception: `session_memory` is the concrete
+    `SessionMemory` class, since no `SessionMemoryProto` exists in
+    `app/domain/interfaces.py` — this class never constructs any of its
+    collaborators, so the E2E harness swaps any of them (via a subclass,
+    for `session_memory`) for a fake without touching this file.
     """
 
     def __init__(
@@ -148,9 +187,13 @@ class ConversationManager:
         always gets *something* to say."""
         self._turn_no += 1
         self.state = TurnState.THINKING
-        with tracer.start_as_current_span("turn") as span:
+        with tracer.start_as_current_span(SPAN_TURN) as span:
             safe_set_attribute(span, "session_id", self._session.session_id)
             safe_set_attribute(span, "turn_no", self._turn_no)
+            # Judgment call #8: appended once, immediately — never
+            # revisited by the except-handler below, so a later failure
+            # can't cause a duplicate.
+            await self._append_user_turn(text)
             try:
                 reply = await self._run_turn(text, span)
             except Exception:
@@ -162,14 +205,7 @@ class ConversationManager:
                 )
                 safe_set_attribute(span, "turn.failed", True)
                 reply = _TURN_FAILURE_APOLOGY
-                # Transcript still gets both sides (judgment call #5) —
-                # best-effort: if Redis is the thing that's down, the
-                # turn already degraded; don't mask the original error
-                # with a second one.
-                try:
-                    await self._append_transcript(text, reply)
-                except Exception:  # noqa: BLE001 — deliberate best-effort
-                    log.error("transcript_append_failed", exc_info=True)
+                await self._append_assistant_turn(reply)
             finally:
                 self.state = TurnState.LISTENING
         return reply
@@ -182,7 +218,7 @@ class ConversationManager:
     # The critical path (docs/05 §2, numbered arrows)
     # ------------------------------------------------------------------
 
-    async def _run_turn(self, text: str, span: trace.Span) -> str:
+    async def _run_turn(self, text: str, span: Span) -> str:
         # Affirmation first (judgment call #6): the classification pairs
         # THIS utterance with the pending confirm as it stood when the
         # user spoke, before any of this turn's executions mutate it.
@@ -201,24 +237,47 @@ class ConversationManager:
         tools = self._tool_registry.to_openai_tools()
         tier = self._llm_router.route(TaskKind.DIALOGUE)
 
-        # Arrows 4-7: stream, executing at most _MAX_TOOL_ROUNDS tool
-        # batches (docs/10 §2's pipeline runs inside execute()).
+        reply_text = await self._run_tool_loop(
+            messages, tools=tools, tier=tier, affirmed=affirmed, stm=stm, span=span
+        )
+
+        reply_text = self._screen_output(reply_text, stm.tool_results, span=span)
+
+        if self._cost_tracker.over_budget():
+            # docs/05 §3.8: warn + span event; the shorter-context
+            # degrade signal is Phase-4/5 ContextBuilder machinery.
+            log.warning(
+                "call_over_budget",
+                session_id=self._session.session_id,
+                call_total=str(self._cost_tracker.call_total()),
+            )
+            safe_set_attribute(span, "turn.over_budget", True)
+
+        # Judgment call #8: best-effort — a failure here must never
+        # discard an already-computed, correct reply_text.
+        await self._append_assistant_turn(reply_text)
+        return reply_text
+
+    async def _run_tool_loop(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[dict[str, object]],
+        tier: object,
+        affirmed: bool,
+        stm: ShortTermMemory,
+        span: Span,
+    ) -> str:
+        """Arrows 4-7: stream, executing at most `_MAX_TOOL_ROUNDS` tool
+        batches (docs/10 §2's pipeline runs inside `execute()`).
+        Extracted from `_run_turn` (code-review HIGH — the combined
+        method exceeded the house 50-line function limit)."""
         reply_text = ""
         tool_rounds = 0
         while True:
             content_parts: list[str] = []
             tool_calls: list[ToolCall] = []
-            # `LLMRouterProto.stream` is spelled `async def ... ->
-            # AsyncIterator`, which mypy reads as coroutine-returning,
-            # while a real async-generator implementation returns the
-            # iterator directly — the pre-existing Protocol wart task 4.3
-            # also documents. Handle both shapes at runtime.
-            raw_stream = self._llm_router.stream(messages, tier=tier, tools=tools)
-            stream = (
-                await raw_stream
-                if inspect.iscoroutine(raw_stream)
-                else cast("AsyncIterator[LLMEvent]", raw_stream)
-            )
+            stream = await self._open_stream(messages, tier=tier, tools=tools)
             async for event in stream:
                 if isinstance(event, UsageEvent):
                     turn_cost = self._cost_tracker.record_turn(event.usage, event.model, span)
@@ -232,17 +291,34 @@ class ConversationManager:
                 elif isinstance(event, TokenEvent):
                     content = event.delta.get("content")
                     if content:
-                        if not content_parts:
-                            self.state = TurnState.SPEAKING
                         content_parts.append(content)
+                        accumulated = sum(len(p) for p in content_parts)
+                        if accumulated > _MAX_REPLY_CHARS:
+                            log.error(
+                                "llm_reply_size_limit_exceeded",
+                                session_id=self._session.session_id,
+                                turn_no=self._turn_no,
+                                accumulated=accumulated,
+                                limit=_MAX_REPLY_CHARS,
+                            )
+                            raise ValueError(
+                                f"streamed reply exceeded {_MAX_REPLY_CHARS} accumulated "
+                                "characters — refusing to accumulate further"
+                            )
 
             reply_text = "".join(content_parts)
 
             if not tool_calls:
+                # Judgment call #9: this round's content IS the reply —
+                # the only point SPEAKING can correctly fire from.
+                if content_parts:
+                    self.state = TurnState.SPEAKING
                 break
             if tool_rounds >= _MAX_TOOL_ROUNDS:
                 # Judgment call #2: bound reached — stop executing, keep
-                # whatever the model already said.
+                # whatever the model already said. This round's content
+                # (if any) is narration for a call that never ran, not
+                # the final answer — never promoted to SPEAKING.
                 log.warning(
                     "tool_loop_bound_reached",
                     session_id=self._session.session_id,
@@ -265,17 +341,51 @@ class ConversationManager:
                 principal=self._principal,
                 session_id=self._session.session_id,
                 turn_no=self._turn_no,
-                affirmed=affirmed,
+                # Judgment call #10 (security review CRITICAL, fixed):
+                # the turn-opening "yes" is eligible to confirm ONLY the
+                # first tool round. Passing the same `affirmed=True` to a
+                # second round let a model that ignores the gate's own
+                # "Do not treat this as executed" instruction propose a
+                # DIFFERENT mutating/sensitive action in round 1 (which
+                # supersedes whatever the user actually said yes to and
+                # writes a fresh pending confirm to Redis), then
+                # immediately re-emit that same new call in round 2 —
+                # where ToolExecutor's fresh Redis read would find it
+                # "matching" and, with the stale affirmed flag still
+                # True, execute it with no genuine confirmation ever
+                # voiced or heard. The confirm-gate state machine
+                # (docs/10 §4: Proposed -> AwaitingYes -> Executing) is
+                # meant to span conversational turns, not collapse
+                # inside one model loop — every round after the first
+                # gets affirmed=False, forcing any newly-(re)proposed
+                # action to wait for a genuine new user utterance.
+                affirmed=affirmed if tool_rounds == 1 else False,
             )
             for result in results:
                 stm.record_tool_result(result)
                 messages.append(result.to_llm_message())
             # Loop: stream again with results appended (docs/05 §2's
             # "append results, continue stream").
+        return reply_text
 
-        # Arrow: output checks (docs/05 §3.6) — fail closed (judgment
-        # call #4).
-        verdict = self._safety_layer.screen_output(reply_text, stm.tool_results)
+    async def _open_stream(
+        self, messages: list[Message], *, tier: object, tools: list[dict[str, object]]
+    ) -> AsyncIterator[LLMEvent]:
+        """`LLMRouterProto.stream` is spelled `async def ... ->
+        AsyncIterator`, which mypy reads as coroutine-returning, while a
+        real async-generator implementation returns the iterator
+        directly — the pre-existing Protocol wart task 4.3 also
+        documents (and independently handles the same way in its own
+        `llm_router.py`). Handle both shapes at runtime."""
+        raw_stream = self._llm_router.stream(messages, tier=tier, tools=tools)  # type: ignore[arg-type]
+        if inspect.iscoroutine(raw_stream):
+            return cast("AsyncIterator[LLMEvent]", await raw_stream)
+        return cast("AsyncIterator[LLMEvent]", raw_stream)
+
+    def _screen_output(self, reply_text: str, tool_results: list[ToolResult], *, span: Span) -> str:
+        """Arrow: output checks (docs/05 §3.6) — fail closed (judgment
+        call #4)."""
+        verdict = self._safety_layer.screen_output(reply_text, tool_results)
         if not verdict.allowed:
             log.warning(
                 "output_blocked",
@@ -293,32 +403,37 @@ class ConversationManager:
             # A tool-only or bound-hit turn can end with no content at
             # all; dead air is the one thing a voice channel can't ship.
             reply_text = _BLOCKED_OUTPUT_FALLBACK
-
-        if self._cost_tracker.over_budget():
-            # docs/05 §3.8: warn + span event; the shorter-context
-            # degrade signal is Phase-4/5 ContextBuilder machinery.
-            log.warning(
-                "call_over_budget",
-                session_id=self._session.session_id,
-                call_total=str(self._cost_tracker.call_total()),
-            )
-            safe_set_attribute(span, "turn.over_budget", True)
-
-        await self._append_transcript(text, reply_text)
         return reply_text
 
-    async def _append_transcript(self, user_text: str, reply_text: str) -> None:
-        """The two transcript-window writes this class owns (docs/05
-        §3.2: the manager "assembles the transcript"). A synthetic
-        call-open trigger turn (empty utterance, PromptBuilder's turn-1
-        convention) writes no user entry — nothing was said."""
-        if user_text:
+    # ------------------------------------------------------------------
+    # Transcript (docs/05 §3.2: the manager "assembles the transcript")
+    # ------------------------------------------------------------------
+
+    async def _append_user_turn(self, text: str) -> None:
+        """A synthetic call-open trigger turn (empty utterance,
+        PromptBuilder's turn-1 convention) writes no user entry —
+        nothing was said. Best-effort (judgment call #8): a transcript
+        write failure degrades the NEXT turn's context, never this
+        turn's answer."""
+        if not text:
+            return
+        try:
             await self._session_memory.append_message(
-                self._session.session_id, Message(role=Role.USER, content=user_text)
+                self._session.session_id, Message(role=Role.USER, content=text)
             )
-        await self._session_memory.append_message(
-            self._session.session_id, Message(role=Role.ASSISTANT, content=reply_text)
-        )
+        except Exception:  # noqa: BLE001 — deliberate best-effort, see docstring
+            log.error("user_transcript_append_failed", exc_info=True)
+
+    async def _append_assistant_turn(self, reply_text: str) -> None:
+        """Best-effort (judgment call #8): never let a logging-layer
+        failure here propagate and discard an already-computed
+        `reply_text` the caller is about to return/voice."""
+        try:
+            await self._session_memory.append_message(
+                self._session.session_id, Message(role=Role.ASSISTANT, content=reply_text)
+            )
+        except Exception:  # noqa: BLE001 — deliberate best-effort, see docstring
+            log.error("assistant_transcript_append_failed", exc_info=True)
 
 
 __all__ = ["ConversationManager"]

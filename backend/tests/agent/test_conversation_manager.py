@@ -471,3 +471,74 @@ async def test_barge_in_is_a_phase2_noop() -> None:
     manager, _, _, _ = _manager(router)
 
     await manager.on_barge_in()  # must neither raise nor cancel anything
+
+
+# ---------------------------------------------------------------------------
+# Review hardening — security CRITICAL (stale affirmed flag across tool
+# rounds) and HIGH (unbounded reply-content accumulation)
+# ---------------------------------------------------------------------------
+
+
+async def test_affirmed_flag_only_applies_to_the_first_tool_round() -> None:
+    """The exact PoC from the security review: round 1 proposes/matches
+    a DIFFERENT action than what the user affirmed (simulating a model
+    that ignores the gate's "do not treat this as executed" instruction
+    and immediately re-emits a newly-superseding call); round 2 must
+    NEVER receive the stale affirmed=True."""
+    router = FakeRouter()
+    router.script(
+        [ToolCallsBatch(tool_calls=(_call("block_card", "c1"),)), *_text_events()],
+        [ToolCallsBatch(tool_calls=(_call("block_card", "c2"),)), *_text_events()],
+        _text_events("Done."),
+    )
+    safety = FakeSafetyLayer()
+    safety.affirmation = True
+    memory = FakeSessionMemory()
+    memory.pending = PendingConfirm(
+        tool="request_limit_increase", args={}, proposed_turn=1, invocation_id="i1"
+    )
+    manager, executor, _, _ = _manager(router, safety=safety, memory=memory)
+
+    await manager.on_stt_final("yes, do it")
+
+    assert len(executor.calls) == 2
+    assert executor.calls[0]["affirmed"] is True  # round 1: the genuine "yes"
+    assert executor.calls[1]["affirmed"] is False  # round 2: never inherits it
+
+
+async def test_affirmed_false_when_no_pending_regardless_of_round() -> None:
+    router = FakeRouter()
+    router.script(
+        [ToolCallsBatch(tool_calls=(_call(),)), *_text_events()],
+        [ToolCallsBatch(tool_calls=(_call(id_="c2"),)), *_text_events()],
+        _text_events("d"),
+    )
+    manager, executor, _, _ = _manager(router)  # no pending set on FakeSessionMemory
+
+    await manager.on_stt_final("check it")
+
+    assert [c["affirmed"] for c in executor.calls] == [False, False]
+
+
+async def test_reply_content_beyond_size_cap_degrades_to_apology() -> None:
+    """Security review HIGH: nothing bounded accumulated reply content —
+    mirrors the tool-call-fragment cap task 4.3 already has. A stream
+    that keeps emitting content past the cap must degrade the turn, not
+    grow memory unboundedly."""
+    from app.agent.conversation_manager import _MAX_REPLY_CHARS, _TURN_FAILURE_APOLOGY
+
+    router = FakeRouter()
+    chunk = "x" * 1000
+    events: list[Any] = [
+        TokenEvent(delta={"content": chunk}) for _ in range(_MAX_REPLY_CHARS // 1000 + 2)
+    ]
+    events.append(UsageEvent(model="m", usage={}))
+    router.script(events)
+    manager, _, memory, _ = _manager(router)
+
+    reply = await manager.on_stt_final("hi")
+
+    assert reply == _TURN_FAILURE_APOLOGY
+    # Best-effort transcript still gets both sides (judgment call #5/#8).
+    assert memory.appended[0].content == "hi"
+    assert memory.appended[-1].content == _TURN_FAILURE_APOLOGY
