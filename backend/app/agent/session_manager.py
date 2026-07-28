@@ -96,9 +96,19 @@ log = get_logger(__name__)
 # example's collision-prone 6.
 _SESSION_ID_HEX_CHARS = 12
 
-# Judgment call #2 (module docstring): NOT NULL column, no Phase-2
-# signaling token to hash — one greppable sentinel digest for every row.
-_PHASE2_SIGNALING_TOKEN_HASH = hashlib.sha256(b"phase2:no-signaling-token").hexdigest()
+def _mint_placeholder_token_hash() -> str:
+    """Judgment call #2, hardened after security review (HIGH): the NOT
+    NULL `signaling_token_hash` column gets a PER-ROW random digest with
+    no known preimage — `sha256(uuid4().bytes)` where the input is
+    discarded — instead of the earlier shared constant derived from a
+    committed plaintext. With the constant, a future Phase-3 verifier
+    doing the natural `sha256(candidate) == row.signaling_token_hash`
+    would have authenticated the publicly-known plaintext against EVERY
+    Phase-2 row; with a preimage-free per-row value, no candidate token
+    can ever hash-match, so the naive comparison fails closed by
+    construction. Phase 3's real token minting replaces this function
+    outright."""
+    return hashlib.sha256(uuid4().bytes).hexdigest()
 
 
 def _mint_session_id() -> str:
@@ -119,7 +129,28 @@ def _to_domain(conversation: Conversation) -> Session:
 def _parse_cost_usd(value: Any) -> Decimal | None:
     # Via str() so a JSON number that arrived as float doesn't smuggle
     # binary-float noise into the NUMERIC(10,6) column.
-    return None if value is None else Decimal(str(value))
+    if value is None:
+        return None
+    parsed = Decimal(str(value))
+    # Security-review MEDIUM: Decimal happily parses "NaN"/"Infinity"
+    # (and 1e400 arrives from orjson as float('inf')); Postgres >= 14
+    # would INSERT them silently — no CHECK guards this column — and one
+    # such row poisons every SUM()/AVG() over cost_usd. Keep it inside
+    # the documented malformed-record-aborts-the-drain contract instead.
+    if not parsed.is_finite():
+        raise ValueError(f"cost_usd must be finite, got {value!r}")
+    return parsed
+
+
+def _parse_optional_int(value: Any, *, field: str) -> int | None:
+    # Security-review note: turn_no was cast, its int siblings weren't —
+    # same explicit coercion for all of them, so a malformed value hits
+    # the abort path here instead of deep inside the driver.
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool is an int subclass; reject it
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    return int(value)
 
 
 def _parse_started_at(value: Any) -> datetime | None:
@@ -186,7 +217,7 @@ class SessionManager:
         started_at = datetime.now(UTC)  # judgment call #4 (module docstring)
         async with self._transaction() as db:
             await ConversationRepo(db).create(
-                session_id, user_id, _PHASE2_SIGNALING_TOKEN_HASH
+                session_id, user_id, _mint_placeholder_token_hash()
             )
         return Session(
             session_id=session_id,
@@ -225,36 +256,59 @@ class SessionManager:
         in one transaction (judgment calls #6-#8, module docstring).
         `text` is never passed through (docs/12 §4.2); Redis keys are
         left to expire on TTL."""
-        async with self._transaction() as db:
-            repo = ConversationRepo(db)
-            conversation = await self._get_existing(db, session_id)
-            if conversation.state == SessionState.ENDED.value:
-                log.debug(
-                    "session_end_duplicate", session_id=session_id, reason=reason.value
-                )
-                return
-            await repo.end(session_id)
+        try:
+            async with self._transaction() as db:
+                repo = ConversationRepo(db)
+                conversation = await self._get_existing(db, session_id)
+                if conversation.state == SessionState.ENDED.value:
+                    # info, not debug (review LOW): docs/05 §3.1 treats a
+                    # double hang-up as an expected, operationally real
+                    # condition — it should be visible at production levels.
+                    log.info(
+                        "session_end_duplicate", session_id=session_id, reason=reason.value
+                    )
+                    return
+                await repo.end(session_id)
 
-            turn_records = await self._redis.get_turns(session_id)
-            for record in turn_records:
-                await repo.append_turn(
-                    session_id,
-                    int(record["turn_no"]),
-                    str(record["role"]),
-                    latency_ms=record.get("latency_ms"),
-                    input_tokens=record.get("input_tokens"),
-                    output_tokens=record.get("output_tokens"),
-                    tool_calls=record.get("tool_calls"),
-                    cost_usd=_parse_cost_usd(record.get("cost_usd")),
-                    trace_id=record.get("trace_id"),
-                    started_at=_parse_started_at(record.get("started_at")),
-                )
+                turn_records = await self._redis.get_turns(session_id)
+                for record in turn_records:
+                    await repo.append_turn(
+                        session_id,
+                        int(record["turn_no"]),
+                        str(record["role"]),
+                        latency_ms=_parse_optional_int(
+                            record.get("latency_ms"), field="latency_ms"
+                        ),
+                        input_tokens=_parse_optional_int(
+                            record.get("input_tokens"), field="input_tokens"
+                        ),
+                        output_tokens=_parse_optional_int(
+                            record.get("output_tokens"), field="output_tokens"
+                        ),
+                        tool_calls=record.get("tool_calls"),
+                        cost_usd=_parse_cost_usd(record.get("cost_usd")),
+                        trace_id=record.get("trace_id"),
+                        started_at=_parse_started_at(record.get("started_at")),
+                    )
 
-            duration_s: int | None = None
-            if conversation.started_at is not None and conversation.ended_at is not None:
-                duration_s = int(
-                    (conversation.ended_at - conversation.started_at).total_seconds()
-                )
+                duration_s: int | None = None
+                if conversation.started_at is not None and conversation.ended_at is not None:
+                    duration_s = int(
+                        (conversation.ended_at - conversation.started_at).total_seconds()
+                    )
+        except Exception:
+            # Code-review MEDIUM: the abort path deserves the same
+            # visibility as the success path — docs/09 §8's "retried
+            # whole" recovery only happens if something notices. The
+            # rollback already happened in _transaction(); re-raise after
+            # logging, never swallow.
+            log.warning(
+                "call_end_drain_failed",
+                session_id=session_id,
+                reason=reason.value,
+                exc_info=True,
+            )
+            raise
 
         # docs/05 §3.10's `call_ended` event, emitted only after the
         # transaction committed — a rolled-back end never claims to have

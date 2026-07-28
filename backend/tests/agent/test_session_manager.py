@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
-from app.agent.session_manager import _PHASE2_SIGNALING_TOKEN_HASH, SessionManager
+from app.agent.session_manager import SessionManager
 from app.api.errors import ResourceNotFoundError
 from app.data.redis_client import RedisClient
 from app.domain.interfaces import SessionManagerProto
@@ -144,16 +144,21 @@ async def test_create_mints_short_hex_session_ids_that_are_unique(
     assert first.session_id != second.session_id
 
 
-async def test_create_uses_the_documented_signaling_token_hash_placeholder(
+async def test_create_uses_a_preimage_free_per_row_token_hash_placeholder(
     manager: SessionManager, db_session: AsyncMock
 ) -> None:
     """NOT NULL column, no Phase-2 signaling token to hash (judgment call
-    #2): every row gets the one sentinel-derived sha256 digest."""
+    #2, hardened after security review HIGH): a well-formed 64-hex digest
+    that is PER-ROW random with no known preimage — never a shared,
+    publicly-derivable constant a naive future verifier could be fed."""
     await manager.create("usr_rajesh01", None, [])
+    first = db_session.add.call_args.args[0].signaling_token_hash
+    assert _SHA256_HEX_RE.match(first)
 
-    row = db_session.add.call_args.args[0]
-    assert row.signaling_token_hash == _PHASE2_SIGNALING_TOKEN_HASH
-    assert _SHA256_HEX_RE.match(row.signaling_token_hash)
+    await manager.create("usr_rajesh01", None, [])
+    second = db_session.add.call_args.args[0].signaling_token_hash
+    assert _SHA256_HEX_RE.match(second)
+    assert first != second  # per-row, not a shared constant
 
 
 async def test_create_accepts_and_ignores_screen_context_and_events(
