@@ -383,3 +383,106 @@ def test_fence_input_does_not_neutralize_current_utterance(safety: SafetyLayer) 
     fenced = safety.fence_input(bundle)
 
     assert fenced.current_utterance == bundle.current_utterance
+
+
+# --------------------------------------------------------------------------
+# Security review CRITICAL: error.detail echoing the model's own tool-call
+# arguments must never license an unrelated voiced amount elsewhere in the
+# same turn. See safety_layer.py's _collect_verified_facts docstring.
+# --------------------------------------------------------------------------
+
+
+def test_echoed_payment_id_digits_do_not_verify_an_unrelated_amount(
+    safety: SafetyLayer,
+) -> None:
+    """The exact PoC from the security review: a 404's echoed payment_id
+    string contains digits that must NOT verify a later, unrelated ₹
+    amount claim."""
+    not_found_result = ToolResult(
+        tool_call_id="c1",
+        tool_name="get_payment_status",
+        ok=False,
+        error={
+            "type": "business",
+            "code": "RESOURCE_NOT_FOUND",
+            "detail": {"payment_id": "txn_500000"},
+            "retryable": False,
+        },
+        status=ToolInvocationStatus.ERROR,
+        latency_ms=8,
+    )
+
+    verdict = safety.screen_output(
+        "I couldn't find that payment, but I found a settlement credit of ₹500,000.",
+        [not_found_result],
+    )
+
+    assert verdict.allowed is False
+
+
+def test_echoed_current_view_paise_does_not_verify_an_unrelated_amount(
+    safety: SafetyLayer,
+) -> None:
+    """Second PoC vector: STALE_LIMIT_VIEW echoes current_limit * 100 as
+    a raw int — must not verify an unrelated voiced amount either."""
+    stale_view_result = ToolResult(
+        tool_call_id="c1",
+        tool_name="request_limit_increase",
+        ok=False,
+        error={
+            "type": "business",
+            "code": "STALE_LIMIT_VIEW",
+            "detail": {"current_view_paise": 5000000, "requested_paise": 2500000},
+            "retryable": True,
+        },
+        status=ToolInvocationStatus.ERROR,
+        latency_ms=9,
+    )
+
+    verdict = safety.screen_output(
+        "Your daily limit is now fifty thousand rupees.".replace(
+            "fifty thousand", "₹50,000"
+        ),
+        [stale_view_result],
+    )
+
+    assert verdict.allowed is False
+
+
+def test_server_generated_reference_id_in_error_detail_still_verifies(
+    safety: SafetyLayer,
+) -> None:
+    """Not a regression: a genuinely server-generated id in error.detail
+    (never something the model supplied) must keep verifying via the
+    string corpus — only NUMBER harvesting is restricted for `error`."""
+    already_pending = ToolResult(
+        tool_call_id="c1",
+        tool_name="request_limit_increase",
+        ok=False,
+        error={
+            "type": "business",
+            "code": "LIMIT_REQUEST_ALREADY_PENDING",
+            "detail": {"existing_request_id": "LMT-2026-0724-0913", "status": "submitted"},
+            "retryable": False,
+        },
+        status=ToolInvocationStatus.ERROR,
+        latency_ms=7,
+    )
+
+    verdict = safety.screen_output(
+        "You already have a request pending — reference LMT-2026-0724-0913.",
+        [already_pending],
+    )
+
+    assert verdict.allowed is True
+
+
+def test_data_payload_numbers_still_verify_unchanged(safety: SafetyLayer) -> None:
+    """Not a regression: `data` (the tool's own authoritative output,
+    never an argument echo in any current handler) keeps verifying
+    numbers exactly as before the fix."""
+    balance_result = _ok_result({"balance": 18450, "currency": "INR", "updated_at": "x"})
+
+    verdict = safety.screen_output("Your balance is ₹18,450.", [balance_result])
+
+    assert verdict.allowed is True

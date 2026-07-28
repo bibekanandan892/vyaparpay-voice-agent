@@ -895,3 +895,81 @@ async def test_canonical_trace_t5_through_t7(
     assert replay[0].data["idempotent_replay"] is True
     assert len(call_log) == 1
     assert len(_audit_rows(sessionmaker)) == 2
+
+
+# --------------------------------------------------------------------------
+# _truncate_data — docs/10 §2 format stage. Code-review MEDIUM: this had
+# zero test coverage despite the module docstring's detailed JSON-safety
+# claim.
+# --------------------------------------------------------------------------
+
+
+def test_truncate_data_leaves_small_payloads_unchanged() -> None:
+    from app.agent.tool_executor import _truncate_data
+
+    data = {"balance": 18450, "currency": "INR"}
+
+    assert _truncate_data(data) == data
+
+
+def test_truncate_data_cuts_long_lists_to_five_rows_with_truncation_markers() -> None:
+    from app.agent.tool_executor import _MAX_LIST_ROWS, _truncate_data
+
+    items = [{"id": i} for i in range(12)]
+
+    result = _truncate_data({"items": items})
+
+    assert len(result["items"]) == _MAX_LIST_ROWS
+    assert result["truncated"] is True
+    assert result["total_available"] == 12
+
+
+def test_truncate_data_never_mutates_the_input_dict() -> None:
+    from app.agent.tool_executor import _truncate_data
+
+    original = {"items": list(range(20))}
+    original_copy = dict(original)
+
+    _truncate_data(original)
+
+    assert original == original_copy
+
+
+def test_truncate_data_falls_back_to_digest_when_still_oversized_and_emits_valid_json() -> None:
+    """The claim this test pins: even when the digest fallback cuts the
+    rendered JSON mid-string, the OUTER structure it returns is still
+    valid JSON — the cut text is a Python str value json.dumps escapes
+    correctly regardless of where it lands."""
+    from app.agent.tool_executor import _MAX_RESULT_CHARS, _truncate_data
+
+    # A single oversized string value the 5-row list truncation can't
+    # help with — forces the digest fallback path.
+    data = {"summary": "x" * (_MAX_RESULT_CHARS * 2)}
+
+    result = _truncate_data(data)
+
+    assert result["truncated"] is True
+    assert "digest" in result
+    # Round-trips through json.dumps/json.loads without error — the
+    # actual "never emits corrupt JSON" claim, verified, not assumed.
+    reparsed = json.loads(json.dumps(result))
+    assert reparsed == result
+
+
+def test_truncate_data_digest_fallback_survives_a_cut_mid_escape_sequence() -> None:
+    """Adversarial case: the digest cut point lands inside what would be
+    a JSON escape sequence in the ALREADY-rendered inner JSON — since the
+    digest is a fresh Python str re-encoded by the OUTER json.dumps, this
+    can never produce invalid JSON, unlike naively slicing a JSON string
+    at the byte level would."""
+    from app.agent.tool_executor import _MAX_RESULT_CHARS, _truncate_data
+
+    # Backslashes and quotes near where the cut is likely to land.
+    poisoned = ('\\"' * 400) + ("y" * _MAX_RESULT_CHARS)
+    data = {"raw": poisoned}
+
+    result = _truncate_data(data)
+
+    reparsed = json.loads(json.dumps(result))
+    assert reparsed == result
+    assert result["truncated"] is True

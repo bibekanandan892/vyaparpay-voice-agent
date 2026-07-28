@@ -123,7 +123,10 @@ _NUMERIC_TOKEN_PATTERN: Final = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _PII_PATTERNS: Final = (
     re.compile(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b"),  # 16-digit card
     re.compile(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}\b"),  # 12-digit Aadhaar
-    re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b"),  # PAN (Indian tax id)
+    # Code-review LOW, fixed: every other pattern in this module is
+    # case-insensitive; this one wasn't, so a lowercase-rendered PAN
+    # (e.g. from a tool that lowercases text) passed through unmasked.
+    re.compile(r"\b[A-Za-z]{5}\d{4}[A-Za-z]\b"),  # PAN (Indian tax id)
 )
 _PII_MASK: Final = "****"
 
@@ -259,13 +262,39 @@ class SafetyLayer:
         """Walk every result payload (`data`/`error`/`gate`) collecting
         canonical numbers and a searchable string corpus. An instance
         method (not a free function) so tests can monkeypatch it to prove
-        the fail-closed path."""
+        the fail-closed path.
+
+        Security review CRITICAL, fixed: `result.error.detail` routinely
+        echoes the LLM's OWN tool-call arguments back verbatim — e.g.
+        `get_payment_status`'s 404 echoes the caller-supplied
+        `payment_id`, and `request_limit_increase`'s `STALE_LIMIT_VIEW`
+        echoes `current_limit * 100` as `current_view_paise`. Treating
+        those digits as "verified" let the model launder an arbitrary
+        chosen number through an error response, then voice it as an
+        unrelated fact elsewhere in the same turn (PoC: call
+        `get_payment_status(payment_id="txn_500000")` on a nonexistent
+        id, then say "I found a settlement credit of ₹500,000" — the
+        digit run inside the echoed `payment_id` string verified it).
+        `error` payloads therefore contribute to the STRING corpus only
+        (so a genuinely server-generated reference id, e.g.
+        `LIMIT_REQUEST_ALREADY_PENDING`'s `existing_request_id`, still
+        verifies via substring match — that id is never something the
+        model supplied), never to the `numbers` set. `data` (the tool's
+        own authoritative output — no current handler echoes a raw
+        caller argument there) and `gate` (docs/10 §6 T5.5: the model
+        must be able to voice its OWN just-proposed action's amounts
+        back for confirmation — a narrower, same-turn, executor-gated
+        surface, not an open echo channel) keep contributing to both.
+        """
         numbers: set[str] = set()
         strings: list[str] = []
         for result in tool_results:
-            for payload in (result.data, result.error, result.gate):
-                if payload:
-                    _walk_payload(payload, numbers, strings)
+            if result.data:
+                _walk_payload(result.data, numbers, strings)
+            if result.error:
+                _walk_payload(result.error, None, strings)
+            if result.gate:
+                _walk_payload(result.gate, numbers, strings)
         return numbers, "\n".join(strings)
 
     # -- action -----------------------------------------------------------
@@ -322,21 +351,32 @@ class SafetyLayer:
 # --------------------------------------------------------------------------
 
 
-def _walk_payload(value: Any, numbers: set[str], strings: list[str]) -> None:
+def _walk_payload(value: Any, numbers: set[str] | None, strings: list[str]) -> None:
     """Recursively harvest verified facts from one result payload. Ints
     and floats become canonical numbers; strings join the corpus *and*
     have their numeric tokens harvested (so "₹25,000" inside a gate
     summary verifies a later voiced ₹25,000). Dict keys are structure,
     not facts — skipped. `bool` is excluded before `int` (it subclasses
-    int) so `true` never verifies a voiced "1"."""
+    int) so `true` never verifies a voiced "1".
+
+    `numbers=None` (security review CRITICAL fix, see
+    `_collect_verified_facts`): still builds the string corpus — a
+    payload can carry a genuinely server-generated reference id worth
+    matching by substring — but skips ALL numeric harvesting, both raw
+    int/float values and digit-tokens extracted from strings. Used for
+    `result.error`, which routinely echoes the model's own tool-call
+    arguments back and must never license them as verified account
+    facts."""
     if isinstance(value, bool):
         return
     if isinstance(value, int | float):
-        numbers.add(_canonical_number(value))
+        if numbers is not None:
+            numbers.add(_canonical_number(value))
     elif isinstance(value, str):
         strings.append(value)
-        for token in _NUMERIC_TOKEN_PATTERN.findall(value):
-            numbers.add(_canonical_number_token(token))
+        if numbers is not None:
+            for token in _NUMERIC_TOKEN_PATTERN.findall(value):
+                numbers.add(_canonical_number_token(token))
     elif isinstance(value, dict):
         for item in value.values():
             _walk_payload(item, numbers, strings)

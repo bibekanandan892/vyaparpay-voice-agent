@@ -506,7 +506,38 @@ class ToolExecutor:
     ) -> ToolResult:
         """Write/refresh the pending state instead of executing (docs/10
         §4 step 1; §6 T5.4). Supersession and the matching-re-proposal
-        behavior are documented in the module docstring."""
+        behavior are documented in the module docstring.
+
+        Code-review MEDIUM, fixed: Redis is now written BEFORE either
+        audit row commits, not after. Previously both the CANCELLED and
+        new PENDING_CONFIRM rows landed in Postgres first; if the
+        subsequent Redis write then failed, the DB durably recorded the
+        old proposal as cancelled while Redis — the state the gate
+        actually matches "yes" against — kept holding it, live. A later
+        affirmation could then execute a proposal Postgres already says
+        was superseded. Writing Redis first means a Redis failure here
+        propagates with NOTHING yet committed to Postgres — no
+        divergence window — at the cost of the CANCELLED/PENDING_CONFIRM
+        audit rows not existing for that one failed attempt, which
+        matches this module's own established best-effort audit
+        philosophy (`_audit` already never blocks the pipeline on a
+        write failure) rather than introducing a new one.
+        """
+        if not matches:
+            await self._redis.set_pending_confirm(
+                session_id,
+                PendingConfirm(
+                    tool=call.name,
+                    args=validated,
+                    proposed_turn=turn_no,
+                    # The real audit row's id isn't known yet at this
+                    # point (that's the whole fix) — always "" here.
+                    # Non-load-bearing: matching keys off tool+args only,
+                    # never off this id (see the reconnect-anchor note
+                    # this docstring already carries elsewhere).
+                    invocation_id="",
+                ),
+            )
         if pending is not None and not matches:
             await self._audit(
                 session_id=session_id,
@@ -523,7 +554,7 @@ class ToolExecutor:
                 new_tool=call.name,
             )
         elapsed = _elapsed_ms(start)
-        invocation_id = await self._audit(
+        await self._audit(
             session_id=session_id,
             tool_name=call.name,
             input=call.arguments,
@@ -532,19 +563,6 @@ class ToolExecutor:
             turn_no=turn_no,
             idempotency_key=idem_key,
         )
-        if not matches:
-            await self._redis.set_pending_confirm(
-                session_id,
-                PendingConfirm(
-                    tool=call.name,
-                    args=validated,
-                    proposed_turn=turn_no,
-                    # "" only if the best-effort audit lost the row (already
-                    # logged loudly there); the pending stays actionable —
-                    # matching keys off tool+args, never off this id.
-                    invocation_id=invocation_id or "",
-                ),
-            )
         gate = {
             "status": "pending_confirm",
             "instruction": _GATE_INSTRUCTION,
