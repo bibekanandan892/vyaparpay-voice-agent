@@ -79,6 +79,14 @@ _SAFE_SPAN_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
         "turn_no",
         "tool",
         "cost_estimated",
+        # llm.total's canon token/cost attributes (docs/04 §7.2's frozen
+        # span table) — added by task 4.3 for CostTracker.record_turn()
+        # via exactly the deliberate-one-line-addition path this module's
+        # docstring prescribes. Aggregate token counts and a computed USD
+        # figure, never raw business values.
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
     }
 )
 

@@ -140,7 +140,12 @@ class LLMRouterProto(Protocol):
     the two fiddly interface pins: adapting list[Message] to the wire
     dicts LLMProvider.stream() wants, and reassembling streamed
     tool_call fragments (TokenEvent.delta) into whole ToolCalls before
-    yielding them to the caller."""
+    yielding them to the caller.
+
+    Contract note (task 4.3): reassembled whole ToolCalls are yielded as
+    one `ToolCallsEvent`, added to the `LLMEvent` union in
+    app/domain/types.py — the original `TokenEvent | UsageEvent` union
+    had no shape for them (see ToolCallsEvent's docstring)."""
 
     def route(self, task: TaskKind) -> ModelTier: ...
 
