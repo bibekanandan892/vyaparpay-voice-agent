@@ -157,15 +157,17 @@ def test_phase3_voice_span_constants_pin_the_docs_06_span_names() -> None:
 
 
 def test_safe_set_attribute_allows_the_phase3_voice_keys() -> None:
-    """The seven Phase-3 additions to the allowlist (endpoint/stage
-    timings, sentence counter, endpoint/barge-in flags) must pass
-    safe_set_attribute and land on the exported span."""
+    """The eight Phase-3 additions to the allowlist (endpoint/stage
+    timings, a transcript-length counter, sentence counter, endpoint/
+    barge-in flags) must pass safe_set_attribute and land on the
+    exported span."""
     exporter = InMemorySpanExporter()
     setup_observability(_settings(otel_exporter_otlp_endpoint=None), exporter=exporter)
 
     voice_attributes: dict[str, int | bool] = {
         "endpoint_ms": 250,
         "stt_ms": 80,
+        "text_len": 42,
         "tts_ttfb_ms": 120,
         "sentence_no": 0,
         "interrupted": True,

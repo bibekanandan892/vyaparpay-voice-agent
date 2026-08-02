@@ -328,12 +328,13 @@ class SessionCredentials(BaseModel):
     expires: datetime
 
     def to_wire(self) -> dict[str, Any]:
+        # ice_servers needs IceServer.to_wire()'s per-entry exclude_none,
+        # not the plain model_dump() every other field gets -- so this
+        # can't be one bare `self.model_dump(mode="json")` call. If a
+        # field is ever added to this model, add it here too.
         return {
-            "session_id": self.session_id,
-            "signaling_url": self.signaling_url,
-            "signaling_token": self.signaling_token,
+            **self.model_dump(mode="json", exclude={"ice_servers"}),
             "ice_servers": [s.to_wire() for s in self.ice_servers],
-            "expires": self.expires.isoformat(),
         }
 
 
