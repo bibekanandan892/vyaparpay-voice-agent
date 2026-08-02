@@ -38,7 +38,7 @@ from app.api.deps import get_db, get_principal, require_rate_limit
 from app.api.errors import success_envelope
 from app.data.repositories import LimitRepo
 from app.domain.types import SessionUser
-from app.tools.request_limit_increase import _MAX_LIMIT_RUPEES
+from app.tools.request_limit_increase import _MAX_LIMIT_RUPEES, _RUPEES_TO_PAISE
 
 router = APIRouter(prefix="/v1/limits", tags=["limits"])
 
@@ -55,12 +55,11 @@ _LimitType = Literal["daily_txn", "per_txn"]
 # `requested_limit` at `_MAX_LIMIT_RUPEES` (₹1 crore) after an earlier
 # review found an unbounded value had no ceiling anywhere in the pipeline.
 # This route — the more exposed, directly network-callable path — never got
-# the same fix. Reuse the tool's ceiling as the single source of truth
-# (rather than a duplicate magic number that could drift) and convert
-# rupees -> paise explicitly, since money is integer paise on REST (docs/13
-# §1) but the tool's constant is denominated in rupees.
-_PAISE_PER_RUPEE = 100
-_MAX_REQUESTED_LIMIT_PAISE = _MAX_LIMIT_RUPEES * _PAISE_PER_RUPEE
+# the same fix. Reuse the tool's ceiling AND its rupees->paise conversion
+# factor as the single source of truth (rather than duplicate magic numbers
+# that could drift), since money is integer paise on REST (docs/13 §1) but
+# the tool's constant is denominated in rupees.
+_MAX_REQUESTED_LIMIT_PAISE = _MAX_LIMIT_RUPEES * _RUPEES_TO_PAISE
 
 
 class IncreaseRequestBody(BaseModel):
