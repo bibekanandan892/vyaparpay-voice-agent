@@ -388,8 +388,10 @@ class LLMRouter:
         # fires correctly across an async generator's yield points as
         # long as the generator eventually resumes to one of those three
         # outcomes (verified against the real opentelemetry-sdk with a
-        # standalone repro — see the module docstring's KNOWN OPEN GAP
-        # note for the one exit path that's NOT yet safe).
+        # standalone repro — see the module docstring's consumer-side
+        # closing-requirement note: consumers must close via
+        # contextlib.aclosing() from their own task, which the one
+        # Phase-2 consumer now does).
         with tracer.start_as_current_span(
             SPAN_LLM_TOTAL, record_exception=False, set_status_on_exception=False
         ) as total_span:

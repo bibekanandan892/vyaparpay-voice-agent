@@ -560,7 +560,7 @@ async def test_reply_content_beyond_size_cap_degrades_to_apology() -> None:
 
 
 async def test_max_reply_chars_guard_closes_the_stream_synchronously() -> None:
-    """Code review HIGH, fixed (module docstring judgment call #10):
+    """Code review HIGH, fixed (module docstring judgment call #12):
     `_run_tool_loop` consumes each round's stream through
     `contextlib.aclosing()` so the `_MAX_REPLY_CHARS` guard's
     `ValueError` — raised from inside the `async for` loop, before the
