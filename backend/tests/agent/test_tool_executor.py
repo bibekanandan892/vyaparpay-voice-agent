@@ -52,6 +52,27 @@ _GATE_INSTRUCTION = (
 )
 
 
+class _DialectTranslatedIntegrityError(Exception):
+    """Security-review CRITICAL regression coverage: SQLAlchemy's real
+    `postgresql+asyncpg` dialect does NOT let the raw asyncpg exception
+    become `IntegrityError.orig` — `_handle_exception` in
+    `sqlalchemy/dialects/postgresql/asyncpg.py` catches it and re-raises
+    a dialect-LOCAL synthetic wrapper class instead (the original becomes
+    `__cause__`, not `.orig`), copying only `.sqlstate`/`.pgcode` onto it.
+    An `.orig` that's an actual `asyncpg.exceptions.UniqueViolationError`
+    instance (what the other fakes below construct) never occurs in this
+    app's real deployment — only this shape (an arbitrary object exposing
+    `.sqlstate`, unrelated to `asyncpg.exceptions`'s class hierarchy)
+    does. `tool_executor.py`'s `expect_duplicate` check must key off
+    `.sqlstate`, not `isinstance(..., asyncpg.exceptions.*)`, precisely
+    so it matches this shape too."""
+
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(f"synthetic dialect error, sqlstate={sqlstate}")
+        self.sqlstate = sqlstate
+        self.pgcode = sqlstate
+
+
 # --------------------------------------------------------------------------
 # Fakes
 # --------------------------------------------------------------------------
@@ -593,12 +614,11 @@ async def test_hold_gate_audit_only_swallows_the_unique_violation_not_other_inte
 ) -> None:
     """Security review MEDIUM (found independently by two review passes on
     the fix below): `_audit`'s `expect_duplicate=True` path must only
-    swallow the SPECIFIC `idempotency_key` UNIQUE violation
-    (`asyncpg.exceptions.UniqueViolationError`), not any `IntegrityError`
-    — a differently-typed driver exception (e.g. simulating a future
-    constraint or a FK violation) must still take the loud
-    `log.exception` path, never the silent info-level
-    `tool_audit_duplicate_hold_skipped` one."""
+    swallow the SPECIFIC `idempotency_key` UNIQUE violation (SQLSTATE
+    23505), not any `IntegrityError` — a differently-typed driver
+    exception (e.g. simulating a future constraint or a FK violation,
+    SQLSTATE 23503) must still take the loud `log.exception` path, never
+    the silent info-level `tool_audit_duplicate_hold_skipped` one."""
     _register_confirm_tool("fake_limit")
     sessionmaker.force_integrity_error = IntegrityError(
         "simulated non-unique constraint violation",
@@ -623,6 +643,47 @@ async def test_hold_gate_audit_only_swallows_the_unique_violation_not_other_inte
     assert duplicate_skipped == []
     assert len(failed) == 1
     assert failed[0]["log_level"] == "error"
+
+
+async def test_hold_gate_audit_swallows_the_real_dialect_translated_unique_violation(
+    executor: ToolExecutor,
+    fake_redis: _FakeRedisClient,
+    sessionmaker: _FakeSessionmaker,
+    principal: SessionUser,
+) -> None:
+    """Security review CRITICAL, fixed: an earlier version of this check
+    used `isinstance(exc.orig, asyncpg.exceptions.UniqueViolationError)`,
+    which is FALSE for every real database round trip — SQLAlchemy's
+    `postgresql+asyncpg` dialect re-raises a dialect-local synthetic
+    wrapper as `.orig`, never the raw asyncpg exception (see
+    `_DialectTranslatedIntegrityError`'s docstring above). The other
+    tests in this file construct `.orig` as a real `asyncpg.exceptions.*`
+    instance, which would have made the broken `isinstance` check pass
+    too — exactly the "tests pass, production doesn't" trap the CRITICAL
+    finding warned about. This test uses the REAL shape instead, proving
+    the `sqlstate`-based check (not a type check) is what actually makes
+    this work against production traffic."""
+    _register_confirm_tool("fake_limit")
+    sessionmaker.force_integrity_error = IntegrityError(
+        "duplicate key value violates unique constraint "
+        '"tool_invocations_idempotency_key_key"',
+        None,
+        _DialectTranslatedIntegrityError(sqlstate="23505"),
+    )
+
+    with capture_logs() as logs:
+        results = await executor.execute(
+            [_call("fake_limit", {"current_limit": 25000, "requested_limit": 50000})],
+            principal=principal,
+            session_id=_SESSION_ID,
+            turn_no=11,
+        )
+
+    assert results[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    duplicate_skipped = [e for e in logs if e["event"] == "tool_audit_duplicate_hold_skipped"]
+    failed = [e for e in logs if e["event"] == "tool_audit_write_failed"]
+    assert len(duplicate_skipped) == 1
+    assert failed == []
 
 
 async def test_same_turn_reproposal_never_executes_and_writes_no_second_audit_row(
