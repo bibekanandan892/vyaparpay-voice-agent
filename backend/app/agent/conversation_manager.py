@@ -341,25 +341,28 @@ class ConversationManager:
                 principal=self._principal,
                 session_id=self._session.session_id,
                 turn_no=self._turn_no,
-                # Judgment call #10 (security review CRITICAL, fixed):
-                # the turn-opening "yes" is eligible to confirm ONLY the
-                # first tool round. Passing the same `affirmed=True` to a
-                # second round let a model that ignores the gate's own
-                # "Do not treat this as executed" instruction propose a
-                # DIFFERENT mutating/sensitive action in round 1 (which
-                # supersedes whatever the user actually said yes to and
-                # writes a fresh pending confirm to Redis), then
-                # immediately re-emit that same new call in round 2 —
-                # where ToolExecutor's fresh Redis read would find it
-                # "matching" and, with the stale affirmed flag still
-                # True, execute it with no genuine confirmation ever
-                # voiced or heard. The confirm-gate state machine
-                # (docs/10 §4: Proposed -> AwaitingYes -> Executing) is
-                # meant to span conversational turns, not collapse
-                # inside one model loop — every round after the first
-                # gets affirmed=False, forcing any newly-(re)proposed
-                # action to wait for a genuine new user utterance.
-                affirmed=affirmed if tool_rounds == 1 else False,
+                # Judgment call #10 (security review CRITICAL, originally
+                # fixed by gating on round number here; refined by a
+                # later security review to gate on `PendingConfirm.
+                # proposed_turn` inside ToolExecutor instead — see that
+                # module's `_confirm_tier` docstring/comment). The
+                # earlier round-only gate closed the cross-round
+                # confirm-bypass (a model proposing a NEW action in round
+                # 1 that supersedes what the user actually said yes to,
+                # then re-emitting it in round 2 to ride the stale
+                # `affirmed=True`) but also silently defeated a
+                # legitimate case: a read in round 1 followed by
+                # re-emitting the SAME already-pending action in round 2
+                # never got to execute, because `affirmed` was already
+                # forced False by then regardless of what the round 2
+                # call actually matched. ToolExecutor now has the
+                # information this class doesn't — whether the round's
+                # call matches a pending action proposed BEFORE this
+                # turn opened — so `affirmed` is passed through as
+                # classified at turn-open, unconditionally, on every
+                # round; the anchor to "the utterance that voiced it"
+                # (module docstring judgment call #6) is enforced there.
+                affirmed=affirmed,
             )
             for result in results:
                 stm.record_tool_result(result)

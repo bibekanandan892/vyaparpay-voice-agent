@@ -467,7 +467,24 @@ class ToolExecutor:
         matches = (
             pending is not None and pending.tool == call.name and pending.args == validated
         )
-        if not (affirmed and matches):
+        # turn_no gate (security-review HIGH, fixed — see module
+        # docstring's confirm-gate mechanics section). `affirmed` is now
+        # passed unconditionally on every tool-loop round by
+        # ConversationManager (it no longer gates on round number); what
+        # actually anchors a "yes" to the proposal it was spoken about is
+        # this check — a pending action proposed in THIS SAME turn can
+        # never execute on THIS turn, because the user could not
+        # possibly have affirmed something the model proposed after they
+        # finished speaking. A pending action proposed in an EARLIER
+        # turn remains eligible on every round of a later turn, which is
+        # what makes a legitimate same-turn read-then-reconfirm of an
+        # already-pending action work (previously defeated by round-only
+        # gating). Closes the cross-round confirm-bypass exactly as
+        # before: a round-1 proposal that supersedes the true pending
+        # action is always THIS turn's proposal, so `eligible` is always
+        # False for it regardless of how many rounds re-emit it.
+        eligible = matches and pending is not None and pending.proposed_turn != turn_no
+        if not (affirmed and eligible):
             return await self._hold_gate(
                 call, validated, pending, matches,
                 session_id=session_id, turn_no=turn_no, idem_key=idem_key, start=start,
@@ -554,15 +571,29 @@ class ToolExecutor:
                 new_tool=call.name,
             )
         elapsed = _elapsed_ms(start)
-        await self._audit(
-            session_id=session_id,
-            tool_name=call.name,
-            input=call.arguments,
-            status=ToolInvocationStatus.PENDING_CONFIRM,
-            latency_ms=elapsed,
-            turn_no=turn_no,
-            idempotency_key=idem_key,
-        )
+        # Same-turn re-hold guard (security-review HIGH, fixed): `matches`
+        # alone doesn't distinguish a legitimate cross-turn "restate" (the
+        # §6 reconnect variant — a re-proposal in a LATER turn, worth its
+        # own audit row under that turn's idem_key, per
+        # test_matching_reproposal_keeps_original_pending_anchor) from an
+        # earlier round of THIS SAME turn having already written a
+        # PENDING_CONFIRM row under this EXACT idem_key (turn-scoped, not
+        # round-scoped — `_confirm_tier`'s `eligible` check is what makes
+        # this case reachable at all: it holds instead of executing).
+        # Re-auditing that case would attempt a second row under the same
+        # idempotency_key and violate the audit table's UNIQUE constraint,
+        # silently dropped by `_audit`'s best-effort exception handling.
+        # Only the same-turn re-hold is skipped; nothing else changes.
+        if not (matches and pending is not None and pending.proposed_turn == turn_no):
+            await self._audit(
+                session_id=session_id,
+                tool_name=call.name,
+                input=call.arguments,
+                status=ToolInvocationStatus.PENDING_CONFIRM,
+                latency_ms=elapsed,
+                turn_no=turn_no,
+                idempotency_key=idem_key,
+            )
         gate = {
             "status": "pending_confirm",
             "instruction": _GATE_INSTRUCTION,

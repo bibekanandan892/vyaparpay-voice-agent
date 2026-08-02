@@ -540,6 +540,58 @@ async def test_matching_reproposal_keeps_original_pending_anchor(
     assert rows[1].idempotency_key == f"{_SESSION_ID}:fake_limit:6"
 
 
+async def test_same_turn_reproposal_never_executes_and_writes_no_second_audit_row(
+    executor: ToolExecutor,
+    fake_redis: _FakeRedisClient,
+    sessionmaker: _FakeSessionmaker,
+    principal: SessionUser,
+) -> None:
+    """Security review HIGH, fixed (two facets of one root cause):
+
+    1. A pending action proposed in THIS SAME turn must never execute on
+       THIS turn even with affirmed=True — the user could not possibly
+       have said "yes" to something the model proposed after they
+       finished speaking. `matches` alone can't tell a same-turn
+       re-emission apart from a genuine cross-turn "yes"; the
+       `proposed_turn != turn_no` check in `_confirm_tier` is what does.
+    2. Re-holding that same-turn re-emission must not attempt a second
+       PENDING_CONFIRM audit row under the SAME idempotency_key the
+       first hold already wrote (idem_key is turn-scoped, not
+       round-scoped) — that would collide with the audit table's
+       UNIQUE(idempotency_key) constraint.
+
+    Simulates ConversationManager's tool loop calling `execute()` twice
+    within one turn (same turn_no): round 1 proposes, round 2 re-emits
+    the identical call with the turn-opening affirmed=True now passed
+    through unconditionally."""
+    call_log: list[dict[str, Any]] = []
+    _register_confirm_tool("fake_limit", call_log=call_log)
+    args = {"current_limit": 25000, "requested_limit": 50000}
+
+    first = await executor.execute(
+        [_call("fake_limit", args)],
+        principal=principal,
+        session_id=_SESSION_ID,
+        turn_no=8,
+        affirmed=False,
+    )
+    second = await executor.execute(
+        [_call("fake_limit", args)],
+        principal=principal,
+        session_id=_SESSION_ID,
+        turn_no=8,
+        affirmed=True,
+    )
+
+    assert first[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    assert second[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    assert call_log == []  # never executed
+    assert fake_redis.pending[_SESSION_ID].proposed_turn == 8
+    rows = _audit_rows(sessionmaker)
+    assert [row.status for row in rows] == ["pending_confirm"]  # no second row
+    assert rows[0].idempotency_key == f"{_SESSION_ID}:fake_limit:8"
+
+
 async def test_affirmed_with_mismatched_args_supersedes_instead_of_executing(
     executor: ToolExecutor,
     fake_redis: _FakeRedisClient,
