@@ -40,6 +40,30 @@ Two responsibilities live here, deliberately kept small:
    `ToolHandler`'s signature — is left for whoever builds `ToolExecutor`
    (task 4.4) to resolve with the interface's owner.
 
+   **Resolved by task 4.4** exactly the way that paragraph anticipated —
+   `ToolExecutor` (app/agent/tool_executor.py) has its own injected
+   `async_sessionmaker`; neither `ToolHandler` nor the frozen
+   `RegisteredTool` changed shape. The one registry-side addition is
+   `_RAW_HANDLERS`/`RawRegistration`/`Registry.get_raw()` below: the
+   decorator now *also* records the original 3-arg `(principal, args,
+   repo)` coroutine plus its `repo_type`, keyed by the same name as
+   `_REGISTRY`. Why: docs/10 §2's audit stage requires a mutating tool's
+   `tool_invocations` row in the SAME transaction as its business write,
+   but this module's 2-arg bridge closure opens its own session and
+   commits internally — an audit row written around it would always be a
+   second transaction. `ToolExecutor` therefore executes mutating tiers
+   via `get_raw()`: it opens ONE session from its own sessionmaker,
+   builds `repo_type(session)` AND the audit repo on that same session,
+   runs the raw handler, inserts the audit row, and commits once — true
+   single-transaction coupling. READ tools keep using the registered
+   2-arg `handler` (this bridge), because a read has no business write
+   to co-commit and the bridge is the frozen `ToolHandler` contract
+   working as designed. Note for test authors: fixtures that
+   snapshot/restore `_REGISTRY` should snapshot `_RAW_HANDLERS` too;
+   an orphaned `_RAW_HANDLERS` entry is benign (every executor lookup
+   goes through `_REGISTRY` first, and re-registering a name overwrites
+   both dicts) but tidiness beats surprise.
+
    **The session the bridge closure uses is injected, not self-built**
    (fixed after review — an earlier version called
    `create_engine_and_sessionmaker(get_settings())` here directly,
@@ -63,6 +87,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal, cast, get_type_hints
 
 from pydantic import BaseModel
@@ -77,6 +102,33 @@ type RawHandler[InT: BaseModel, OutT: BaseModel, RepoT: SqlAlchemyRepository[Any
 ]
 
 _REGISTRY: dict[str, RegisteredTool] = {}
+
+# Type-erased view of a raw 3-arg handler as stored in _RAW_HANDLERS.
+# Erased (InT -> BaseModel, RepoT -> Any) for the same reason _wrapped's
+# own cast exists: `Callable` is contravariant in its parameters, so the
+# per-tool `RawHandler[InT, OutT, RepoT]` cannot be assigned to a common
+# storage type without widening. Safe for the same reason too — the one
+# caller (`ToolExecutor.get_raw` path) validates args against this tool's
+# `input_model` and constructs `repo_type(session)` before invoking.
+type ErasedRawHandler = Callable[[SessionUser, BaseModel, Any], Awaitable[BaseModel]]
+
+
+@dataclass(frozen=True)
+class RawRegistration:
+    """The pre-bridge registration record task 4.4's same-transaction
+    execution path consumes (see the module docstring's "Resolved by
+    task 4.4" paragraph): the original 3-arg `(principal, args, repo)`
+    coroutine and the repo class to build from the *caller's* session —
+    letting `ToolExecutor` co-commit a mutating tool's business write
+    with its audit row in one transaction (docs/10 §2's audit stage).
+    Lives here (not in the frozen `app/domain/interfaces.py`) because it
+    is a registry implementation detail, not a shared contract."""
+
+    raw_handler: ErasedRawHandler
+    repo_type: type[SqlAlchemyRepository[Any]]
+
+
+_RAW_HANDLERS: dict[str, RawRegistration] = {}
 
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
@@ -188,6 +240,13 @@ def tool[InT: BaseModel, OutT: BaseModel, RepoT: SqlAlchemyRepository[Any]](
             handler=handler,
             description=description,
         )
+        # Kept adjacent to the _REGISTRY insert on purpose: the two dicts
+        # share a key and must never drift. The cast erases InT/RepoT for
+        # storage — see ErasedRawHandler's comment for why that is safe.
+        _RAW_HANDLERS[name] = RawRegistration(
+            raw_handler=cast(ErasedRawHandler, raw_handler),
+            repo_type=cast(type[SqlAlchemyRepository[Any]], repo_type),
+        )
         return raw_handler
 
     return decorator
@@ -204,6 +263,15 @@ class Registry:
 
     def get(self, name: str) -> RegisteredTool | None:
         return _REGISTRY.get(name)
+
+    def get_raw(self, name: str) -> RawRegistration | None:
+        """Task 4.4's same-transaction seam — a concrete-`Registry`
+        extension *beyond* the `ToolRegistry` Protocol floor (the
+        Protocol stays frozen; docs/04's "floor, not ceiling"
+        convention). Only `ToolExecutor`'s mutating-tier path should
+        call this; every other consumer wants `get()`'s bridged
+        handler."""
+        return _RAW_HANDLERS.get(name)
 
     def all(self) -> list[RegisteredTool]:
         return list(_REGISTRY.values())
@@ -228,4 +296,4 @@ class Registry:
 
 registry = Registry()
 
-__all__ = ["Registry", "configure", "registry", "tool"]
+__all__ = ["RawRegistration", "Registry", "configure", "registry", "tool"]
