@@ -890,8 +890,9 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         }
         # Full accounting so a new span name can't slip in unasserted:
         # one context.build per turn, one llm.total + one llm.ttft per
-        # LLM stream round (FakeLLM always yields a first token, so ttft
-        # always opens).
+        # LLM stream round (llm.ttft opens unconditionally around
+        # _open_with_ttft_retry() regardless of whether a token ever
+        # arrives — the count is 1:1 with stream() calls, not tokens).
         context_spans = [s for s in spans if s.name == SPAN_CONTEXT_BUILD]
         llm_total_spans = [s for s in spans if s.name == SPAN_LLM_TOTAL]
         llm_ttft_spans = [s for s in spans if s.name == SPAN_LLM_TTFT]
