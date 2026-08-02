@@ -300,7 +300,7 @@ def setup_observability(settings: Settings) -> None:
 
 | Span | Opened by | Attributes |
 |---|---|---|
-| `turn` (root) | `ConversationManager.on_stt_final` | `session_id`, `turn_no`, `interrupted`, `turn_ms` |
+| `turn` (root) | `ConversationManager.on_stt_final` | `session_id`, `turn_no`, `interrupted`, `turn_ms`, `endpoint_ms` |
 | `stt.final` | `VoiceAgentWorker` | `stt_ms`, `text_len`, `is_endpoint` |
 | `context.build` | `ContextBuilder` | `ctx_ms`, `slots_filled`, `degraded` |
 | `llm.ttft` | `LLMRouter` | `ttft_ms`, `model`, `tier`, `cache_hit` |
