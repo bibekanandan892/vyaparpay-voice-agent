@@ -137,7 +137,9 @@ class MerchantLimit(Base):
 
     __tablename__ = "merchant_limits"
     __table_args__ = (
-        CheckConstraint("limit_type IN ('daily_txn', 'per_txn')", name="ck_merchant_limits_limit_type"),
+        CheckConstraint(
+            "limit_type IN ('daily_txn', 'per_txn')", name="ck_merchant_limits_limit_type"
+        ),
         CheckConstraint("limit_paise > 0", name="ck_merchant_limits_limit_paise"),
         CheckConstraint("used_paise >= 0", name="ck_merchant_limits_used_paise"),
         CheckConstraint("requested_paise > limit_paise", name="ck_merchant_limits_requested_paise"),
@@ -158,7 +160,9 @@ class MerchantLimit(Base):
         ),
     )
 
-    merchant_id: Mapped[str] = mapped_column(Text, ForeignKey("merchants.merchant_id"), primary_key=True)
+    merchant_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("merchants.merchant_id"), primary_key=True
+    )
     limit_type: Mapped[str] = mapped_column(Text, primary_key=True)
     limit_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
     used_paise: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
@@ -196,8 +200,12 @@ class Transaction(Base):
     )
 
     txn_id: Mapped[str] = mapped_column(Text, primary_key=True)
-    merchant_id: Mapped[str] = mapped_column(Text, ForeignKey("merchants.merchant_id"), nullable=False)
-    wallet_id: Mapped[str] = mapped_column(Text, ForeignKey("wallet_accounts.wallet_id"), nullable=False)
+    merchant_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("merchants.merchant_id"), nullable=False
+    )
+    wallet_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("wallet_accounts.wallet_id"), nullable=False
+    )
     type: Mapped[str] = mapped_column(Text, nullable=False)
     amount_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
     counterparty: Mapped[str] = mapped_column(Text, nullable=False)
@@ -327,7 +335,9 @@ class CallCost(Base):
     llm_utility_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
     embeddings_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
     tts_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
-    turn_infra_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False, server_default="0")
+    turn_infra_usd: Mapped[Decimal] = mapped_column(
+        Numeric(10, 6), nullable=False, server_default="0"
+    )
     total_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
     stt_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 from collections.abc import AsyncGenerator, Generator
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -238,7 +238,7 @@ async def test_merchant_limit_requested_paise_must_exceed_limit_paise(
         request_id="LMT-test-0001",
         requested_paise=2_000_000,  # <= limit_paise: must violate the CHECK
         request_status="submitted",
-        requested_at=datetime.now(timezone.utc),
+        requested_at=datetime.now(UTC),
     )
     session.add(bad_limit)
 
@@ -330,7 +330,7 @@ async def test_conversation_turn_round_trip(session: AsyncSession) -> None:
         session_id="sess_test_turn",
         turn_no=1,
         role="agent",
-        started_at=datetime.now(timezone.utc),
+        started_at=datetime.now(UTC),
     )
     session.add(turn)
     await session.flush()

@@ -79,4 +79,11 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Process-singleton settings, built once (docs/04 §4's lifespan calls
     this once and stores the result on app.state)."""
-    return Settings()
+    # call-arg ignored: pydantic-settings populates the three
+    # required-no-default fields (jwt_secret, database_url,
+    # openrouter_api_key) from the environment at runtime — the
+    # fail-fast-on-missing behavior this module's docstring promises —
+    # which mypy's constructor signature can't see. The standard
+    # pydantic-settings pattern; anything else missing still raises
+    # ValidationError at startup exactly as before.
+    return Settings()  # type: ignore[call-arg]
