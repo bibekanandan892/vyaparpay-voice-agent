@@ -1,0 +1,123 @@
+{
+  "name": "signaling_message.v1",
+  "description": "Signaling WebSocket envelope (docs/13 §6): control plane only — SDP offer/answer, trickle ICE, teardown, keepalive — on wss://<voice-worker>/v1/signal. Media and context never ride this socket (ADR-4). Every frame wears {v, type, payload}. Forward compatibility (docs/13 §9): new message types are additive within v1, so a receiver MUST ignore frames whose type it does not recognize instead of erroring, and MUST ignore unknown envelope fields — which is why this schema deliberately does not set additionalProperties: false.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1,
+      "description": "Envelope version. Breaking changes bump this to 2 in lockstep with the /v2 REST path (docs/13 §9)."
+    },
+    "type": {
+      "enum": ["offer", "answer", "ice", "bye", "error", "ping", "pong"],
+      "description": "The v1 signaling message set (docs/13 §6). Additive within v1: a client MUST ignore frames whose type is unknown (docs/13 §9)."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Per-type payload — see $defs, dispatched by the oneOf below."
+    }
+  },
+  "required": ["v", "type", "payload"],
+  "oneOf": [
+    {
+      "properties": {
+        "type": { "const": "offer" },
+        "payload": { "$ref": "#/$defs/offer_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "answer" },
+        "payload": { "$ref": "#/$defs/answer_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "ice" },
+        "payload": { "$ref": "#/$defs/ice_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "bye" },
+        "payload": { "$ref": "#/$defs/bye_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "error" },
+        "payload": { "$ref": "#/$defs/error_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "ping" },
+        "payload": { "$ref": "#/$defs/keepalive_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "pong" },
+        "payload": { "$ref": "#/$defs/keepalive_payload" }
+      }
+    }
+  ],
+  "$defs": {
+    "offer_payload": {
+      "type": "object",
+      "description": "client → server. Initial SDP offer — the client is always the offerer; the offer carries the mic track and the ctx data channel in one SDP. Also re-sent (created with iceRestart: true) for ICE restart over the same WebSocket (docs/13 §6, §6.1).",
+      "properties": {
+        "sdp": { "type": "string" }
+      },
+      "required": ["sdp"]
+    },
+    "answer_payload": {
+      "type": "object",
+      "description": "server → client. aiortc's answer to the current offer (docs/13 §6).",
+      "properties": {
+        "sdp": { "type": "string" }
+      },
+      "required": ["sdp"]
+    },
+    "ice_payload": {
+      "type": "object",
+      "description": "Both directions. One trickled ICE candidate; candidate: null marks end-of-candidates (docs/13 §6).",
+      "properties": {
+        "candidate": {
+          "type": ["string", "null"],
+          "description": "candidate-attribute string, or null to signal end-of-candidates."
+        },
+        "sdpMid": { "type": ["string", "null"] },
+        "sdpMLineIndex": { "type": ["integer", "null"] }
+      },
+      "required": ["candidate", "sdpMid", "sdpMLineIndex"]
+    },
+    "bye_payload": {
+      "type": "object",
+      "description": "Both directions. Clean teardown (docs/13 §6); every hang-up path converges on the same terminal session state (docs/13 §2.2).",
+      "properties": {
+        "reason": { "enum": ["user_hangup", "agent_hangup", "error"] }
+      },
+      "required": ["reason"]
+    },
+    "error_payload": {
+      "type": "object",
+      "description": "server → client. code uses the docs/13 §1.1 vocabulary — the same code strings as REST. Deliberately NOT an enum here: new codes may be added within an existing prefix class without a version bump, and clients switch on the prefix class when the member is unknown (docs/13 §1.1, §9).",
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "required": ["code", "message"]
+    },
+    "keepalive_payload": {
+      "type": "object",
+      "description": "Both directions, shared by ping and pong. 10 s keepalive; two missed pongs mark the WebSocket dead (docs/13 §6).",
+      "properties": {
+        "ts": {
+          "type": "integer",
+          "description": "Sender epoch milliseconds."
+        }
+      },
+      "required": ["ts"]
+    }
+  }
+}

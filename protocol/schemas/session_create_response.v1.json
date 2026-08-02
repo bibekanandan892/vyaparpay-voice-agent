@@ -1,0 +1,77 @@
+{
+  "name": "session_create_response.v1",
+  "description": "POST /v1/sessions 201 response (docs/13 §1, §2.1): the standard REST envelope with data = the connect bundle. Forward compatibility (docs/13 §9): new response fields are additive within v1 and clients MUST ignore fields they do not recognize — which is why this schema deliberately does not set additionalProperties: false anywhere.",
+  "type": "object",
+  "properties": {
+    "success": {
+      "const": true,
+      "description": "true iff HTTP 2xx (docs/13 §1). Redundant with the status code on purpose — the body carries its own verdict because mobile HTTP stacks and interceptors mangle status codes."
+    },
+    "data": { "$ref": "#/$defs/connect_bundle" },
+    "error": {
+      "type": "null",
+      "description": "null on success (docs/13 §1)."
+    },
+    "meta": {
+      "type": "null",
+      "description": "null everywhere except paginated list endpoints (docs/13 §1)."
+    }
+  },
+  "required": ["success", "data", "error", "meta"],
+  "$defs": {
+    "connect_bundle": {
+      "type": "object",
+      "description": "Everything the client needs to connect: mint happened server-side (session id, hashed one-time signaling token in Redis, computed TURN credential pair) before this body is returned (docs/13 §2.1).",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The session id, e.g. 'a1f3c9' — also the suffix of the TURN username (docs/13 §7)."
+        },
+        "signaling_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "wss:// URL of the voice-worker SignalingServer; the client connects with ?session_id=<id>&token=<signaling_token> (docs/13 §6)."
+        },
+        "signaling_token": {
+          "type": "string",
+          "pattern": "^st_",
+          "description": "Opaque one-time token ('st_…'), 5-min TTL, stored SHA-256-hashed in Redis, verified and burned at WS accept before any SDP is read (docs/13 §6.2)."
+        },
+        "ice_servers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ice_server" },
+          "description": "Passed verbatim to PeerConnection construction on the client — STUN entry first (credential-free), then the coturn TURN entry with its HMAC credential pair (docs/13 §2.1, §7)."
+        },
+        "expires": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The signaling token's connect deadline (5-min TTL, docs/13 §6.2) — NOT the session's lifetime."
+        }
+      },
+      "required": ["session_id", "signaling_url", "signaling_token", "ice_servers", "expires"]
+    },
+    "ice_server": {
+      "type": "object",
+      "description": "One RTCIceServer entry. The STUN entry carries only urls; the TURN entry adds the coturn use-auth-secret credential pair (docs/13 §7).",
+      "properties": {
+        "urls": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "stun:/turn:/turns: URIs; for TURN, udp on 3478 first, tls on 5349 fallback (docs/13 §7)."
+        },
+        "username": {
+          "type": "string",
+          "pattern": "^[0-9]+:",
+          "description": "TURN REST-API credential username '<expiry_unix_ts>:<session_id>', e.g. '1784537062:a1f3c9' — the expiry travels inside the username; 10-min TTL (docs/13 §7). Absent on the STUN entry."
+        },
+        "credential": {
+          "type": "string",
+          "description": "base64(HMAC-SHA1(TURN_SECRET, username)) (docs/13 §7). Absent on the STUN entry."
+        }
+      },
+      "required": ["urls"]
+    }
+  }
+}

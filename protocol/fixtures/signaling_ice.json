@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "type": "ice",
+  "payload": {
+    "candidate": "candidate:842163049 1 udp 1677729535 49.36.112.8 61042 typ srflx raddr 10.0.4.17 rport 50213 generation 0",
+    "sdpMid": "0",
+    "sdpMLineIndex": 0
+  }
+}

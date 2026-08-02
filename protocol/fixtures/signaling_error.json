@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "type": "error",
+  "payload": {
+    "code": "AUTH_EXPIRED_TOKEN",
+    "message": "Signaling token expired. Re-mint via POST /v1/sessions/{id}/token."
+  }
+}

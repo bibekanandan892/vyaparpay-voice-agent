@@ -1,0 +1,160 @@
+{
+  "name": "data_channel_envelope.v1",
+  "description": "WebRTC data-channel message envelope (docs/13 §4): one native RTCDataChannel, label 'ctx', reliable and ordered, opened by the client inside the SDP offer. One channel, two streams split by type prefix: ctx.* carries context (client → server, plus the server's one recovery request), transcript.* and agent.state (server → client) drive the ConversationOverlay. Phase 3 sends only the server → client types; the ctx.* types are defined here now so the v1 envelope is complete — Phase 4 starts sending them (context capture). Forward compatibility (docs/13 §9): new message types are additive within v1, so a receiver MUST ignore messages whose type it does not recognize instead of erroring, and MUST ignore unknown envelope fields — which is why this schema deliberately does not set additionalProperties: false.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1,
+      "description": "Envelope version. Breaking changes bump this to 2 in lockstep with the /v2 REST path and payload schema versions (docs/13 §9)."
+    },
+    "type": {
+      "enum": [
+        "ctx.snapshot",
+        "ctx.delta",
+        "ctx.event",
+        "ctx.request_snapshot",
+        "transcript.partial",
+        "transcript.final",
+        "agent.state"
+      ],
+      "description": "The v1 data-channel message set (docs/13 §4). Additive within v1: a client MUST ignore messages whose type is unknown (docs/13 §9)."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Per-direction monotonically increasing counter — the client → server ctx.* stream and the server → client stream each run their own (docs/13 §4). The backend gap-checks the client's single counter across the ctx.* stream (a lost delta corrupts merge state); the client never gap-checks the server stream (a lost caption partial is repaired by the next partial; a lost agent.state by the next transition)."
+    },
+    "ts": {
+      "type": "integer",
+      "description": "Sender epoch milliseconds."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Per-type payload — see $defs, dispatched by the oneOf below."
+    }
+  },
+  "required": ["v", "type", "seq", "ts", "payload"],
+  "oneOf": [
+    {
+      "properties": {
+        "type": { "const": "ctx.snapshot" },
+        "payload": { "$ref": "#/$defs/ctx_snapshot_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "ctx.delta" },
+        "payload": { "$ref": "#/$defs/ctx_delta_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "ctx.event" },
+        "payload": { "$ref": "#/$defs/ctx_event_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "ctx.request_snapshot" },
+        "payload": { "$ref": "#/$defs/ctx_request_snapshot_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "transcript.partial" },
+        "payload": { "$ref": "#/$defs/transcript_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "transcript.final" },
+        "payload": { "$ref": "#/$defs/transcript_payload" }
+      }
+    },
+    {
+      "properties": {
+        "type": { "const": "agent.state" },
+        "payload": { "$ref": "#/$defs/agent_state_payload" }
+      }
+    }
+  ],
+  "$defs": {
+    "ctx_snapshot_payload": {
+      "type": "object",
+      "description": "client → server (Phase 4). Full screen_context/v1 IR, replacing server state wholesale; 300 ms debounce, forced on screen change and gap recovery (docs/13 §4). The IR's shape authority is docs/07 and protocol/schemas/screen_context.v1.json when it lands — this envelope schema deliberately does not re-define it, and only pins the payload version marker.",
+      "properties": {
+        "v": { "const": "screen_context/v1" }
+      },
+      "required": ["v"]
+    },
+    "ctx_delta_payload": {
+      "type": "object",
+      "description": "client → server (Phase 4). Changed components only, base_seq-verified merge; 300 ms debounce (docs/13 §4). Component shape authority is docs/07 / screen_context.v1.json.",
+      "properties": {
+        "base_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "seq of the last snapshot or delta this delta applies on top of — NOT simply the previous message's seq, because ctx.event shares the single counter without advancing screen state (docs/13 §4)."
+        },
+        "changed": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Changed components only (docs/07 component shape)."
+        },
+        "removed": {
+          "type": "array",
+          "description": "Components no longer present (docs/07)."
+        },
+        "last_action": {
+          "type": "object",
+          "description": "The user action that produced this delta, when there was one (docs/07 last_action shape)."
+        }
+      },
+      "required": ["base_seq", "changed", "removed"]
+    },
+    "ctx_event_payload": {
+      "type": "object",
+      "description": "client → server (Phase 4). One app_event/v1 timeline entry, sent immediately with no debounce (docs/13 §4). Event shape authority is docs/07/08 and protocol/schemas/app_event.v1.json when it lands; only the fields every event variant carries are pinned here.",
+      "properties": {
+        "type": { "type": "string" },
+        "name": { "type": "string" },
+        "ts": {
+          "type": "integer",
+          "description": "When the event happened on-device, epoch milliseconds — distinct from the envelope ts (when the message was sent)."
+        }
+      },
+      "required": ["type", "name", "ts"]
+    },
+    "ctx_request_snapshot_payload": {
+      "type": "object",
+      "description": "server → client (Phase 4). Sent on a sequence gap in the client's ctx.* stream: asks for a fresh capture, not a replay (docs/13 §4).",
+      "properties": {
+        "last_good_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Last client seq the server ingested cleanly."
+        }
+      },
+      "required": ["last_good_seq"]
+    },
+    "transcript_payload": {
+      "type": "object",
+      "description": "server → client, shared by transcript.partial and transcript.final. The overlay keys captions on (turn, role): each transcript.partial replaces the previous partial for that key; transcript.final (once per (turn, role)) freezes it as the authoritative caption text (docs/13 §4). User-side partials are STT interims throttled to ~5/s; agent-side partials arrive per sentence, as dispatched to TTS.",
+      "properties": {
+        "turn": { "type": "integer" },
+        "role": { "enum": ["user", "agent"] },
+        "text": { "type": "string" }
+      },
+      "required": ["turn", "role", "text"]
+    },
+    "agent_state_payload": {
+      "type": "object",
+      "description": "server → client, on transition. Drives the overlay's listening/thinking/speaking indicator; the overlay renders state, never infers it (docs/13 §4).",
+      "properties": {
+        "state": { "enum": ["listening", "thinking", "speaking"] },
+        "turn": { "type": "integer" }
+      },
+      "required": ["state", "turn"]
+    }
+  }
+}

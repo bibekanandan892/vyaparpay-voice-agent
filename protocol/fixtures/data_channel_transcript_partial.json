@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "transcript.partial",
+  "seq": 11,
+  "ts": 1784536470400,
+  "payload": {
+    "turn": 2,
+    "role": "user",
+    "text": "haan, the two forty five one to"
+  }
+}

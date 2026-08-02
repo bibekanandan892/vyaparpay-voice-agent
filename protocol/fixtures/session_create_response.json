@@ -1,0 +1,18 @@
+{
+  "success": true,
+  "data": {
+    "session_id": "a1f3c9",
+    "signaling_url": "wss://voice.vyapar.local/v1/signal",
+    "signaling_token": "st_hV4nQ9pXzL2mR8cT0kWyB6uJ",
+    "ice_servers": [
+      {"urls": ["stun:turn.vyapar.local:3478"]},
+      {"urls": ["turn:turn.vyapar.local:3478?transport=udp",
+                "turns:turn.vyapar.local:5349"],
+       "username": "1784537062:a1f3c9",
+       "credential": "kWx0mB4vQ2nT8hZJc6yUq1RfLpE="}
+    ],
+    "expires": "2026-07-24T14:19:22+05:30"
+  },
+  "error": null,
+  "meta": null
+}
