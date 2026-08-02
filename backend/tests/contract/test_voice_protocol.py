@@ -99,11 +99,19 @@ def _type_name(value: Any) -> str:
     return "object"
 
 
+def _json_equal(a: Any, b: Any) -> bool:
+    """`==` gated on matching JSON type first -- plain `==`/`in` would let
+    Python's bool-is-an-int-subclass equivalence (`True == 1`) satisfy a
+    `const`/`enum` that names an integer, or vice versa, which JSON
+    Schema's own type system never allows."""
+    return _type_name(a) == _type_name(b) and a == b
+
+
 def _check_scalars(value: Any, schema: dict[str, Any], path: str) -> list[str]:
     errs: list[str] = []
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _json_equal(value, schema["const"]):
         errs.append(f"{path}: {value!r} != const {schema['const']!r}")
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(value, member) for member in schema["enum"]):
         errs.append(f"{path}: {value!r} not in enum {schema['enum']!r}")
     if "pattern" in schema and isinstance(value, str) and not re.search(schema["pattern"], value):
         errs.append(f"{path}: {value!r} does not match pattern {schema['pattern']!r}")
@@ -228,6 +236,53 @@ def test_rejects_unknown_signaling_type_and_bad_payload() -> None:
     assert _errors(unknown, schema, schema.get("$defs", {}), "$")
     bad_payload = {"v": 1, "type": "bye", "payload": {"reason": "boredom"}}
     assert _errors(bad_payload, schema, schema.get("$defs", {}), "$")
+
+
+def test_rejects_bool_where_signaling_envelope_version_const_is_an_int() -> None:
+    """Regression for the walker's bool/int type-confusion: Python's
+    `True == 1` must not let a boolean satisfy an integer `const`."""
+    schema = _load_schema("signaling_message.v1")
+    wrong_type = {"v": True, "type": "bye", "payload": {"reason": "user_hangup"}}
+    assert _errors(wrong_type, schema, schema.get("$defs", {}), "$")
+
+
+def test_rejects_bool_where_data_channel_envelope_version_const_is_an_int() -> None:
+    schema = _load_schema("data_channel_envelope.v1")
+    wrong_type = {
+        "v": True,
+        "type": "agent.state",
+        "seq": 1,
+        "ts": 0,
+        "payload": {"state": "listening", "turn": 1},
+    }
+    assert _errors(wrong_type, schema, schema.get("$defs", {}), "$")
+
+
+def test_rejects_unknown_data_channel_type_and_missing_required_payload_key() -> None:
+    schema = _load_schema("data_channel_envelope.v1")
+    unknown_shape = {"v": 1, "type": "agent.state", "seq": 1}  # missing ts, payload
+    assert _errors(unknown_shape, schema, schema.get("$defs", {}), "$")
+
+
+def test_rejects_session_create_request_with_wrong_field_types() -> None:
+    schema = _load_schema("session_create_request.v1")
+    valid = _load_fixture("session_create_request")
+    missing_required = {k: v for k, v in valid.items() if k != "user_id"}
+    assert _errors(missing_required, schema, schema.get("$defs", {}), "$")
+    wrong_type = {**valid, "screen_context": "not-an-object-or-null"}
+    assert _errors(wrong_type, schema, schema.get("$defs", {}), "$")
+
+
+def test_rejects_session_create_response_with_int_instead_of_bool_success() -> None:
+    """Regression case: `success: 1` (int) must not satisfy `"const": true`
+    (bool) -- the exact shape a serialization bug would produce."""
+    schema = _load_schema("session_create_response.v1")
+    valid = _load_fixture("session_create_response")
+    wrong_type = {**valid, "success": 1}
+    assert _errors(wrong_type, schema, schema.get("$defs", {}), "$")
+    data_without_ice_servers = {k: v for k, v in valid["data"].items() if k != "ice_servers"}
+    missing_ice_servers = {**valid, "data": data_without_ice_servers}
+    assert _errors(missing_ice_servers, schema, schema.get("$defs", {}), "$")
 
 
 # ---------------------------------------------------------------------------
