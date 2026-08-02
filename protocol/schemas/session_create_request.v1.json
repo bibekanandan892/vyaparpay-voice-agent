@@ -1,0 +1,34 @@
+{
+  "name": "session_create_request.v1",
+  "description": "POST /v1/sessions request body (docs/13 §2.1): the one endpoint where context beats audio — the full ScreenContext IR and the last ~15 timeline events ride in the request body so the agent is context-complete before the peer connection exists. Phase 3 sends screen_context: null and recent_events: [] — context capture lands in Phase 4. The server validates the snapshot and events against protocol/ schemas and rejects the whole body with 400 VALIDATION_SCHEMA, never a partial ingest (docs/13 §2.1). additionalProperties is false in the house input-schema style (protocol/tools/*.json): new request fields are a server-contract change (docs/13 §9), never a client improvisation.",
+  "type": "object",
+  "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Must equal the JWT sub claim — the server verifies and rejects a mismatch rather than honoring it; sub is the only principal in the system (docs/13 §1.2)."
+    },
+    "screen_context": {
+      "type": ["object", "null"],
+      "description": "Full screen_context/v1 IR — the last operational screen, support surfaces excluded (docs/07 §2.1) — or null when the client has no capture. Phase 3 always sends null; capture is Phase 4. Shape authority is docs/07 and protocol/schemas/screen_context.v1.json when it lands; only the version marker is pinned here. An unknown version is rejected with 400 VALIDATION_UNSUPPORTED_VERSION (docs/13 §1.1).",
+      "properties": {
+        "v": { "const": "screen_context/v1" }
+      },
+      "required": ["v"]
+    },
+    "recent_events": {
+      "type": "array",
+      "description": "The last ~15 app_event/v1 timeline entries, oldest first; may be empty (Phase 3 always sends []). Event shape authority is docs/07/08 and protocol/schemas/app_event.v1.json when it lands; only the fields every event variant carries are pinned here.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string" },
+          "name": { "type": "string" },
+          "ts": { "type": "integer", "description": "Epoch milliseconds, on-device." }
+        },
+        "required": ["type", "name", "ts"]
+      }
+    }
+  },
+  "required": ["user_id", "screen_context", "recent_events"],
+  "additionalProperties": false
+}

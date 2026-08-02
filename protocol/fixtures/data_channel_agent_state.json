@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "type": "agent.state",
+  "seq": 10,
+  "ts": 1784536468900,
+  "payload": {
+    "state": "listening",
+    "turn": 1
+  }
+}

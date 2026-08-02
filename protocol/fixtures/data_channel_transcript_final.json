@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "transcript.final",
+  "seq": 9,
+  "ts": 1784536468200,
+  "payload": {
+    "turn": 1,
+    "role": "agent",
+    "text": "Hi Rajesh, I can see your ₹245 payment to Amazon Business didn't go through — your daily transaction limit was exceeded. Would you like me to request a limit increase, or retry the payment tomorrow?"
+  }
+}

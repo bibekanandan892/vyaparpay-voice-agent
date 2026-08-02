@@ -1,0 +1,30 @@
+{
+  "user_id": "usr_rajesh01",
+  "screen_context": {
+    "v": "screen_context/v1",
+    "screen": "PaymentScreen",
+    "flow": "vendor_payment",
+    "components": [
+      {"role": "amount_field", "label": "Amount", "value": "₹245"},
+      {"role": "recipient", "label": "To", "value": "Amazon Business"},
+      {"role": "primary_cta", "label": "Pay Now", "enabled": true},
+      {"role": "dialog", "label": "Daily Limit Exceeded", "visible": true},
+      {"role": "snackbar", "label": "Payment Failed", "visible": true}
+    ],
+    "last_action": {"type": "tap", "target": "Pay Now", "ts": 1784536440000},
+    "last_api": {"method": "POST", "path": "/payments", "status": 402,
+                 "error_code": "DAILY_LIMIT_EXCEEDED"},
+    "dirty_fields": [], "loading": false
+  },
+  "recent_events": [
+    {"type": "nav",       "name": "PaymentScreen", "from": "DashboardScreen", "ts": 1784536395000},
+    {"type": "input",     "name": "amount", "value": "₹245",                  "ts": 1784536417000},
+    {"type": "tap",       "name": "Amazon Business", "screen": "PaymentScreen", "ts": 1784536428000},
+    {"type": "tap",       "name": "Pay Now", "screen": "PaymentScreen",       "ts": 1784536440000},
+    {"type": "api_error", "name": "POST /payments", "status": 402,
+     "code": "DAILY_LIMIT_EXCEEDED",                                          "ts": 1784536440820},
+    {"type": "dialog",    "name": "Daily Limit Exceeded", "visible": true,    "ts": 1784536440900},
+    {"type": "nav",       "name": "HelpScreen", "from": "PaymentScreen",      "ts": 1784536452000},
+    {"type": "tap",       "name": "Call Support", "screen": "HelpScreen",     "ts": 1784536458000}
+  ]
+}
