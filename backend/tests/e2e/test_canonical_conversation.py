@@ -175,7 +175,13 @@ from app.domain.types import (
 )
 from app.memory.session_memory import SessionMemory
 from app.models.orm import CallCost, Conversation, ConversationTurn, MerchantLimit, ToolInvocation
-from app.obs.tracing import SPAN_TURN, setup_observability
+from app.obs.tracing import (
+    SPAN_CONTEXT_BUILD,
+    SPAN_LLM_TOTAL,
+    SPAN_LLM_TTFT,
+    SPAN_TURN,
+    setup_observability,
+)
 from app.tools.registry import registry
 from scripts import seed as seed_module
 from tests.fakes import FakeLLM
@@ -882,7 +888,24 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
             "tool.exec.get_payment_status",
             "tool.exec.request_limit_increase",
         }
-        assert len(spans) == _EXPECTED_CONVERSATION_TURN_SPANS + len(tool_exec_spans)
+        # Full accounting so a new span name can't slip in unasserted:
+        # one context.build per turn, one llm.total + one llm.ttft per
+        # LLM stream round (llm.ttft opens unconditionally around
+        # _open_with_ttft_retry() regardless of whether a token ever
+        # arrives — the count is 1:1 with stream() calls, not tokens).
+        context_spans = [s for s in spans if s.name == SPAN_CONTEXT_BUILD]
+        llm_total_spans = [s for s in spans if s.name == SPAN_LLM_TOTAL]
+        llm_ttft_spans = [s for s in spans if s.name == SPAN_LLM_TTFT]
+        assert len(context_spans) == _EXPECTED_CONVERSATION_TURN_SPANS
+        assert len(llm_total_spans) == _EXPECTED_STREAM_CALLS
+        assert len(llm_ttft_spans) == _EXPECTED_STREAM_CALLS
+        assert len(spans) == (
+            len(turn_spans)
+            + len(context_spans)
+            + len(llm_total_spans)
+            + len(llm_ttft_spans)
+            + len(tool_exec_spans)
+        )
     finally:
         registry_module._sessionmaker = sessionmaker_snapshot
         await engine.dispose()

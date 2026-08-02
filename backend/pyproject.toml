@@ -50,6 +50,11 @@ packages = ["app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Without this, an async fixture declared scope="session"/"module" silently
+# binds its event loop to that scope while tests run per-function loops —
+# the exact latent bug CI's first docker-gated run surfaced in
+# tests/models/test_orm.py. Pin every async fixture to the per-test loop.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]

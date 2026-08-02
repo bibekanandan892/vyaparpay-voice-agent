@@ -75,8 +75,15 @@ def _migrated(database_url: str) -> None:
     )
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture
 async def engine(database_url: str) -> AsyncGenerator[AsyncEngine, None]:
+    """Function-scoped ON PURPOSE (was session-scoped until CI's first real
+    run of this suite): pytest-asyncio gives every test its own event loop,
+    and a session-scoped engine pools asyncpg connections bound to the
+    FIRST test's loop — every later test then dies with "attached to a
+    different loop"/"Event loop is closed". A per-test engine keeps pool
+    and loop lifetimes aligned; the container + migration stay
+    session-scoped (sync fixtures, loop-agnostic)."""
     eng = create_async_engine(database_url, future=True)
     yield eng
     await eng.dispose()

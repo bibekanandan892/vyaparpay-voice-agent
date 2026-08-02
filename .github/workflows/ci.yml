@@ -1,0 +1,65 @@
+# CI — the same three gates every PR in this repo has so far run by hand
+# (backend/README.md "Development"), now automatic, plus the first-ever
+# automated execution of the Docker-gated test dirs.
+#
+# Two jobs on purpose:
+# - `gates` mirrors the local loop exactly (ruff, mypy, non-Docker pytest)
+#   and is the signal to watch on every PR.
+# - `docker-gated` runs tests/models + tests/e2e via testcontainers
+#   (ubuntu-latest ships a Docker daemon). These suites were written with
+#   the Phase-2 build but have NEVER been executed anywhere — no local
+#   Docker was available — so this job is genuinely new coverage, not a
+#   re-run. It is a separate job so a testcontainers-specific failure is
+#   immediately distinguishable from a core-gate failure.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least-privilege hardening (security review MEDIUM): neither job performs
+# any token-consuming operation, so the ambient GITHUB_TOKEN needs nothing
+# beyond checkout. Declaring it explicitly removes the token as an attack
+# surface if a future step is added without noticing the default scope.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  gates:
+    name: lint + types + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff (repo-wide)
+        run: ruff check .
+      - name: Mypy
+        run: mypy app
+      - name: Pytest (non-Docker suites)
+        run: pytest tests -q --ignore=tests/models --ignore=tests/e2e
+
+  docker-gated:
+    name: testcontainers suites (ORM + E2E)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Pytest (Docker-gated suites)
+        run: pytest tests/models tests/e2e -q

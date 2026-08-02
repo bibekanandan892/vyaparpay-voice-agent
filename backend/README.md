@@ -88,7 +88,7 @@ All commands below assume `backend/` as the working directory.
 ```bash
 pip install -e ".[dev]"
 
-pytest tests                  # unit tests: no Docker required
+pytest tests --ignore=tests/models --ignore=tests/e2e  # no Docker required
 pytest tests/models tests/e2e  # testcontainers-gated: need Docker (Postgres)
 ruff check .
 mypy app
