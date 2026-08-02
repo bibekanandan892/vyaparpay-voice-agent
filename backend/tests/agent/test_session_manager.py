@@ -28,7 +28,7 @@ from app.api.errors import ResourceNotFoundError
 from app.data.redis_client import RedisClient
 from app.domain.interfaces import SessionManagerProto
 from app.domain.types import EndReason, Session, SessionState
-from app.models.orm import Conversation, ConversationTurn
+from app.models.orm import CallCost, Conversation, ConversationTurn
 
 _SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -441,3 +441,82 @@ async def test_end_rolls_back_the_whole_drain_when_a_record_is_malformed(
 
     db_session.rollback.assert_awaited_once()
     db_session.commit.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------
+# end — judgment call #9: the finalize-before-end ordering invariant
+# --------------------------------------------------------------------------
+
+
+def _get_by_model(
+    *, conversation: Conversation | None, call_cost: CallCost | None
+) -> Any:
+    """Builds a `db_session.get` side_effect that discriminates by the
+    model class each repo passes through (both `ConversationRepo.get`
+    and `CostRepo.get` are the same inherited `SqlAlchemyRepository.get`,
+    so a single uniform `return_value` can't tell them apart)."""
+
+    async def fake_get(model: type, _id: str) -> Any:
+        if model is Conversation:
+            return conversation
+        if model is CallCost:
+            return call_cost
+        raise AssertionError(f"unexpected model queried: {model!r}")
+
+    return fake_get
+
+
+async def test_end_succeeds_when_a_call_costs_row_already_exists(
+    manager: SessionManager, db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """Happy path for judgment call #9: `CostTracker.finalize()` already
+    ran (a `call_costs` row exists for this session_id), so `end()`
+    proceeds with the drain exactly as before this check was added."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(
+        conversation=conversation, call_cost=CallCost(session_id="sess_1")
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+
+    await manager.end("sess_1", EndReason.HANGUP)
+
+    assert conversation.state == "ended"
+    assert len(_added_turns(db_session)) == 1
+    db_session.commit.assert_awaited_once()
+    db_session.rollback.assert_not_awaited()
+
+
+async def test_end_raises_when_finalize_never_ran(
+    manager: SessionManager, db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """The bug this check exists to catch: no `call_costs` row means
+    `CostTracker.finalize()` never ran for this session — `end()` must
+    fail loudly instead of silently draining an empty/stale turn list
+    into Postgres with no other signal anything went wrong."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(conversation=conversation, call_cost=None)
+
+    with pytest.raises(RuntimeError, match="before CostTracker.finalize"):
+        await manager.end("sess_1", EndReason.HANGUP)
+
+    # Never reached the drain, and the ended-flip was rolled back.
+    redis_client.get_turns.assert_not_awaited()
+    assert conversation.state == "in_call"
+    db_session.rollback.assert_awaited_once()
+    db_session.commit.assert_not_awaited()
+
+
+async def test_end_ordering_check_is_skipped_for_an_already_ended_session(
+    manager: SessionManager, db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """The duplicate-end no-op gate (judgment call #7) runs first — a
+    second `end()` on an already-ended session must still no-op cleanly
+    even if, hypothetically, no call_costs row were queried at all."""
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="ended"), call_cost=None
+    )
+
+    await manager.end("sess_1", EndReason.TIMEOUT)  # must not raise
+
+    redis_client.get_turns.assert_not_awaited()
+    db_session.flush.assert_not_awaited()

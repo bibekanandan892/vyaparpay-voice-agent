@@ -52,6 +52,7 @@ from app.data.repositories.payment_repo import PaymentRepo, _midnight_ist_after
 from app.data.repositories.tool_audit_repo import ToolAuditRepo
 from app.data.repositories.wallet_repo import WalletRepo
 from app.models.orm import (
+    CallCost,
     Conversation,
     ConversationTurn,
     Merchant,
@@ -794,6 +795,33 @@ async def test_cost_repo_upsert_defaults_turn_infra_usd_to_zero() -> None:
     compiled_params = stmt.compile(dialect=postgresql.dialect())
     assert compiled_params.params["turn_infra_usd"] == Decimal("0")
     assert compiled_params.params["session_id"] == "sess_1"
+
+
+async def test_cost_repo_get_delegates_to_session_get() -> None:
+    """No dedicated `exists`/`get` method was added to `CostRepo` for
+    `SessionManager.end()`'s finalize-before-end invariant check (docs/05
+    §3.1 judgment call #9) — `call_costs` is keyed by `session_id` alone,
+    so the inherited `SqlAlchemyRepository.get` (already exercised
+    generically by `test_base_get_delegates_to_session_get` above)
+    already does exactly what that check needs. This test pins that
+    `CostRepo` specifically gets this behavior for free, unmodified."""
+    session = make_session()
+    cost_row = CallCost(session_id="sess_1", **_cost_kwargs())
+    session.get.return_value = cost_row
+    repo = CostRepo(session)
+
+    result = await repo.get("sess_1")
+
+    session.get.assert_awaited_once_with(CallCost, "sess_1")
+    assert result is cost_row
+
+
+async def test_cost_repo_get_returns_none_when_absent() -> None:
+    session = make_session()
+    session.get.return_value = None
+    repo = CostRepo(session)
+
+    assert await repo.get("sess_missing") is None
 
 
 # --------------------------------------------------------------------------

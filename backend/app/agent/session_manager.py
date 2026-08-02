@@ -69,6 +69,33 @@ rather than silently guessed at:
 8. **Redis keys are never deleted here** — they expire on their own 24h
    TTL (docs/09 §8's "Redis keys left to expire"), which is also what
    keeps the retry-whole property in #6/#7 possible.
+9. **`end` enforces the finalize-before-end ordering invariant (security
+   review, HIGH) by checking for a `call_costs` row before draining.**
+   `CostTracker.finalize()` (app/agent/cost_tracker.py) is documented as
+   the sole writer of `session:{id}:turns` in Redis, and it unconditionally
+   upserts a `call_costs` row (`CostRepo.upsert`) as its last step, on
+   every call including zero-turn ones (verified: `demo_cli.py` calls
+   `cost_tracker.finalize()` before `session_manager.end()` on every exit
+   path, no exceptions). A `call_costs` row is therefore a reliable,
+   always-present witness that `finalize()` already ran for this
+   `session_id`. If a future caller (e.g. a Phase-3 `POST /v1/sessions`
+   flow) called `end()` first, the old behavior was to silently drain an
+   empty/stale turn list into Postgres — permanently losing per-turn
+   cost/audit data with no error. `end()` now calls `CostRepo(db).get
+   (session_id)` (the inherited `SqlAlchemyRepository.get` — `call_costs`
+   is keyed by `session_id` alone, so no new CostRepo method is needed)
+   before the drain, and raises a plain `RuntimeError` if no row exists:
+   this isn't an HTTP-facing error (no route calls `end()` yet — only the
+   CLI harness and tests do), so it deliberately isn't a typed `AppError`
+   (app/api/errors.py) routed through `ErrorEnvelopeMiddleware`; a bug
+   this loud should crash the caller, not degrade into a spoken apology
+   the way `ConversationManager.on_stt_final`'s critical-path failures do
+   (that class's own judgment call #5) — there is no live call to keep
+   talking to at this point, only a caller that got the ordering wrong
+   and needs to know immediately. The check runs inside the same
+   transaction as the drain, after the duplicate-end no-op check (#7) so
+   a second `end()` on an already-ended session still short-circuits
+   before this new check ever runs.
 """
 
 from __future__ import annotations
@@ -86,6 +113,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.errors import ResourceNotFoundError
 from app.data.redis_client import RedisClient
 from app.data.repositories.conversation_repo import ConversationRepo
+from app.data.repositories.cost_repo import CostRepo
 from app.domain.types import EndReason, Session, SessionState
 from app.models import Conversation
 from app.obs.logging import get_logger
@@ -255,7 +283,14 @@ class SessionManager:
         `conversation_turns` rows in list order — gate, flip, and drain
         in one transaction (judgment calls #6-#8, module docstring).
         `text` is never passed through (docs/12 §4.2); Redis keys are
-        left to expire on TTL."""
+        left to expire on TTL.
+
+        Before draining, requires a `call_costs` row for this
+        `session_id` (judgment call #9, module docstring) — the
+        always-present signal that `CostTracker.finalize()` already ran.
+        Its absence means a caller invoked `end()` before `finalize()`,
+        which would otherwise silently drain an empty/stale turn list;
+        that ordering bug raises a `RuntimeError` here instead."""
         try:
             async with self._transaction() as db:
                 repo = ConversationRepo(db)
@@ -268,6 +303,21 @@ class SessionManager:
                         "session_end_duplicate", session_id=session_id, reason=reason.value
                     )
                     return
+
+                # Judgment call #9: finalize-before-end invariant. A
+                # missing call_costs row means CostTracker.finalize()
+                # never ran for this session_id — draining now would
+                # silently commit an empty/stale turn list with no other
+                # signal that anything went wrong.
+                if await CostRepo(db).get(session_id) is None:
+                    raise RuntimeError(
+                        "SessionManager.end() called before CostTracker.finalize() for "
+                        f"session_id={session_id!r} — no call_costs row exists yet, so "
+                        "draining session:{id}:turns now would silently lose all "
+                        "per-turn cost/audit data for this call. Call "
+                        "cost_tracker.finalize(session_id) before session_manager.end()."
+                    )
+
                 await repo.end(session_id)
 
                 turn_records = await self._redis.get_turns(session_id)
