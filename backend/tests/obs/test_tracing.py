@@ -28,6 +28,8 @@ from opentelemetry.util._once import Once
 from app.config import Settings
 from app.obs.tracing import (
     SPAN_CONTEXT_BUILD,
+    SPAN_STT_FINAL,
+    SPAN_TTS_FIRST_BYTE,
     SPAN_TURN,
     get_tracer,
     safe_set_attribute,
@@ -145,3 +147,38 @@ def test_safe_set_attribute_rejects_a_key_outside_the_allowlist() -> None:
     with tool_span("get_wallet_balance") as span:
         with pytest.raises(ValueError, match="not in the safe-attribute allowlist"):
             safe_set_attribute(span, "wallet_balance_paise", 1_845_000)
+
+
+def test_phase3_voice_span_constants_pin_the_docs_06_span_names() -> None:
+    """docs/06 §4.1's frozen span table — the names dashboards filter on;
+    added by the Phase-3 voice contract freeze."""
+    assert SPAN_STT_FINAL == "stt.final"
+    assert SPAN_TTS_FIRST_BYTE == "tts.first_byte"
+
+
+def test_safe_set_attribute_allows_the_phase3_voice_keys() -> None:
+    """The seven Phase-3 additions to the allowlist (endpoint/stage
+    timings, sentence counter, endpoint/barge-in flags) must pass
+    safe_set_attribute and land on the exported span."""
+    exporter = InMemorySpanExporter()
+    setup_observability(_settings(otel_exporter_otlp_endpoint=None), exporter=exporter)
+
+    voice_attributes: dict[str, int | bool] = {
+        "endpoint_ms": 250,
+        "stt_ms": 80,
+        "tts_ttfb_ms": 120,
+        "sentence_no": 0,
+        "interrupted": True,
+        "is_endpoint": True,
+        "turn_ms": 1_000,
+    }
+    tracer = get_tracer(__name__)
+    with tracer.start_as_current_span(SPAN_TURN) as span:
+        for key, value in voice_attributes.items():
+            safe_set_attribute(span, key, value)
+
+    otel_trace.get_tracer_provider().force_flush()
+    recorded = exporter.get_finished_spans()[0]
+    assert recorded.attributes is not None
+    for key, value in voice_attributes.items():
+        assert recorded.attributes.get(key) == value

@@ -61,6 +61,11 @@ SPAN_TURN = "turn"
 SPAN_CONTEXT_BUILD = "context.build"
 SPAN_LLM_TTFT = "llm.ttft"
 SPAN_LLM_TOTAL = "llm.total"
+# Phase-3 voice-pipeline spans (docs/06 §4.1's frozen span table): the
+# STT-tail finalization after the endpoint, and the first-sentence TTS
+# time-to-first-byte. Added by the voice contract freeze (Phase-3 T1.1).
+SPAN_STT_FINAL = "stt.final"
+SPAN_TTS_FIRST_BYTE = "tts.first_byte"
 
 # Attribute keys later batches are known to need (docs/04 §7.2's canon
 # attribute list) — the allowlist `safe_set_attribute` enforces. Deliberately
@@ -97,6 +102,18 @@ _SAFE_SPAN_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
         "turn.tool_loop_bound_hit",
         "turn.output_blocked",
         "turn.over_budget",
+        # Phase-3 voice-pipeline attributes (docs/06 §4.1: `endpoint_ms`
+        # rides the `turn` span because the endpoint decision is what
+        # *opens* it; the stage timings ride their own spans). All are
+        # millisecond durations, small counters, or booleans — nothing
+        # here can carry transcript text, an account fact, or PII.
+        "endpoint_ms",
+        "stt_ms",
+        "tts_ttfb_ms",
+        "sentence_no",
+        "interrupted",
+        "is_endpoint",
+        "turn_ms",
     }
 )
 
@@ -173,6 +190,8 @@ __all__ = [
     "SPAN_CONTEXT_BUILD",
     "SPAN_LLM_TOTAL",
     "SPAN_LLM_TTFT",
+    "SPAN_STT_FINAL",
+    "SPAN_TTS_FIRST_BYTE",
     "SPAN_TURN",
     "get_tracer",
     "safe_set_attribute",
