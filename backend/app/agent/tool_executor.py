@@ -937,9 +937,13 @@ class ToolExecutor:
            dialect's translated wrapper (real production traffic) and a
            raw `asyncpg.exceptions.UniqueViolationError` (what a
            lower-level test might construct directly) — since both expose
-           `.sqlstate`. `idempotency_key` is the only UNIQUE column on
-           this table (`app/models/orm.py`), so SQLSTATE 23505 at this
-           call site is unambiguous without needing the constraint's name
+           `.sqlstate`. `idempotency_key` is the only APPLICATION-WRITABLE
+           unique column on this table (`app/models/orm.py`) — the
+           `invocation_id` primary key is also 23505-enforced by Postgres,
+           but it's a server-generated `gen_random_uuid()`, never
+           supplied by any caller here, so in practice a 23505 reaching
+           this except block is unambiguously the idempotency_key
+           collision, with no need to also check the constraint's name
            (confirmed NOT to be the ORM's `_NAMING_CONVENTION`-derived
            `uq_tool_invocations_idempotency_key` —
            `migrations/versions/0001_initial_schema.py`'s
