@@ -41,7 +41,17 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,voice]"
+      # Keyed on the pinned tag+hash inside scripts/fetch_models.py: a
+      # model bump changes the key, anything else is a warm-cache hit and
+      # the fetch step's skip-if-verified path makes it a no-op.
+      - name: Cache VAD model
+        uses: actions/cache@v4
+        with:
+          path: backend/app/voice/models
+          key: silero-vad-v6.2.1-1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+      - name: Fetch VAD model
+        run: python -m scripts.fetch_models
       - name: Ruff (repo-wide)
         run: ruff check .
       - name: Mypy
@@ -60,6 +70,6 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,voice]"
       - name: Pytest (Docker-gated suites)
         run: pytest tests/models tests/e2e -q

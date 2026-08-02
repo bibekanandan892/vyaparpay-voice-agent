@@ -2,8 +2,10 @@
 missing secrets (they have no default, so Settings() raises at import time
 if unset — the process dies at startup, not on first request).
 
-Phase-2 env subset only (docs/04 §3) — signaling/TURN/coturn vars are
-Phase-3-only and deliberately absent here.
+Phase-2 vars (docs/04 §3) plus the Phase-3 voice set (STT/TTS providers,
+signaling/TURN, VAD tuning). Every Phase-3 field is optional-with-default:
+agent-api and the whole Phase-2 test suite boot with no voice env at all;
+the voice worker fail-fasts on the subset it needs at its own startup.
 """
 
 from __future__ import annotations
@@ -66,6 +68,44 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 86400
     rate_limit_sessions_per_min: int = 5
     call_cost_cap_usd: Decimal = Decimal("1.00")
+
+    # --- Phase-3 voice (docs/06) — every field below is optional-with-
+    # default so agent-api boots with no voice env at all; the voice
+    # worker fail-fasts on the ones it needs at its own startup. The API
+    # keys and TURN secret are SecretStr for the same masking reason
+    # documented above jwt_secret.
+
+    # STT — Deepgram streaming (docs/04 §3, docs/06 §1).
+    deepgram_api_key: SecretStr | None = None
+    deepgram_model: str = "nova-3"
+    deepgram_url: str = "wss://api.deepgram.com/v1/listen"
+
+    # TTS — ElevenLabs Flash (docs/04 §3, docs/06 §1); fallback voice id
+    # is used when the primary voice errors, empty = no fallback.
+    elevenlabs_api_key: SecretStr | None = None
+    elevenlabs_voice_id: str = ""
+    elevenlabs_fallback_voice_id: str = ""
+    elevenlabs_url: str = "https://api.elevenlabs.io"
+
+    # WebRTC / signaling (docs/06 §2): agent-api mints short-lived
+    # signaling tokens and HMAC TURN credentials (docs/04 §3);
+    # session_grace_s is the reconnect window after transport loss
+    # (docs/06 §8).
+    turn_secret: SecretStr | None = None
+    coturn_host: str = ""
+    signaling_public_url: str = ""
+    signaling_token_ttl_s: int = 300
+    turn_credential_ttl_s: int = 600
+    session_grace_s: int = 30
+
+    # VAD / endpointing (docs/06 §5-§6) — config, never constants in
+    # VadEndpointer/barge-in logic (canon §5), so a demo-day tune is an
+    # env edit, not a code change.
+    vad_threshold: float = 0.5
+    min_speech_ms: int = 200
+    endpoint_silence_ms: int = 250
+    max_endpoint_delay_ms: int = 2000
+    barge_in_debounce_ms: int = 100
 
     @property
     def dialogue_models(self) -> list[str]:
