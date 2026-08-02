@@ -98,6 +98,14 @@ Other judgment calls, flagged per house style:
   inverts the harm. The mutating OK path is the exception — there the
   audit is inside the business transaction, so its failure rolls the
   mutation back too, which is exactly the guarantee docs/10 §2 asks for.
+- `_audit`'s `expect_duplicate` parameter (security-review HIGH,
+  `_hold_gate`'s repeated-hold write) makes ONE exception to "best-effort
+  ⇒ always loud": a `UNIQUE(idempotency_key)` collision there is an
+  anticipated outcome (this exact hold was already audited earlier in
+  the turn, across shapes a predictive check can't fully enumerate — see
+  `_audit`'s own docstring for the narrowing reasoning), logged at info
+  instead of `log.exception`. Every other `_audit` call site is
+  unaffected — the parameter defaults `False`.
 - Per-tool validation hints mirror §6 T5.2's model-facing hint for the
   canonical tool; tools without an entry get Pydantic's field messages
   alone.
@@ -892,7 +900,26 @@ class ToolExecutor:
         hold was already audited earlier in the turn — not a failure:
         logged at info, not `log.exception`. Any other exception, or an
         `IntegrityError` when `expect_duplicate=False`, still takes the
-        loud path unchanged."""
+        loud path unchanged.
+
+        Code-review MEDIUM, addressed: `except IntegrityError` here is
+        broad (matching `tool_invocations.idempotency_key`'s UNIQUE
+        constraint, but also, in principle, its FK on `session_id` and
+        its two CHECK constraints — `app/models/orm.py`'s
+        `ToolInvocation.__table_args__`). At `_hold_gate`'s
+        `expect_duplicate=True` call site specifically, neither CHECK can
+        fire (`status` is always the `PENDING_CONFIRM` enum member,
+        `error_code` is never passed, so `ck_tool_invocations_status` and
+        `ck_tool_invocations_error_code_pair` are always satisfied by
+        construction) and the `session_id` FK is the same one every other
+        `_audit` call in this pipeline already relies on being valid — a
+        violation there would be a different, unrelated bug this
+        parameter isn't meant to mask. `idempotency_key`'s UNIQUE
+        constraint is the only one actually reachable from a repeated
+        call at this site (mirrors the same reasoning
+        `LimitRepo.submit_increase_request` documents for its own
+        narrowed `except IntegrityError`, app/data/repositories/
+        limit_repo.py)."""
         try:
             async with self._sessionmaker() as session:
                 row = await ToolAuditRepo(session).insert(
@@ -908,8 +935,8 @@ class ToolExecutor:
                 )
                 await session.commit()
                 return str(row.invocation_id) if row.invocation_id is not None else None
-        except IntegrityError:
-            if expect_duplicate:
+        except Exception as exc:
+            if expect_duplicate and isinstance(exc, IntegrityError):
                 log.info(
                     "tool_audit_duplicate_hold_skipped",
                     tool=tool_name,
@@ -917,14 +944,6 @@ class ToolExecutor:
                     idempotency_key=idempotency_key,
                 )
                 return None
-            log.exception(
-                "tool_audit_write_failed",
-                tool=tool_name,
-                session_id=session_id,
-                status=status.value,
-            )
-            return None
-        except Exception:
             log.exception(
                 "tool_audit_write_failed",
                 tool=tool_name,

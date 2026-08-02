@@ -692,11 +692,13 @@ async def test_same_turn_different_args_reproposal_never_double_audits(
     assert round_two[0].status == ToolInvocationStatus.PENDING_CONFIRM
     assert call_log == []  # never executed
     rows = _audit_rows(sessionmaker)
-    # Round 1's hold + round 1 (as "prior pending") never gets a
-    # cancelled row of its own here (nothing was pending before round 1),
-    # but round 2 supersedes round 1's now-pending proposal: cancelled +
-    # one pending_confirm survives (the second attempt at that same key
-    # is the one the UNIQUE constraint — not a second row — absorbs).
+    # Round 1 holds cleanly (nothing was pending before it): one
+    # pending_confirm row under turn 9's key. Round 2 supersedes round
+    # 1's now-pending proposal (different args -> not matches), auditing
+    # round 1's proposal as cancelled — but round 2's OWN pending_confirm
+    # attempt reuses that same turn-9 key, so the UNIQUE constraint
+    # absorbs it: no second pending_confirm row, only the cancelled one
+    # from the supersession.
     assert [row.status for row in rows] == ["pending_confirm", "cancelled"]
     assert rows[0].idempotency_key == f"{_SESSION_ID}:fake_limit:9"
     assert rows[1].idempotency_key is None  # the cancelled row never carries one
