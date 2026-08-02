@@ -98,6 +98,14 @@ Other judgment calls, flagged per house style:
   inverts the harm. The mutating OK path is the exception — there the
   audit is inside the business transaction, so its failure rolls the
   mutation back too, which is exactly the guarantee docs/10 §2 asks for.
+- `_audit`'s `expect_duplicate` parameter (security-review HIGH,
+  `_hold_gate`'s repeated-hold write) makes ONE exception to "best-effort
+  ⇒ always loud": a `UNIQUE(idempotency_key)` collision there is an
+  anticipated outcome (this exact hold was already audited earlier in
+  the turn, across shapes a predictive check can't fully enumerate — see
+  `_audit`'s own docstring for the narrowing reasoning), logged at info
+  instead of `log.exception`. Every other `_audit` call site is
+  unaffected — the parameter defaults `False`.
 - Per-tool validation hints mirror §6 T5.2's model-facing hint for the
   canonical tool; tools without an entry get Pydantic's field messages
   alone.
@@ -127,7 +135,9 @@ import json
 import time
 from typing import Any, Final
 
+import asyncpg.exceptions
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.errors import AppError
@@ -467,7 +477,24 @@ class ToolExecutor:
         matches = (
             pending is not None and pending.tool == call.name and pending.args == validated
         )
-        if not (affirmed and matches):
+        # turn_no gate (security-review HIGH, fixed — see module
+        # docstring's confirm-gate mechanics section). `affirmed` is now
+        # passed unconditionally on every tool-loop round by
+        # ConversationManager (it no longer gates on round number); what
+        # actually anchors a "yes" to the proposal it was spoken about is
+        # this check — a pending action proposed in THIS SAME turn can
+        # never execute on THIS turn, because the user could not
+        # possibly have affirmed something the model proposed after they
+        # finished speaking. A pending action proposed in an EARLIER
+        # turn remains eligible on every round of a later turn, which is
+        # what makes a legitimate same-turn read-then-reconfirm of an
+        # already-pending action work (previously defeated by round-only
+        # gating). Closes the cross-round confirm-bypass exactly as
+        # before: a round-1 proposal that supersedes the true pending
+        # action is always THIS turn's proposal, so `eligible` is always
+        # False for it regardless of how many rounds re-emit it.
+        eligible = matches and pending is not None and pending.proposed_turn != turn_no
+        if not (affirmed and eligible):
             return await self._hold_gate(
                 call, validated, pending, matches,
                 session_id=session_id, turn_no=turn_no, idem_key=idem_key, start=start,
@@ -554,6 +581,27 @@ class ToolExecutor:
                 new_tool=call.name,
             )
         elapsed = _elapsed_ms(start)
+        # Repeated-hold guard (security-review HIGH, fixed twice): an
+        # earlier attempt keyed this off `pending.proposed_turn ==
+        # turn_no` to predict when a hold was a same-turn repeat — but
+        # that only catches a fresh proposal re-emitted within the turn
+        # that created it. It misses a pending action from an EARLIER
+        # turn that gets matched-but-not-executed (held) across MULTIPLE
+        # rounds of the CURRENT turn (the `matches` branch never rewrites
+        # `proposed_turn`, so every round's hold looks identical to the
+        # predictor), and it misses a same-turn, same-tool, different-args
+        # re-proposal (idem_key is tool+turn scoped, not args-scoped, so
+        # it collides too even though `matches` is False both times).
+        # Every one of these shapes writes under the SAME idempotency_key
+        # as an earlier attempt this turn — `idem_key` depends only on
+        # (session_id, tool_name, turn_no), never on round number or
+        # `matches`. Rather than re-deriving every shape that can produce
+        # a duplicate key (a predictive check will always be one case
+        # behind), let the database's own UNIQUE(idempotency_key)
+        # constraint be the single source of truth: always attempt the
+        # audit, and treat the resulting IntegrityError as the expected,
+        # benign signal that this exact hold was already recorded earlier
+        # in the turn — never a silently-dropped failure.
         await self._audit(
             session_id=session_id,
             tool_name=call.name,
@@ -562,6 +610,7 @@ class ToolExecutor:
             latency_ms=elapsed,
             turn_no=turn_no,
             idempotency_key=idem_key,
+            expect_duplicate=True,
         )
         gate = {
             "status": "pending_confirm",
@@ -837,13 +886,70 @@ class ToolExecutor:
         output: dict[str, Any] | None = None,
         error_code: str | None = None,
         idempotency_key: str | None = None,
+        expect_duplicate: bool = False,
     ) -> str | None:
         """Separate-transaction audit insert for every non-mutating-OK
         outcome (the mutating OK row is written inside `_commit_mutation`
         instead). Best-effort by design — see the module docstring's
         judgment call; a failure is logged loudly, never propagated.
         `input` shadows the builtin to mirror `ToolAuditRepo.insert`'s
-        own column-named parameter."""
+        own column-named parameter.
+
+        `expect_duplicate=True` (set only by `_hold_gate`'s repeated-hold
+        path, security-review HIGH) means a `UNIQUE(idempotency_key)`
+        violation here is an anticipated, benign outcome — this exact
+        hold was already audited earlier in the turn — not a failure:
+        logged at info, not `log.exception`. Any other exception still
+        takes the loud path unchanged.
+
+        Three security review rounds landed on this parameter's exact
+        exception check, in order:
+
+        1. Bare `except IntegrityError` couldn't distinguish
+           `idempotency_key`'s UNIQUE violation from `tool_invocations`'
+           other constraints (its `session_id` FK, two CHECKs —
+           `app/models/orm.py`'s `ToolInvocation.__table_args__`) — a
+           future migration adding a new constraint would silently lose
+           diagnostic detail for a genuinely different failure.
+        2. Narrowing to `isinstance(exc.orig, asyncpg.exceptions.
+           UniqueViolationError)` was WRONG — verified empirically against
+           this app's real stack (`postgresql+asyncpg`, SQLAlchemy 2.0):
+           `sqlalchemy/dialects/postgresql/asyncpg.py`'s
+           `_handle_exception` catches the real asyncpg exception and
+           re-raises a DIALECT-LOCAL synthetic wrapper class (`raise
+           translated_error from error`) — the original asyncpg exception
+           becomes `__cause__`, not `.orig`. `isinstance(exc.orig,
+           asyncpg.exceptions.UniqueViolationError)` is therefore `False`
+           for every real database round trip, always — the exact
+           opposite of catching too broadly, this caught NOTHING, so
+           every benign repeated-hold took the loud `log.exception` path
+           on ordinary confirm-gate traffic. Existing tests didn't catch
+           this because the fake's `.orig` was a bare `asyncpg.exceptions.
+           UniqueViolationError` instance, bypassing the dialect's
+           translation layer entirely.
+        3. What DOES survive that translation intact: the wrapper's
+           `sqlstate`/`pgcode` attributes, explicitly copied from the
+           original error (`translated_error.sqlstate = getattr(error,
+           "sqlstate", None)`, same file). Checking
+           `getattr(exc.orig, "sqlstate", None) ==
+           asyncpg.exceptions.UniqueViolationError.sqlstate` (SQLSTATE
+           23505, `unique_violation`) works against BOTH shapes — the
+           dialect's translated wrapper (real production traffic) and a
+           raw `asyncpg.exceptions.UniqueViolationError` (what a
+           lower-level test might construct directly) — since both expose
+           `.sqlstate`. `idempotency_key` is the only APPLICATION-WRITABLE
+           unique column on this table (`app/models/orm.py`) — the
+           `invocation_id` primary key is also 23505-enforced by Postgres,
+           but it's a server-generated `gen_random_uuid()`, never
+           supplied by any caller here, so in practice a 23505 reaching
+           this except block is unambiguously the idempotency_key
+           collision, with no need to also check the constraint's name
+           (confirmed NOT to be the ORM's `_NAMING_CONVENTION`-derived
+           `uq_tool_invocations_idempotency_key` —
+           `migrations/versions/0001_initial_schema.py`'s
+           `idempotency_key` column is hand-written raw DDL predating and
+           not autogenerated from the ORM model, so it gets Postgres's
+           own default `tool_invocations_idempotency_key_key` instead)."""
         try:
             async with self._sessionmaker() as session:
                 row = await ToolAuditRepo(session).insert(
@@ -859,7 +965,20 @@ class ToolExecutor:
                 )
                 await session.commit()
                 return str(row.invocation_id) if row.invocation_id is not None else None
-        except Exception:
+        except Exception as exc:
+            if (
+                expect_duplicate
+                and isinstance(exc, IntegrityError)
+                and getattr(exc.orig, "sqlstate", None)
+                == asyncpg.exceptions.UniqueViolationError.sqlstate
+            ):
+                log.info(
+                    "tool_audit_duplicate_hold_skipped",
+                    tool=tool_name,
+                    session_id=session_id,
+                    idempotency_key=idempotency_key,
+                )
+                return None
             log.exception(
                 "tool_audit_write_failed",
                 tool=tool_name,

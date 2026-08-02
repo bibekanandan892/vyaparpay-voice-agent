@@ -479,12 +479,19 @@ async def test_barge_in_is_a_phase2_noop() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_affirmed_flag_only_applies_to_the_first_tool_round() -> None:
-    """The exact PoC from the security review: round 1 proposes/matches
-    a DIFFERENT action than what the user affirmed (simulating a model
-    that ignores the gate's "do not treat this as executed" instruction
-    and immediately re-emits a newly-superseding call); round 2 must
-    NEVER receive the stale affirmed=True."""
+async def test_affirmed_flag_passes_through_unconditionally_on_every_round() -> None:
+    """Security review CRITICAL, refined by a later security review:
+    ConversationManager no longer decides eligibility by round number —
+    that gate moved into ToolExecutor, which can see whether a round's
+    call matches a pending action proposed BEFORE this turn opened
+    (`PendingConfirm.proposed_turn`), something this class's fake
+    executor double doesn't model. What THIS class is responsible for is
+    classifying `affirmed` once, at turn open, and passing that same
+    flag to every `execute()` this turn unconditionally (module
+    docstring judgment call #6) — the cross-round confirm-bypass PoC
+    this test used to guard against is now covered at the ToolExecutor
+    level (tests/agent/test_tool_executor.py's same-turn-reproposal
+    tests), where the actual matching/eligibility decision is made."""
     router = FakeRouter()
     router.script(
         [ToolCallsBatch(tool_calls=(_call("block_card", "c1"),)), *_text_events()],
@@ -502,8 +509,8 @@ async def test_affirmed_flag_only_applies_to_the_first_tool_round() -> None:
     await manager.on_stt_final("yes, do it")
 
     assert len(executor.calls) == 2
-    assert executor.calls[0]["affirmed"] is True  # round 1: the genuine "yes"
-    assert executor.calls[1]["affirmed"] is False  # round 2: never inherits it
+    assert executor.calls[0]["affirmed"] is True
+    assert executor.calls[1]["affirmed"] is True
 
 
 async def test_affirmed_false_when_no_pending_regardless_of_round() -> None:
