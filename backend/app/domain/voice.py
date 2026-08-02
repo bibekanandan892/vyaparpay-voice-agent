@@ -33,14 +33,18 @@ and not the diff:
 3. `TtsChunk.alignment` is a tuple of `(char_offset, ms)` pairs, not a
    list — the frozen-immutability discipline types.py already applies to
    `Message.tool_calls` / `ContextBundle.conversation`.
-4. `DataChannelMessage.type` is an open `str`, not a closed Literal:
-   docs/13 §9's additive rule requires unknown envelope types to be
-   ignorable, and the `ctx.*` payloads are owned by protocol/ and
-   docs/08, not typed here. The three server->client types Phase 3
-   emits are pinned as DC_TYPE_* constants instead (the same
-   never-hand-type-a-string rule app/obs/tracing.py applies to span
-   names). `SignalMessage.type` IS a closed Literal because docs/13 §6
-   fixes the signaling vocabulary in the envelope itself.
+4. `DataChannelMessage.type` AND `SignalMessage.type` are both open
+   `str`, not a closed Literal (this was revised from an earlier draft
+   that pinned SignalMessage.type as a Literal): docs/13 §9 says
+   verbatim that new *signaling or data-channel* message types are
+   allowed without a version bump, and requires clients to "ignore
+   unknown envelope types" from day one — §6 only enumerates the
+   current v1 vocabulary, it doesn't freeze it. A closed Literal would
+   make `SignalMessage.model_validate(...)` raise on exactly the future
+   types §9 says must degrade gracefully. Both channels' *currently
+   known* types are pinned as SIG_TYPE_*/DC_TYPE_* constants instead so
+   no emitter or test hand-types a string that could drift (the same
+   rule app/obs/tracing.py applies to span names).
 5. Transcript payload `role` is `Literal["user", "agent"]` — docs/12
    §4.2's coarse who-spoke vocabulary, deliberately NOT the chat-array
    `Role` enum (see Role's own docstring in types.py for why the two
@@ -57,6 +61,14 @@ and not the diff:
    caveat (async-generator implementations need one documented cast;
    see tests/agent/test_llm_router.py) — because contract-file
    consistency beats a private spelling improvement.
+8. `IceServer.credential` and `SessionCredentials.signaling_token` are
+   plain `str`, not `SecretStr` — both MUST serialize in cleartext on
+   the wire, and SecretStr's default JSON dump masks the value, which
+   would be wrong here. Instead both fields use `Field(repr=False)` so
+   `repr()`/`str()`/an f-string interpolation can't leak them (the
+   thing SecretStr protects against in config.py), while `.to_wire()`
+   on both models is the one sanctioned path to their real cleartext
+   wire shape — never call bare `.model_dump()` on either.
 
 Docs: docs/06-voice-pipeline.md (thresholds, events, barge-in semantics),
 docs/13-api-contracts.md §2/§4/§6 (wire shapes), docs/05-agent-architecture.md
@@ -70,7 +82,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 _FROZEN = ConfigDict(frozen=True)
 
@@ -86,6 +98,17 @@ WIRE_ENVELOPE_V: Final = 1
 DC_TYPE_TRANSCRIPT_PARTIAL: Final = "transcript.partial"
 DC_TYPE_TRANSCRIPT_FINAL: Final = "transcript.final"
 DC_TYPE_AGENT_STATE: Final = "agent.state"
+
+# The signaling vocabulary docs/13 §6 currently enumerates. type stays an
+# open str (judgment call 4) — these are what THIS codebase emits/expects,
+# not an exhaustive validation set.
+SIG_TYPE_OFFER: Final = "offer"
+SIG_TYPE_ANSWER: Final = "answer"
+SIG_TYPE_ICE: Final = "ice"
+SIG_TYPE_BYE: Final = "bye"
+SIG_TYPE_ERROR: Final = "error"
+SIG_TYPE_PING: Final = "ping"
+SIG_TYPE_PONG: Final = "pong"
 
 
 # --------------------------------------------------------------------------
@@ -201,7 +224,7 @@ class SignalMessage(BaseModel):
     model_config = _FROZEN
 
     v: int = WIRE_ENVELOPE_V
-    type: Literal["offer", "answer", "ice", "bye", "error", "ping", "pong"]
+    type: str
     payload: dict[str, Any]
 
 
@@ -263,15 +286,25 @@ class AgentStateMsg(BaseModel):
 class IceServer(BaseModel):
     """One `ice_servers[]` entry, passed verbatim to PeerConnection
     construction (docs/13 §2.1). STUN entries carry only `urls`; the
-    TURN entry adds the HMAC credential pair (docs/13 §7). Serialize
-    with `exclude_none=True` so a STUN entry omits the credential keys
-    on the wire exactly as §2.1 shows."""
+    TURN entry adds the HMAC credential pair (docs/13 §7), a live
+    bearer secret for its 10-min TTL — `credential` is excluded from
+    `repr()`/`str()` (judgment call 8) so an accidental
+    `logger.info(f"...{ice_server}")` or exception traceback can't
+    print it, mirroring config.py's SecretStr discipline. It stays a
+    plain `str`, not SecretStr, because it MUST serialize in cleartext
+    on the wire — call `.to_wire()`, not `.model_dump()`, to get the
+    exact §2.1 shape (a STUN entry omits `username`/`credential`
+    entirely rather than nulling them; relying on callers to remember
+    `exclude_none=True` is how that shape silently breaks)."""
 
     model_config = _FROZEN
 
     urls: tuple[str, ...]
     username: str | None = None
-    credential: str | None = None
+    credential: str | None = Field(default=None, repr=False)
+
+    def to_wire(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
 
 
 class SessionCredentials(BaseModel):
@@ -279,15 +312,29 @@ class SessionCredentials(BaseModel):
     §2.1) — everything the client needs to connect. `expires` is the
     signaling token's connect deadline (5-min TTL, docs/13 §6.2), not
     the session's lifetime; it serializes to the ISO-8601 string the
-    wire example shows."""
+    wire example shows. `signaling_token` is a one-time bearer
+    credential verified-and-burned before any SDP is read (docs/13
+    §6.2) — excluded from `repr()`/`str()` for the same reason as
+    `IceServer.credential` (judgment call 8). Call `.to_wire()` for the
+    exact §2.1 response shape (nested `ice_servers` need the same
+    exclude_none treatment `IceServer.to_wire()` gives each entry)."""
 
     model_config = _FROZEN
 
     session_id: str
     signaling_url: str
-    signaling_token: str
+    signaling_token: str = Field(repr=False)
     ice_servers: tuple[IceServer, ...]
     expires: datetime
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "signaling_url": self.signaling_url,
+            "signaling_token": self.signaling_token,
+            "ice_servers": [s.to_wire() for s in self.ice_servers],
+            "expires": self.expires.isoformat(),
+        }
 
 
 # --------------------------------------------------------------------------

@@ -104,11 +104,15 @@ _SAFE_SPAN_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
         "turn.over_budget",
         # Phase-3 voice-pipeline attributes (docs/06 §4.1: `endpoint_ms`
         # rides the `turn` span because the endpoint decision is what
-        # *opens* it; the stage timings ride their own spans). All are
-        # millisecond durations, small counters, or booleans — nothing
-        # here can carry transcript text, an account fact, or PII.
+        # *opens* it; the stage timings ride their own spans — docs/04
+        # §7.2's frozen table reconciled to include endpoint_ms in the
+        # same PR that added it here). All are millisecond durations,
+        # small counters, or booleans — nothing here can carry transcript
+        # text, an account fact, or PII. `text_len` is a character COUNT
+        # of the STT final, not the transcript itself.
         "endpoint_ms",
         "stt_ms",
+        "text_len",
         "tts_ttfb_ms",
         "sentence_no",
         "interrupted",

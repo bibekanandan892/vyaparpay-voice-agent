@@ -27,6 +27,7 @@ from app.domain.voice import (
     DC_TYPE_AGENT_STATE,
     DC_TYPE_TRANSCRIPT_FINAL,
     DC_TYPE_TRANSCRIPT_PARTIAL,
+    SIG_TYPE_BYE,
     WIRE_ENVELOPE_V,
     AgentState,
     AgentStateMsg,
@@ -80,7 +81,7 @@ def test_session_credentials_serializes_to_the_docs_13_2_1_wire_shape() -> None:
         expires=datetime.fromisoformat("2026-07-24T14:19:22+05:30"),
     )
 
-    assert creds.model_dump(mode="json", exclude_none=True) == {
+    expected = {
         "session_id": "a1f3c9",
         "signaling_url": "wss://voice.vyapar.local/v1/signal",
         "signaling_token": "st_hV4nQ9pXzL2mR8cT0kWyB6uJ",
@@ -97,6 +98,37 @@ def test_session_credentials_serializes_to_the_docs_13_2_1_wire_shape() -> None:
         ],
         "expires": "2026-07-24T14:19:22+05:30",
     }
+    # to_wire() is the sanctioned path (bare model_dump() is a footgun for
+    # the exclude_none STUN-entry shape); still exercise mode="json"
+    # exclude_none to prove the two agree for this fixture.
+    assert creds.to_wire() == expected
+    assert creds.model_dump(mode="json", exclude_none=True) == expected
+
+
+def test_session_credentials_and_ice_server_secrets_never_appear_in_repr() -> None:
+    """judgment call 8: repr()/str() must not leak the live bearer token
+    or TURN credential — the same failure mode SecretStr prevents in
+    config.py, applied here via Field(repr=False) since these fields
+    must still serialize in cleartext for the wire."""
+    turn_entry = IceServer(
+        urls=("turn:turn.vyapar.local:3478?transport=udp",),
+        username="1784537062:a1f3c9",
+        credential="kWx0mB4vQ2nT8hZJc6yUq1RfLpE=",
+    )
+    creds = SessionCredentials(
+        session_id="a1f3c9",
+        signaling_url="wss://voice.vyapar.local/v1/signal",
+        signaling_token="st_hV4nQ9pXzL2mR8cT0kWyB6uJ",
+        ice_servers=(turn_entry,),
+        expires=datetime.fromisoformat("2026-07-24T14:19:22+05:30"),
+    )
+
+    assert "kWx0mB4vQ2nT8hZJc6yUq1RfLpE=" not in repr(turn_entry)
+    assert "st_hV4nQ9pXzL2mR8cT0kWyB6uJ" not in repr(creds)
+    # The wire path must still carry the real values — repr(-only) hiding
+    # them is the point, not making them unreachable.
+    assert creds.to_wire()["signaling_token"] == "st_hV4nQ9pXzL2mR8cT0kWyB6uJ"
+    assert creds.to_wire()["ice_servers"][0]["credential"] == "kWx0mB4vQ2nT8hZJc6yUq1RfLpE="
 
 
 def test_session_credentials_round_trips_through_json() -> None:
@@ -122,12 +154,18 @@ def test_signal_message_parses_and_re_emits_the_docs_13_6_envelope() -> None:
     assert msg.model_dump(mode="json") == wire
 
 
-def test_signal_message_rejects_a_type_outside_the_docs_13_6_vocabulary() -> None:
-    """§6's envelope fixes the signaling vocabulary in the type itself —
-    unlike the data channel, an unknown signal type is a protocol error,
-    not something to ignore."""
-    with pytest.raises(ValidationError):
-        SignalMessage(type="renegotiate", payload={})  # type: ignore[arg-type]
+def test_signal_message_accepts_unknown_types_per_the_additive_rule() -> None:
+    """docs/13 §9: new signaling types are additive within /v1 too (not
+    just data-channel types) — §6 enumerates the current vocabulary, it
+    doesn't freeze it, and clients must ignore unknown envelope types
+    rather than error on them."""
+    msg = SignalMessage(type="renegotiate", payload={})
+
+    assert msg.type == "renegotiate"
+
+
+def test_signal_message_type_constant_matches_docs_13_6() -> None:
+    assert SIG_TYPE_BYE == "bye"
 
 
 def test_data_channel_envelope_round_trips_the_docs_13_4_transcript_final() -> None:
