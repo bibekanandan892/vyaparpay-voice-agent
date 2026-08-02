@@ -103,8 +103,16 @@ def _json_equal(a: Any, b: Any) -> bool:
     """`==` gated on matching JSON type first -- plain `==`/`in` would let
     Python's bool-is-an-int-subclass equivalence (`True == 1`) satisfy a
     `const`/`enum` that names an integer, or vice versa, which JSON
-    Schema's own type system never allows."""
-    return _type_name(a) == _type_name(b) and a == b
+    Schema's own type system never allows. Carries the same
+    integer-satisfies-number exception `_errors`'s `type` handling
+    already applies, so a float const/int instance pair (or vice versa)
+    isn't spuriously rejected -- dormant today (no schema uses a float
+    const/enum) but kept consistent with the rest of the walker."""
+    a_type, b_type = _type_name(a), _type_name(b)
+    numeric = {"integer", "number"}
+    if a_type != b_type and not (a_type in numeric and b_type in numeric):
+        return False
+    return a == b
 
 
 def _check_scalars(value: Any, schema: dict[str, Any], path: str) -> list[str]:
@@ -258,10 +266,10 @@ def test_rejects_bool_where_data_channel_envelope_version_const_is_an_int() -> N
     assert _errors(wrong_type, schema, schema.get("$defs", {}), "$")
 
 
-def test_rejects_unknown_data_channel_type_and_missing_required_payload_key() -> None:
+def test_rejects_data_channel_envelope_missing_required_keys() -> None:
     schema = _load_schema("data_channel_envelope.v1")
-    unknown_shape = {"v": 1, "type": "agent.state", "seq": 1}  # missing ts, payload
-    assert _errors(unknown_shape, schema, schema.get("$defs", {}), "$")
+    incomplete = {"v": 1, "type": "agent.state", "seq": 1}  # missing ts, payload
+    assert _errors(incomplete, schema, schema.get("$defs", {}), "$")
 
 
 def test_rejects_session_create_request_with_wrong_field_types() -> None:
