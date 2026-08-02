@@ -745,3 +745,37 @@ async def test_both_spans_close_when_the_consumer_abandons_the_stream_early(
     for span in spans:
         assert span.end_time is not None
         assert span.status.status_code is not otel_trace.StatusCode.ERROR
+
+
+async def test_error_status_never_carries_the_exception_message_or_a_recorded_event(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """Security review HIGH, fixed: `_ToolCallAssembler`'s malformed-
+    fragment `ValueError`s embed the raw fragment/argument text verbatim
+    (potentially amounts/account numbers, for a money-moving agent) —
+    OTel's default `record_exception=True`/`set_status_on_exception=True`
+    would attach that text to the span (an `exception` event plus a
+    `str(exc)`-bearing status description), exported unredacted via
+    Phase 2's default ConsoleSpanExporter. `llm.total`'s span must carry
+    only the exception's TYPE name, never its message, and must record
+    no `exception` event at all."""
+    sensitive_marker = "acct-9988776655-amount-450000"
+    fake_llm.script_turn(
+        TokenEvent(delta={"tool_calls": [{"function": {"name": sensitive_marker}}]}),
+    )
+    router = _router(fake_llm, settings)
+
+    with pytest.raises(ValueError, match="no integer 'index'") as exc_info:
+        await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+    assert sensitive_marker in str(exc_info.value)  # confirms the raw content really is in there
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    total_span = next(s for s in spans if s.name == "llm.total")
+    assert total_span.status.status_code is otel_trace.StatusCode.ERROR
+    assert total_span.status.description == "ValueError"
+    assert sensitive_marker not in (total_span.status.description or "")
+    assert total_span.events == ()  # record_exception=False: no exception event at all
+    for span in spans:
+        rendered = repr(span.to_json())
+        assert sensitive_marker not in rendered
