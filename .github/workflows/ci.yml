@@ -18,6 +18,13 @@ on:
   push:
     branches: [main]
 
+# Least-privilege hardening (security review MEDIUM): neither job performs
+# any token-consuming operation, so the ambient GITHUB_TOKEN needs nothing
+# beyond checkout. Declaring it explicitly removes the token as an attack
+# surface if a future step is added without noticing the default scope.
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: backend
@@ -27,8 +34,8 @@ jobs:
     name: lint + types + unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -46,8 +53,8 @@ jobs:
     name: testcontainers suites (ORM + E2E)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
