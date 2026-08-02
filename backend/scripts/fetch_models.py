@@ -61,12 +61,31 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses a redirect target that isn't https — urllib's default
+    handler follows a redirect to plain http without re-checking scheme,
+    which would defeat the initial-URL check below on a hijacked/
+    misconfigured server."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
+        if not newurl.startswith("https://"):
+            raise ValueError(f"refusing non-https redirect target: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_https_only_opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
+
+
 def download(url: str, dest: Path) -> None:
-    """Streams `url` to `dest`. https only — a pin that quietly became
-    plain-http would defeat the whole point of pinning."""
+    """Streams `url` to `dest`. https only, including any redirect hop —
+    a pin that quietly became plain-http would defeat the whole point of
+    pinning."""
     if not url.startswith("https://"):
         raise ValueError(f"refusing non-https model URL: {url}")
-    with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_S) as resp, dest.open("wb") as out:
+    with (
+        _https_only_opener.open(url, timeout=_DOWNLOAD_TIMEOUT_S) as resp,
+        dest.open("wb") as out,
+    ):
         while chunk := resp.read(_CHUNK_SIZE):
             out.write(chunk)
 

@@ -70,6 +70,6 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
       - name: Install
-        run: pip install -e ".[dev,voice]"
+        run: pip install -e ".[dev]"
       - name: Pytest (Docker-gated suites)
         run: pytest tests/models tests/e2e -q
