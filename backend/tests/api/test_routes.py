@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import get_db, require_rate_limit
 from app.api.errors import LimitRequestAlreadyPendingError, RateLimitedError
+from app.api.routes.limits import _MAX_REQUESTED_LIMIT_PAISE
 from app.config import get_settings
 from app.data.repositories import (
     DailyLimitCheck,
@@ -614,6 +615,59 @@ def test_create_increase_request_propagates_already_pending(
     assert resp.status_code == 409
     assert body["error"]["code"] == "LIMIT_REQUEST_ALREADY_PENDING"
     assert body["error"]["details"]["existing_request_id"] == "LMT-2026-0724-0800"
+
+
+def test_create_increase_request_over_ceiling_is_rejected(client: TestClient) -> None:
+    """Security review (HIGH): this route fronts the same
+    `LimitRepo.submit_increase_request` mutation as the `request_limit_increase`
+    tool (app/tools/request_limit_increase.py), which caps `requested_limit`
+    at `_MAX_LIMIT_RUPEES` (₹1 crore) — added after an earlier review found
+    an unbounded value had no ceiling anywhere in the pipeline. This route,
+    the more exposed directly network-callable path, never got a matching
+    ceiling on `requested_limit_paise`. One paise over the ceiling must be
+    rejected by Pydantic validation before ever reaching `LimitRepo` — and,
+    per this app's `validation_exception_handler` (app/api/middleware.py),
+    every Pydantic validation failure surfaces as `400 VALIDATION_SCHEMA`,
+    not FastAPI's raw 422 (see the identical `test_create_payment_invalid_
+    type_is_400_validation_schema` pattern for `POST /v1/payments`)."""
+    resp = client.post(
+        "/v1/limits/increase-requests",
+        headers=_AUTH_HEADERS,
+        json={
+            "limit_type": "daily_txn",
+            "current_limit_paise": 2_500_000,
+            "requested_limit_paise": _MAX_REQUESTED_LIMIT_PAISE + 1,
+        },
+    )
+
+    body = resp.json()
+    assert resp.status_code == 400
+    assert body["error"]["code"] == "VALIDATION_SCHEMA"
+    assert body["error"]["details"]["fields"]
+
+
+def test_create_increase_request_at_ceiling_is_not_rejected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary immediately below the previous test: a request exactly
+    at `_MAX_REQUESTED_LIMIT_PAISE` must pass this route's validation and
+    reach `LimitRepo.submit_increase_request` normally."""
+    result = LimitIncreaseRequest(request_id="LMT-2026-0724-0913", status="submitted", eta_hours=4)
+    monkeypatch.setattr("app.api.routes.limits.LimitRepo", _limit_repo(result=result))
+
+    resp = client.post(
+        "/v1/limits/increase-requests",
+        headers=_AUTH_HEADERS,
+        json={
+            "limit_type": "daily_txn",
+            "current_limit_paise": 2_500_000,
+            "requested_limit_paise": _MAX_REQUESTED_LIMIT_PAISE,
+        },
+    )
+
+    body = resp.json()
+    assert resp.status_code == 201
+    assert body["success"] is True
 
 
 # --------------------------------------------------------------------------
