@@ -686,11 +686,14 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         # ==============================================================
         # Turn 6 — "Yes, do it." classifies as an affirmation of the
         # turn-5 pending, but the model does NOT re-emit the tool call
-        # this turn (pure acknowledgement) — the re-emission must land as
-        # turn 7's FIRST tool round, respecting the round-scoping fix
-        # (conversation_manager.py's judgment call #10: affirmed is only
-        # honored on a turn's first tool round, and only a genuinely new
-        # user turn gets a fresh affirmed classification at all).
+        # this turn (pure acknowledgement) — the re-emission lands as
+        # turn 7. `affirmed` is now passed unconditionally to every
+        # tool-loop round (conversation_manager.py's judgment call #10);
+        # what actually gates execution is ToolExecutor._confirm_tier's
+        # `proposed_turn != turn_no` check (tool_executor.py) — the
+        # turn-5 pending can only ever execute on a turn AFTER 5, never
+        # on turn 5 itself, regardless of round. A genuinely new user
+        # turn is still what produces a fresh `affirmed` classification.
         # ==============================================================
         t6_reply = "Sure, one moment while I get that submitted for you."
         fake_llm.script_turn(*_content_round(t6_reply, model=dialogue_model))

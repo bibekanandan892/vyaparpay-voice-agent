@@ -128,6 +128,7 @@ import time
 from typing import Any, Final
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.errors import AppError
@@ -571,29 +572,37 @@ class ToolExecutor:
                 new_tool=call.name,
             )
         elapsed = _elapsed_ms(start)
-        # Same-turn re-hold guard (security-review HIGH, fixed): `matches`
-        # alone doesn't distinguish a legitimate cross-turn "restate" (the
-        # §6 reconnect variant — a re-proposal in a LATER turn, worth its
-        # own audit row under that turn's idem_key, per
-        # test_matching_reproposal_keeps_original_pending_anchor) from an
-        # earlier round of THIS SAME turn having already written a
-        # PENDING_CONFIRM row under this EXACT idem_key (turn-scoped, not
-        # round-scoped — `_confirm_tier`'s `eligible` check is what makes
-        # this case reachable at all: it holds instead of executing).
-        # Re-auditing that case would attempt a second row under the same
-        # idempotency_key and violate the audit table's UNIQUE constraint,
-        # silently dropped by `_audit`'s best-effort exception handling.
-        # Only the same-turn re-hold is skipped; nothing else changes.
-        if not (matches and pending is not None and pending.proposed_turn == turn_no):
-            await self._audit(
-                session_id=session_id,
-                tool_name=call.name,
-                input=call.arguments,
-                status=ToolInvocationStatus.PENDING_CONFIRM,
-                latency_ms=elapsed,
-                turn_no=turn_no,
-                idempotency_key=idem_key,
-            )
+        # Repeated-hold guard (security-review HIGH, fixed twice): an
+        # earlier attempt keyed this off `pending.proposed_turn ==
+        # turn_no` to predict when a hold was a same-turn repeat — but
+        # that only catches a fresh proposal re-emitted within the turn
+        # that created it. It misses a pending action from an EARLIER
+        # turn that gets matched-but-not-executed (held) across MULTIPLE
+        # rounds of the CURRENT turn (the `matches` branch never rewrites
+        # `proposed_turn`, so every round's hold looks identical to the
+        # predictor), and it misses a same-turn, same-tool, different-args
+        # re-proposal (idem_key is tool+turn scoped, not args-scoped, so
+        # it collides too even though `matches` is False both times).
+        # Every one of these shapes writes under the SAME idempotency_key
+        # as an earlier attempt this turn — `idem_key` depends only on
+        # (session_id, tool_name, turn_no), never on round number or
+        # `matches`. Rather than re-deriving every shape that can produce
+        # a duplicate key (a predictive check will always be one case
+        # behind), let the database's own UNIQUE(idempotency_key)
+        # constraint be the single source of truth: always attempt the
+        # audit, and treat the resulting IntegrityError as the expected,
+        # benign signal that this exact hold was already recorded earlier
+        # in the turn — never a silently-dropped failure.
+        await self._audit(
+            session_id=session_id,
+            tool_name=call.name,
+            input=call.arguments,
+            status=ToolInvocationStatus.PENDING_CONFIRM,
+            latency_ms=elapsed,
+            turn_no=turn_no,
+            idempotency_key=idem_key,
+            expect_duplicate=True,
+        )
         gate = {
             "status": "pending_confirm",
             "instruction": _GATE_INSTRUCTION,
@@ -868,13 +877,22 @@ class ToolExecutor:
         output: dict[str, Any] | None = None,
         error_code: str | None = None,
         idempotency_key: str | None = None,
+        expect_duplicate: bool = False,
     ) -> str | None:
         """Separate-transaction audit insert for every non-mutating-OK
         outcome (the mutating OK row is written inside `_commit_mutation`
         instead). Best-effort by design — see the module docstring's
         judgment call; a failure is logged loudly, never propagated.
         `input` shadows the builtin to mirror `ToolAuditRepo.insert`'s
-        own column-named parameter."""
+        own column-named parameter.
+
+        `expect_duplicate=True` (set only by `_hold_gate`'s repeated-hold
+        path, security-review HIGH) means a `UNIQUE(idempotency_key)`
+        violation here is an anticipated, benign outcome — this exact
+        hold was already audited earlier in the turn — not a failure:
+        logged at info, not `log.exception`. Any other exception, or an
+        `IntegrityError` when `expect_duplicate=False`, still takes the
+        loud path unchanged."""
         try:
             async with self._sessionmaker() as session:
                 row = await ToolAuditRepo(session).insert(
@@ -890,6 +908,22 @@ class ToolExecutor:
                 )
                 await session.commit()
                 return str(row.invocation_id) if row.invocation_id is not None else None
+        except IntegrityError:
+            if expect_duplicate:
+                log.info(
+                    "tool_audit_duplicate_hold_skipped",
+                    tool=tool_name,
+                    session_id=session_id,
+                    idempotency_key=idempotency_key,
+                )
+                return None
+            log.exception(
+                "tool_audit_write_failed",
+                tool=tool_name,
+                session_id=session_id,
+                status=status.value,
+            )
+            return None
         except Exception:
             log.exception(
                 "tool_audit_write_failed",

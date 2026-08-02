@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.exc import IntegrityError
 
 import app.tools  # noqa: F401 -- import side effect: registers the 3 Phase-2 tools
 from app.agent.safety_layer import SafetyLayer
@@ -89,11 +90,17 @@ class _FakeRedisClient:
 class _FakeSession:
     """Session-shaped async context manager supporting what
     `ToolAuditRepo.insert` (add + flush) and the executor (commit) issue.
-    `flush` mimics INSERT..RETURNING by assigning a primary key."""
+    `flush` mimics INSERT..RETURNING by assigning a primary key, and — for
+    the security-review HIGH regression coverage below — mimics the real
+    `tool_invocations.idempotency_key` UNIQUE constraint by raising
+    `IntegrityError` on a second non-null key, checked against the
+    `_FakeSessionmaker`-shared set (a real UNIQUE index is enforced across
+    the whole table, not scoped to one session/transaction)."""
 
-    def __init__(self) -> None:
+    def __init__(self, committed_idempotency_keys: set[str]) -> None:
         self.added: list[Any] = []
         self.commit_count = 0
+        self._committed_idempotency_keys = committed_idempotency_keys
 
     async def __aenter__(self) -> _FakeSession:
         return self
@@ -106,8 +113,13 @@ class _FakeSession:
 
     async def flush(self) -> None:
         for entity in self.added:
+            key = getattr(entity, "idempotency_key", None)
+            if key is not None and key in self._committed_idempotency_keys:
+                raise IntegrityError("duplicate idempotency_key", None, Exception(key))
             if getattr(entity, "invocation_id", None) is None:
                 entity.invocation_id = uuid4()
+            if key is not None:
+                self._committed_idempotency_keys.add(key)
 
     async def commit(self) -> None:
         self.commit_count += 1
@@ -116,9 +128,12 @@ class _FakeSession:
 class _FakeSessionmaker:
     def __init__(self) -> None:
         self.sessions: list[_FakeSession] = []
+        # Shared across every session this maker hands out — a real
+        # UNIQUE index spans the whole table, not one transaction.
+        self._committed_idempotency_keys: set[str] = set()
 
     def __call__(self) -> _FakeSession:
-        session = _FakeSession()
+        session = _FakeSession(self._committed_idempotency_keys)
         self.sessions.append(session)
         return session
 
@@ -554,11 +569,12 @@ async def test_same_turn_reproposal_never_executes_and_writes_no_second_audit_ro
        finished speaking. `matches` alone can't tell a same-turn
        re-emission apart from a genuine cross-turn "yes"; the
        `proposed_turn != turn_no` check in `_confirm_tier` is what does.
-    2. Re-holding that same-turn re-emission must not attempt a second
-       PENDING_CONFIRM audit row under the SAME idempotency_key the
+    2. Re-holding that same-turn re-emission must not surface a second
+       PENDING_CONFIRM audit attempt under the SAME idempotency_key the
        first hold already wrote (idem_key is turn-scoped, not
-       round-scoped) — that would collide with the audit table's
-       UNIQUE(idempotency_key) constraint.
+       round-scoped) as a failure — the audit table's
+       UNIQUE(idempotency_key) constraint rejects it, and `_audit`'s
+       `expect_duplicate=True` path absorbs that as expected.
 
     Simulates ConversationManager's tool loop calling `execute()` twice
     within one turn (same turn_no): round 1 proposes, round 2 re-emits
@@ -590,6 +606,102 @@ async def test_same_turn_reproposal_never_executes_and_writes_no_second_audit_ro
     rows = _audit_rows(sessionmaker)
     assert [row.status for row in rows] == ["pending_confirm"]  # no second row
     assert rows[0].idempotency_key == f"{_SESSION_ID}:fake_limit:8"
+
+
+async def test_cross_turn_pending_reheld_across_rounds_never_double_audits(
+    executor: ToolExecutor,
+    fake_redis: _FakeRedisClient,
+    sessionmaker: _FakeSessionmaker,
+    principal: SessionUser,
+) -> None:
+    """Security review HIGH (found in a second security pass on the fix
+    above): a pending action from an EARLIER turn that gets matched but
+    not executed (not affirmed) across MULTIPLE rounds of the CURRENT
+    turn reuses the SAME idem_key on every round — `matches` is True on
+    both rounds and `_hold_gate`'s `not matches` branch (which is the
+    only place that ever rewrites `proposed_turn`) never runs, so a
+    predictor keyed off `proposed_turn == turn_no` can't see this case at
+    all. `_audit`'s IntegrityError handling is what actually makes this
+    safe regardless of shape — this test proves the mechanism, not a
+    specific predictor."""
+    call_log: list[dict[str, Any]] = []
+    _register_confirm_tool("fake_limit", call_log=call_log)
+    args = {"current_limit": 25000, "requested_limit": 50000}
+    fake_redis.pending[_SESSION_ID] = PendingConfirm(
+        tool="fake_limit", args=args, proposed_turn=5, invocation_id="inv_old"
+    )
+
+    # Turn 6, "round 1": matched but not affirmed — held, audited under
+    # the turn-6 key (the legitimate cross-turn restate).
+    round_one = await executor.execute(
+        [_call("fake_limit", args)],
+        principal=principal,
+        session_id=_SESSION_ID,
+        turn_no=6,
+        affirmed=False,
+    )
+    # Turn 6, "round 2": the SAME call re-emitted again within the same
+    # turn — same idem_key as round 1, since idem_key depends only on
+    # (session_id, tool_name, turn_no).
+    round_two = await executor.execute(
+        [_call("fake_limit", args)],
+        principal=principal,
+        session_id=_SESSION_ID,
+        turn_no=6,
+        affirmed=False,
+    )
+
+    assert round_one[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    assert round_two[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    assert call_log == []  # never executed
+    assert fake_redis.pending[_SESSION_ID].proposed_turn == 5  # anchor untouched
+    rows = _audit_rows(sessionmaker)
+    assert [row.status for row in rows] == ["pending_confirm"]  # one row, not two
+    assert rows[0].idempotency_key == f"{_SESSION_ID}:fake_limit:6"
+
+
+async def test_same_turn_different_args_reproposal_never_double_audits(
+    executor: ToolExecutor,
+    fake_redis: _FakeRedisClient,
+    sessionmaker: _FakeSessionmaker,
+    principal: SessionUser,
+) -> None:
+    """A third shape of the same idem_key collision, found while fixing
+    the two above: idem_key is `session:tool:turn`, scoped by TOOL, not
+    by ARGS. Round 1 of a turn proposing tool A with args X, then round 2
+    of the SAME turn proposing the SAME tool A with DIFFERENT args Y, are
+    both `not matches` (args differ) — the branch that supersedes and
+    re-audits PENDING_CONFIRM — yet land on the identical idem_key."""
+    call_log: list[dict[str, Any]] = []
+    _register_confirm_tool("fake_limit", call_log=call_log)
+
+    round_one = await executor.execute(
+        [_call("fake_limit", {"current_limit": 25000, "requested_limit": 50000})],
+        principal=principal,
+        session_id=_SESSION_ID,
+        turn_no=9,
+    )
+    round_two = await executor.execute(
+        [_call("fake_limit", {"current_limit": 25000, "requested_limit": 75000})],
+        principal=principal,
+        session_id=_SESSION_ID,
+        turn_no=9,
+    )
+
+    assert round_one[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    assert round_two[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    assert call_log == []  # never executed
+    rows = _audit_rows(sessionmaker)
+    # Round 1's hold + round 1 (as "prior pending") never gets a
+    # cancelled row of its own here (nothing was pending before round 1),
+    # but round 2 supersedes round 1's now-pending proposal: cancelled +
+    # one pending_confirm survives (the second attempt at that same key
+    # is the one the UNIQUE constraint — not a second row — absorbs).
+    assert [row.status for row in rows] == ["pending_confirm", "cancelled"]
+    assert rows[0].idempotency_key == f"{_SESSION_ID}:fake_limit:9"
+    assert rows[1].idempotency_key is None  # the cancelled row never carries one
+    pending = fake_redis.pending[_SESSION_ID]
+    assert pending.args == {"current_limit": 25000, "requested_limit": 75000}
 
 
 async def test_affirmed_with_mismatched_args_supersedes_instead_of_executing(
