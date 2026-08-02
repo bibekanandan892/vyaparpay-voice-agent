@@ -81,25 +81,23 @@ Judgment calls, flagged per house style:
   guarantee an unenforced cross-file invariant — any future direct
   caller of `stream()` under a default-configured ancestor span would
   silently reopen this exact leak.
-- **KNOWN OPEN GAP, not fixed in this revision** (code review HIGH,
-  tracked, not silently missed): `llm.total`'s span correctly closes when
-  the CONSUMER of `stream()` calls `.aclose()` in the same task/context
-  it's iterating from — verified against the real opentelemetry-sdk. It
-  does NOT correctly close when the consumer's loop body raises an
-  exception WITHOUT calling `.aclose()` first (Python's async-generator
-  finalizer then throws `GeneratorExit` from a different task with its
-  own copied `contextvars.Context`, and the span's `context.detach()`
-  fails against that mismatched Context — the span silently never closes
-  / exports). `ConversationManager._run_tool_loop`'s `_MAX_REPLY_CHARS`
-  guard does exactly this today (raises out of its `async for event in
-  stream:` loop with no `try/finally`/`aclosing()`). The correct fix is
-  on the CONSUMER side — wrap stream consumption in
-  `contextlib.aclosing()` — not here; deferred because that call site
-  (`conversation_manager.py`) is being touched by a separate, currently
-  in-flight PR (the confirm-gate turn-anchored eligibility fix) and
-  editing it now would create an unnecessary merge conflict. Tracked as
-  a required follow-up, to land together with whatever next touches
-  `ConversationManager._run_tool_loop`.
+- **The consumer-side closing requirement** (code review HIGH, found
+  here and CLOSED in this same PR once the confirm-gate fix merged and
+  unblocked editing the call site): `llm.total`'s span closes correctly
+  when the CONSUMER of `stream()` closes the generator from the same
+  task/context it iterates in — verified against the real
+  opentelemetry-sdk. It does NOT close correctly if a consumer's loop
+  body raises WITHOUT closing the generator first (Python's
+  async-generator finalizer then throws `GeneratorExit` from a
+  different task with its own copied `contextvars.Context`, and the
+  span's `context.detach()` fails against that mismatched Context — the
+  span silently never exports). Every consumer must therefore wrap
+  stream consumption in `contextlib.aclosing()`. The one Phase-2
+  consumer, `ConversationManager._run_tool_loop`, now does (its
+  judgment call #12), with a regression test proving the close happens
+  synchronously (`test_max_reply_chars_guard_closes_the_stream_
+  synchronously`). Any FUTURE direct caller of `stream()` inherits this
+  requirement — that's what this note is for.
 """
 
 from __future__ import annotations

@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from redis.exceptions import RedisError
@@ -365,3 +366,34 @@ async def test_context_build_span_still_closes_when_the_db_degrades(
     spans = span_exporter.get_finished_spans()
     assert [s.name for s in spans] == ["context.build"]
     assert spans[0].end_time is not None
+
+
+async def test_context_build_span_never_carries_escaped_exception_content(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """Security review LOW, fixed: the degrade-the-slot except tuples in
+    `_build_user_profile`/`_get_window` catch everything those methods
+    raise TODAY, so no exception normally escapes `build()` — but that's
+    an invariant of those tuples, not of the span. An exception type
+    OUTSIDE them (here `RuntimeError`, simulating a future uncaught
+    type whose message echoes merchant data) must propagate with the
+    span closed as ERROR carrying the TYPE NAME only — no message, no
+    recorded exception event — matching the hardening `llm.total`/
+    `llm.ttft` got in llm_router.py for the identical leak class."""
+    sensitive_marker = "merchant-usr_rajesh01-balance-1845000"
+    db = make_db_session()
+    db.get.side_effect = RuntimeError(f"unexpected: {sensitive_marker}")
+    builder = make_builder(db_session=db)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await builder.build(make_call_session(), current_utterance="hi")
+    assert sensitive_marker in str(exc_info.value)  # the content really is in the exception
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["context.build"]
+    span = spans[0]
+    assert span.status.status_code is otel_trace.StatusCode.ERROR
+    assert span.status.description == "RuntimeError"
+    assert span.events == ()  # record_exception=False: no exception event at all
+    assert sensitive_marker not in repr(span.to_json())
