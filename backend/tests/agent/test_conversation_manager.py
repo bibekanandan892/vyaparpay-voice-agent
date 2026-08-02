@@ -87,6 +87,11 @@ class FakeRouter:
     def __init__(self) -> None:
         self._turns: list[list[Any]] = []
         self.calls: list[list[Message]] = []
+        # Incremented in `finally`, so it counts every exit (normal
+        # exhaustion, an exception, or aclose()) — a regression test can
+        # still use it to prove aclose() ran SYNCHRONOUSLY when a round
+        # scripts more events than the consumer ever reads.
+        self.closed_count = 0
 
     def script(self, *turns: list[Any]) -> None:
         self._turns.extend(turns)
@@ -106,8 +111,11 @@ class FakeRouter:
         self.calls.append(list(messages))
         assert self._turns, "FakeRouter.stream() called with nothing scripted"
         events = self._turns.pop(0)
-        for event in events:
-            yield event
+        try:
+            for event in events:
+                yield event
+        finally:
+            self.closed_count += 1
 
 
 def _ok_result(call: ToolCall, data: dict[str, Any] | None = None) -> ToolResult:
@@ -549,3 +557,36 @@ async def test_reply_content_beyond_size_cap_degrades_to_apology() -> None:
     # Best-effort transcript still gets both sides (judgment call #5/#8).
     assert memory.appended[0].content == "hi"
     assert memory.appended[-1].content == _TURN_FAILURE_APOLOGY
+
+
+async def test_max_reply_chars_guard_closes_the_stream_synchronously() -> None:
+    """Code review HIGH, fixed (module docstring judgment call #10):
+    `_run_tool_loop` consumes each round's stream through
+    `contextlib.aclosing()` so the `_MAX_REPLY_CHARS` guard's
+    `ValueError` — raised from inside the `async for` loop, before the
+    scripted events are exhausted — closes the stream in THIS frame
+    synchronously, not deferred to a later event-loop tick via Python's
+    async-generator finalizer (which, in the real `LLMRouter.stream()`
+    this fake stands in for, could run in a different task/Context and
+    break `llm.total`'s span `context.detach()`). `closed_count == 1`
+    immediately after `on_stt_final()` returns — no extra `await`, no
+    `gc.collect()` — is exactly what a deferred, GC-driven close would
+    NOT reliably produce within a single test."""
+    from app.agent.conversation_manager import _MAX_REPLY_CHARS, _TURN_FAILURE_APOLOGY
+
+    router = FakeRouter()
+    chunk = "x" * 1000
+    # Scripts strictly more events than the guard will ever let the
+    # consumer read — if the generator is exhausted rather than closed,
+    # this test isn't actually proving early-close behavior.
+    events: list[Any] = [
+        TokenEvent(delta={"content": chunk}) for _ in range(_MAX_REPLY_CHARS // 1000 + 5)
+    ]
+    events.append(UsageEvent(model="m", usage={}))
+    router.script(events)
+    manager, _, _, _ = _manager(router)
+
+    reply = await manager.on_stt_final("hi")
+
+    assert reply == _TURN_FAILURE_APOLOGY
+    assert router.closed_count == 1

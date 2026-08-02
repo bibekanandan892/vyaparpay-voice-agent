@@ -71,12 +71,26 @@ Judgment calls, flagged per house style rather than silently guessed at:
    guessed right later — docs/05 §3.2 calls the SPEAKING transition
    safety-critical for Phase 3 barge-in cancellation, even though
    nothing reads `state` yet in Phase 2.
+10. **`_run_tool_loop` consumes each round's stream through
+    `contextlib.aclosing()`** (code review HIGH, fixed — the
+    `LLMRouter.stream()` module docstring's KNOWN OPEN GAP note names
+    this exact call site). The `_MAX_REPLY_CHARS` guard below raises out
+    of a bare `async for event in stream:` — without `aclosing()`,
+    Python's async-generator finalizer would only schedule the
+    now-abandoned `stream`'s `.aclose()` on a LATER event-loop tick,
+    likely from a different task/`contextvars.Context` than the one that
+    opened `LLMRouter.stream()`'s own `llm.total` span, breaking that
+    span's `context.detach()` and silently dropping it from the trace.
+    `async with contextlib.aclosing(stream)` closes it synchronously, in
+    THIS frame, on every exit path — normal completion, this exception,
+    or any other.
 """
 
 from __future__ import annotations
 
+import contextlib
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import cast
 
 from opentelemetry.trace import Span
@@ -278,33 +292,41 @@ class ConversationManager:
             content_parts: list[str] = []
             tool_calls: list[ToolCall] = []
             stream = await self._open_stream(messages, tier=tier, tools=tools)
-            async for event in stream:
-                if isinstance(event, UsageEvent):
-                    turn_cost = self._cost_tracker.record_turn(event.usage, event.model, span)
-                    await self._session_memory.add_cost(
-                        self._session.session_id, turn_cost.cost_usd
-                    )
-                elif (calls := getattr(event, "tool_calls", None)) is not None:
-                    # Judgment call #1: task 4.3's reassembled-batch
-                    # event, matched structurally.
-                    tool_calls.extend(calls)
-                elif isinstance(event, TokenEvent):
-                    content = event.delta.get("content")
-                    if content:
-                        content_parts.append(content)
-                        accumulated = sum(len(p) for p in content_parts)
-                        if accumulated > _MAX_REPLY_CHARS:
-                            log.error(
-                                "llm_reply_size_limit_exceeded",
-                                session_id=self._session.session_id,
-                                turn_no=self._turn_no,
-                                accumulated=accumulated,
-                                limit=_MAX_REPLY_CHARS,
-                            )
-                            raise ValueError(
-                                f"streamed reply exceeded {_MAX_REPLY_CHARS} accumulated "
-                                "characters — refusing to accumulate further"
-                            )
+            # Judgment call #10 (module docstring): aclosing() ensures
+            # `stream` closes synchronously, in this frame, on every exit
+            # path — including the _MAX_REPLY_CHARS ValueError below,
+            # which a bare `async for` would leave to a deferred,
+            # possibly cross-task close.
+            async with contextlib.aclosing(stream) as events:
+                async for event in events:
+                    if isinstance(event, UsageEvent):
+                        turn_cost = self._cost_tracker.record_turn(
+                            event.usage, event.model, span
+                        )
+                        await self._session_memory.add_cost(
+                            self._session.session_id, turn_cost.cost_usd
+                        )
+                    elif (calls := getattr(event, "tool_calls", None)) is not None:
+                        # Judgment call #1: task 4.3's reassembled-batch
+                        # event, matched structurally.
+                        tool_calls.extend(calls)
+                    elif isinstance(event, TokenEvent):
+                        content = event.delta.get("content")
+                        if content:
+                            content_parts.append(content)
+                            accumulated = sum(len(p) for p in content_parts)
+                            if accumulated > _MAX_REPLY_CHARS:
+                                log.error(
+                                    "llm_reply_size_limit_exceeded",
+                                    session_id=self._session.session_id,
+                                    turn_no=self._turn_no,
+                                    accumulated=accumulated,
+                                    limit=_MAX_REPLY_CHARS,
+                                )
+                                raise ValueError(
+                                    f"streamed reply exceeded {_MAX_REPLY_CHARS} accumulated "
+                                    "characters — refusing to accumulate further"
+                                )
 
             reply_text = "".join(content_parts)
 
@@ -373,17 +395,23 @@ class ConversationManager:
 
     async def _open_stream(
         self, messages: list[Message], *, tier: object, tools: list[dict[str, object]]
-    ) -> AsyncIterator[LLMEvent]:
+    ) -> AsyncGenerator[LLMEvent, None]:
         """`LLMRouterProto.stream` is spelled `async def ... ->
         AsyncIterator`, which mypy reads as coroutine-returning, while a
         real async-generator implementation returns the iterator
         directly — the pre-existing Protocol wart task 4.3 also
         documents (and independently handles the same way in its own
-        `llm_router.py`). Handle both shapes at runtime."""
+        `llm_router.py`). Handle both shapes at runtime. Declared
+        `AsyncGenerator`, not the Protocol's own `AsyncIterator` —
+        narrower but accurate (every real implementation, including the
+        one this method's whole docstring is about, is a genuine async
+        generator with `.aclose()`) and required by `_run_tool_loop`'s
+        `contextlib.aclosing(stream)` (judgment call #10, module
+        docstring), which needs that method statically."""
         raw_stream = self._llm_router.stream(messages, tier=tier, tools=tools)  # type: ignore[arg-type]
         if inspect.iscoroutine(raw_stream):
-            return cast("AsyncIterator[LLMEvent]", await raw_stream)
-        return cast("AsyncIterator[LLMEvent]", raw_stream)
+            return cast("AsyncGenerator[LLMEvent, None]", await raw_stream)
+        return cast("AsyncGenerator[LLMEvent, None]", raw_stream)
 
     def _screen_output(self, reply_text: str, tool_results: list[ToolResult], *, span: Span) -> str:
         """Arrow: output checks (docs/05 §3.6) — fail closed (judgment
