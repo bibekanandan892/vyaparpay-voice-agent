@@ -1,0 +1,452 @@
+"""LLMRouter — tier routing, wire adaptation, streamed tool-call
+reassembly, and the TTFT deadline/retry policy (docs/05-agent-
+architecture.md §3.4).
+
+This module owns the two interface pins the Phase-2 plan calls out:
+
+1. **Wire adaptation.** `stream()` takes domain `list[Message]` and hands
+   `LLMProvider.stream()` the OpenAI-compatible `list[dict]` it expects
+   (`Message.to_wire()`, app/domain/types.py) — the provider layer does
+   no domain-type handling of its own (`LLMProvider`'s docstring,
+   app/domain/interfaces.py).
+2. **Tool-call reassembly.** `OpenRouterLLM` forwards every streamed
+   chunk's raw `delta` untouched (its module docstring explicitly defers
+   reassembly here). Real OpenAI-compatible streams split one tool call's
+   `function.arguments` JSON string across many chunks, keyed by
+   `tool_calls[i].index`, with `id`/`function.name` arriving only on the
+   first fragment for that index; parallel calls (the canonical
+   two-reads turn, docs/05 §2) interleave distinct indices. `stream()`
+   accumulates fragments per index and yields ONE `ToolCallsEvent` of
+   whole `ToolCall`s (arguments JSON-parsed to a dict) when the
+   tool-call section completes.
+
+Judgment calls, flagged per house style:
+
+- **The filler phrase is out of scope.** docs/05 §3.4's TTFT step 1 is
+  "emit a filler phrase to TTS + retry once on the same tier" — Phase 2
+  has no TTS/voice pipeline, so only the retry half is implemented here;
+  the filler belongs to the Phase-3 voice worker.
+- **Degrade/apology (docs/05 §3.4 steps 2-3) are not here either.** A
+  retry that also stalls or errors propagates its exception — the
+  shortened-prompt degrade and the `escalate_to_human` apology are
+  ConversationManager's turn-level policy (docs/05 §3.2, a later task).
+  Routing failures (primary-model 5xx/capacity) were already covered
+  inside the single HTTP call by OpenRouter's `models: [...]` fallback
+  array, invisibly to this layer.
+- **The tool-call section's end is inferred, not observed.** The provider
+  forwards only `delta` dicts, so `finish_reason: "tool_calls"` is
+  invisible at this layer. Real streams place tool-call fragments after
+  any content, followed by the stream-final usage frame — pending calls
+  are flushed immediately before the `UsageEvent` (so the caller sees
+  whole calls, then usage) or at end of stream, whichever comes first.
+- **No spans opened here.** `llm.ttft`/`llm.total` (docs/04 §7.2) wrap
+  the whole turn's LLM stage and belong to ConversationManager's turn
+  orchestration (a later task); this module stays span-free rather than
+  guessing at that structure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any, Final, cast
+
+import orjson
+
+from app.config import Settings
+from app.domain.interfaces import LLMProvider
+from app.domain.types import (
+    LLMEvent,
+    Message,
+    ModelTier,
+    TaskKind,
+    TokenEvent,
+    ToolCall,
+    ToolCallsEvent,
+    UsageEvent,
+)
+from app.obs.logging import get_logger
+
+log = get_logger(__name__)
+
+# docs/05 §3.4's tier table: the merchant-facing dialogue turn gets the
+# best model; invisible bookkeeping (summary folds, classification) gets
+# the cheap one. One decision per task kind — deliberately a dumb mapping.
+_TASK_TIER: Final[dict[TaskKind, ModelTier]] = {
+    TaskKind.DIALOGUE: ModelTier.DIALOGUE,
+    TaskKind.UTILITY: ModelTier.UTILITY,
+}
+
+# Security-review HIGH, fixed: nothing bounded how many distinct
+# `tool_calls[i].index` values or how many argument bytes per index this
+# accumulator would hold — a misbehaving or compromised upstream could
+# grow it unboundedly for as long as the connection stayed open (no
+# per-call wall-clock cap exists past the TTFT deadline). The 16-tool
+# catalog (docs/10-tool-calling.md §3) bounds legitimate parallelism; a
+# generous multiple covers any real batch with headroom, and per-index
+# argument bytes are bounded well above the largest real tool schema
+# (docs/10 §3's `update_business_address`, still under 1 KB serialized).
+# Both fail loudly (house rule) rather than silently truncating.
+_MAX_TOOL_CALL_INDICES: Final = 32
+_MAX_ARGUMENT_BYTES_PER_INDEX: Final = 16_384
+
+
+@dataclass
+class _PartialToolCall:
+    """Mutable accumulator for one in-flight streamed tool call.
+
+    Deliberately not frozen: it exists to accumulate fragments and is
+    internal working state, never shared or returned — the immutability
+    rule protects the domain value objects this module *emits*
+    (`ToolCall`/`ToolCallsEvent`), which stay frozen.
+    """
+
+    id: str | None = None
+    name: str | None = None
+    argument_parts: list[str] = field(default_factory=list)
+
+
+class _ToolCallAssembler:
+    """Stitches OpenAI-compatible streamed `tool_calls` fragments back
+    into whole `ToolCall`s (the docs/05 §3.4 interface pin).
+
+    The streaming shape this decodes (pinned raw, fragment by fragment,
+    in tests/providers/test_openrouter.py): each chunk's
+    `delta.tool_calls` is a list of fragments each carrying an `index`;
+    the first fragment for an index carries `id` and `function.name`;
+    every fragment may carry a partial `function.arguments` string that
+    only parses as JSON once concatenated in arrival order.
+    """
+
+    def __init__(self) -> None:
+        self._partials: dict[int, _PartialToolCall] = {}
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._partials)
+
+    def process(self, event: LLMEvent) -> list[LLMEvent]:
+        """Map one provider event to the events the router should yield.
+
+        - `TokenEvent` without `tool_calls`: passed through untouched —
+          content/role/empty deltas are the caller's to interpret.
+        - `TokenEvent` with `tool_calls`: fragments are consumed into the
+          accumulator and NOT re-yielded (the caller must never see a raw
+          fragment). A hybrid delta carrying `content` alongside
+          fragments re-emits just the content part as a fresh TokenEvent.
+        - `UsageEvent`: flushes pending calls first, so the reassembled
+          `ToolCallsEvent` always precedes the stream-final usage frame.
+        - `ToolCallsEvent`: already whole (not something `OpenRouterLLM`
+          emits today) — passed through untouched.
+        """
+        if isinstance(event, UsageEvent):
+            out: list[LLMEvent] = []
+            if self.has_pending:
+                out.append(ToolCallsEvent(tool_calls=self.flush()))
+            out.append(event)
+            return out
+        if isinstance(event, ToolCallsEvent):
+            # Security-review LOW, hardened: an already-whole event (not
+            # something OpenRouterLLM emits today, but the Protocol
+            # admits a future provider that does) must not silently
+            # strand any partials this instance already accumulated —
+            # flush them first so nothing is dropped.
+            out = [ToolCallsEvent(tool_calls=self.flush())] if self.has_pending else []
+            out.append(event)
+            return out
+        fragments = event.delta.get("tool_calls")
+        if not fragments:
+            return [event]
+        self._feed(fragments)
+        content = event.delta.get("content")
+        if content:
+            return [TokenEvent(delta={"content": content})]
+        return []
+
+    def flush(self) -> tuple[ToolCall, ...]:
+        """Finalize every accumulated call in index order, resetting the
+        accumulator. Malformed accumulation fails loudly with full
+        context attached (house rule: never silently swallow — mirrors
+        `OpenRouterLLM`'s malformed-chunk handling one layer down)."""
+        calls: list[ToolCall] = []
+        seen_ids: set[str] = set()
+        for index in sorted(self._partials):
+            partial = self._partials[index]
+            raw_arguments = "".join(partial.argument_parts)
+            if partial.id is None or partial.name is None:
+                log.error(
+                    "llm_router.tool_call_reassembly_incomplete",
+                    index=index,
+                    tool_call_id=partial.id,
+                    tool_name=partial.name,
+                    raw_arguments=raw_arguments,
+                )
+                raise ValueError(
+                    f"streamed tool_call at index {index} ended without an id/name "
+                    f"(id={partial.id!r}, name={partial.name!r}) — first-fragment "
+                    "fields never arrived"
+                )
+            if partial.id in seen_ids:
+                # Security-review M-1: a provider that violates its own
+                # documented "id arrives only on an index's first
+                # fragment" invariant by reusing an id across indices
+                # would otherwise silently produce two ToolCalls sharing
+                # one id — corrupting tool-result correlation downstream
+                # (ToolExecutor, the follow-up LLM message). Fail loudly
+                # instead of guessing which one is real.
+                log.error(
+                    "llm_router.tool_call_id_reused_across_indices",
+                    index=index,
+                    tool_call_id=partial.id,
+                )
+                raise ValueError(
+                    f"streamed tool_call id {partial.id!r} reused across multiple "
+                    "indices — expected one id per index"
+                )
+            seen_ids.add(partial.id)
+            arguments = self._parse_arguments(partial, index, raw_arguments)
+            calls.append(ToolCall(id=partial.id, name=partial.name, arguments=arguments))
+        self._partials = {}
+        return tuple(calls)
+
+    def _feed(self, fragments: list[dict[str, Any]]) -> None:
+        for fragment in fragments:
+            index = fragment.get("index")
+            if not isinstance(index, int):
+                # Without an integer index there is nothing to key the
+                # accumulation on — fail loudly with the fragment attached
+                # rather than guessing (raw fragment is LLM output, not a
+                # secret, same logging rationale as openrouter.py).
+                log.error("llm_router.tool_call_fragment_missing_index", fragment=fragment)
+                raise ValueError(
+                    f"streamed tool_call fragment has no integer 'index': {fragment!r}"
+                )
+            if index not in self._partials and len(self._partials) >= _MAX_TOOL_CALL_INDICES:
+                log.error(
+                    "llm_router.tool_call_index_limit_exceeded",
+                    index=index,
+                    limit=_MAX_TOOL_CALL_INDICES,
+                )
+                raise ValueError(
+                    f"streamed tool_calls exceeded {_MAX_TOOL_CALL_INDICES} distinct "
+                    "indices — refusing to accumulate further (docs/10 §3's 16-tool "
+                    "catalog bounds any legitimate batch well under this)"
+                )
+            partial = self._partials.setdefault(index, _PartialToolCall())
+            if partial.id is None and fragment.get("id"):
+                partial.id = fragment["id"]
+            function = fragment.get("function") or {}
+            if partial.name is None and function.get("name"):
+                partial.name = function["name"]
+            arguments_part = function.get("arguments")
+            if arguments_part:
+                accumulated = sum(len(p) for p in partial.argument_parts) + len(arguments_part)
+                if accumulated > _MAX_ARGUMENT_BYTES_PER_INDEX:
+                    log.error(
+                        "llm_router.tool_call_argument_bytes_exceeded",
+                        index=index,
+                        tool_call_id=partial.id,
+                        accumulated=accumulated,
+                        limit=_MAX_ARGUMENT_BYTES_PER_INDEX,
+                    )
+                    raise ValueError(
+                        f"streamed tool_call at index {index} exceeded "
+                        f"{_MAX_ARGUMENT_BYTES_PER_INDEX} accumulated argument bytes"
+                    )
+                partial.argument_parts.append(arguments_part)
+
+    @staticmethod
+    def _parse_arguments(
+        partial: _PartialToolCall, index: int, raw_arguments: str
+    ) -> dict[str, Any]:
+        if not raw_arguments:
+            # A zero-argument call streams `arguments: ""` (or nothing at
+            # all) — an empty accumulation means "no arguments", which is
+            # a defined wire shape, not malformed JSON to fail on.
+            return {}
+        try:
+            arguments = orjson.loads(raw_arguments)
+        except orjson.JSONDecodeError:
+            log.error(
+                "llm_router.tool_call_arguments_malformed",
+                index=index,
+                tool_call_id=partial.id,
+                tool_name=partial.name,
+                raw_arguments=raw_arguments,
+            )
+            raise
+        if not isinstance(arguments, dict):
+            log.error(
+                "llm_router.tool_call_arguments_not_object",
+                index=index,
+                tool_call_id=partial.id,
+                tool_name=partial.name,
+                raw_arguments=raw_arguments,
+            )
+            raise ValueError(
+                f"tool_call {partial.name!r} arguments parsed to "
+                f"{type(arguments).__name__}, expected a JSON object: {raw_arguments!r}"
+            )
+        return arguments
+
+
+class LLMRouter:
+    """Implements `app.domain.interfaces.LLMRouterProto` (docs/05 §3.4)
+    on top of an injected `LLMProvider` — model IDs and fallback slugs
+    come from `Settings`, never constants (canon §5)."""
+
+    def __init__(self, provider: LLMProvider, settings: Settings) -> None:
+        self._provider = provider
+        self._settings = settings
+
+    def route(self, task: TaskKind) -> ModelTier:
+        """docs/05 §3.4's tier table — see `_TASK_TIER`."""
+        return _TASK_TIER[task]
+
+    async def stream(
+        self,
+        messages: list[Message],
+        *,
+        tier: ModelTier,
+        tools: list[dict[str, Any]] | None = None,
+        ttft_deadline_s: float = 1.5,
+    ) -> AsyncIterator[LLMEvent]:
+        """Stream one completion: adapt to wire shape, apply the TTFT
+        deadline/one-retry policy, pass content `TokenEvent`s and the
+        final `UsageEvent` through (the caller hands usage to
+        CostTracker), and yield reassembled `ToolCallsEvent`s in place of
+        raw tool-call fragments. See the module docstring for the policy
+        scope and judgment calls."""
+        wire_messages = [message.to_wire() for message in messages]
+        models = self._models_for(tier)
+        upstream, first = await self._open_with_ttft_retry(
+            wire_messages, models=models, tools=tools, ttft_deadline_s=ttft_deadline_s
+        )
+        assembler = _ToolCallAssembler()
+        try:
+            if first is not None:
+                for out_event in assembler.process(first):
+                    yield out_event
+                async for event in upstream:
+                    for out_event in assembler.process(event):
+                        yield out_event
+            if assembler.has_pending:
+                # Stream ended without a usage frame — flush at end of
+                # stream so accumulated calls are never dropped.
+                yield ToolCallsEvent(tool_calls=assembler.flush())
+        finally:
+            # The consumer may abandon this generator mid-stream
+            # (aclose()); closing the provider stream here keeps the
+            # underlying HTTP response from leaking. No-op when the
+            # stream is already exhausted.
+            await _close_quietly(upstream)
+
+    def _models_for(self, tier: ModelTier) -> list[str]:
+        """docs/05 §3.4: dialogue rides the fallback array (primary +
+        configured fallbacks, `Settings.dialogue_models`); utility is the
+        single cheap model with no fallback array of its own — every
+        utility task is off the merchant-audible path."""
+        if tier is ModelTier.DIALOGUE:
+            return self._settings.dialogue_models
+        return [self._settings.openrouter_utility_model]
+
+    async def _open_with_ttft_retry(
+        self,
+        wire_messages: list[dict[str, Any]],
+        *,
+        models: list[str],
+        tools: list[dict[str, Any]] | None,
+        ttft_deadline_s: float,
+    ) -> tuple[AsyncIterator[LLMEvent], LLMEvent | None]:
+        """Open the provider stream and await its first event under the
+        TTFT deadline (docs/05 §3.4: no first token by 1.5 s -> retry
+        once, same tier). Returns the live iterator plus its first event
+        (`None` = the stream legitimately ended with no events at all).
+
+        A stalled first attempt is closed and retried exactly once; a
+        retry that stalls (TimeoutError) or errors propagates after its
+        stream is closed — see the module docstring for why degrade
+        lives with the caller."""
+        upstream = await self._open_stream(wire_messages, models=models, tools=tools)
+        try:
+            return upstream, await _first_event(upstream, ttft_deadline_s)
+        except TimeoutError:
+            log.warning(
+                "llm_router.ttft_deadline_exceeded",
+                ttft_deadline_s=ttft_deadline_s,
+                models=models,
+                attempt=1,
+            )
+            await _close_quietly(upstream)
+        except BaseException:
+            # Code-review MEDIUM, fixed: only TimeoutError closed the
+            # first attempt's stream; a CancelledError from the router's
+            # own generator being aclose()'d while still awaiting the
+            # first token (a realistic barge-in/hangup-during-TTFT
+            # scenario) propagated straight out, before stream()'s own
+            # try/finally is even entered. Now symmetric with the retry
+            # branch below.
+            await _close_quietly(upstream)
+            raise
+        retry_upstream = await self._open_stream(wire_messages, models=models, tools=tools)
+        try:
+            return retry_upstream, await _first_event(retry_upstream, ttft_deadline_s)
+        except BaseException:
+            await _close_quietly(retry_upstream)
+            raise
+
+    async def _open_stream(
+        self,
+        wire_messages: list[dict[str, Any]],
+        *,
+        models: list[str],
+        tools: list[dict[str, Any]] | None,
+    ) -> AsyncIterator[LLMEvent]:
+        """Open one provider stream. `LLMProvider.stream`'s
+        `async def ... -> AsyncIterator` Protocol spelling admits two
+        legal implementations: an async *generator* (OpenRouterLLM,
+        FakeLLM — calling it returns the iterator directly, un-awaited)
+        or a plain coroutine that must be awaited to obtain the iterator.
+        Accept both rather than baking in the generator form — the cast
+        reconciles mypy's coroutine reading of the Protocol with the
+        generator reality of every current implementation."""
+        result: Any = self._provider.stream(wire_messages, models=models, tools=tools)
+        if inspect.iscoroutine(result):
+            result = await result
+        return aiter(cast("AsyncIterator[LLMEvent]", result))
+
+
+async def _first_event(
+    upstream: AsyncIterator[LLMEvent], deadline_s: float
+) -> LLMEvent | None:
+    """First event under the TTFT deadline. Raises `TimeoutError` on a
+    stall (`asyncio.wait_for` also cancels the pending `anext`, which
+    unwinds the provider generator at its await point); returns `None`
+    when the stream ends before yielding anything."""
+    try:
+        return await asyncio.wait_for(anext(upstream), timeout=deadline_s)
+    except StopAsyncIteration:
+        return None
+
+
+async def _close_quietly(upstream: AsyncIterator[LLMEvent]) -> None:
+    """Best-effort `aclose()` of a provider stream being walked away from
+    (a stalled first attempt, an errored retry, or a consumer that closed
+    the router's own generator mid-stream).
+
+    Deliberate, narrow exception to the never-swallow rule: a failure to
+    close an already-abandoned stream is logged and dropped — raising
+    here would mask the TTFT retry (or the original error) the caller
+    actually cares about."""
+    aclose = getattr(upstream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:
+        log.warning("llm_router.abandoned_stream_close_failed", error=str(exc))
+
+
+__all__ = ["LLMRouter"]

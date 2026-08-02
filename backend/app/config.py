@@ -43,6 +43,23 @@ class Settings(BaseSettings):
     # comma-separated fallback slugs, e.g. "openai/gpt-5.1,google/gemini-3-pro"
     openrouter_dialogue_fallbacks: str = ""
 
+    # LLM pricing, USD per MILLION tokens — config, never constants in
+    # CostTracker logic (canon §5; added by task 4.3). Defaults are the
+    # standard list prices docs/05 §3.4's table headlines (Sonnet 5 $3/M
+    # in, $15/M out; Haiku 4.5 $1/M in, $5/M out), NOT the temporary intro
+    # discount ($2/$10 through 2026-08-31): a deployment on the discount
+    # overrides via env rather than a hardcoded default silently going
+    # stale on expiry. Cached-input reads are priced at 0.1x the base
+    # input rate — Anthropic's published prompt-caching cache-read
+    # multiplier (assumption documented per task 4.3; docs/05 §3.4's
+    # table gives no cached price of its own).
+    llm_dialogue_input_usd_per_mtok: Decimal = Decimal("3.00")
+    llm_dialogue_cached_input_usd_per_mtok: Decimal = Decimal("0.30")
+    llm_dialogue_output_usd_per_mtok: Decimal = Decimal("15.00")
+    llm_utility_input_usd_per_mtok: Decimal = Decimal("1.00")
+    llm_utility_cached_input_usd_per_mtok: Decimal = Decimal("0.10")
+    llm_utility_output_usd_per_mtok: Decimal = Decimal("5.00")
+
     otel_exporter_otlp_endpoint: str | None = None
     otel_service_name: str = "agent-api"
 
