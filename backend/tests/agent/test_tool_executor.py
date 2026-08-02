@@ -20,9 +20,11 @@ from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
 
+import asyncpg.exceptions
 import pytest
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
+from structlog.testing import capture_logs
 
 import app.tools  # noqa: F401 -- import side effect: registers the 3 Phase-2 tools
 from app.agent.safety_layer import SafetyLayer
@@ -97,10 +99,21 @@ class _FakeSession:
     `_FakeSessionmaker`-shared set (a real UNIQUE index is enforced across
     the whole table, not scoped to one session/transaction)."""
 
-    def __init__(self, committed_idempotency_keys: set[str]) -> None:
+    def __init__(
+        self,
+        committed_idempotency_keys: set[str],
+        *,
+        force_integrity_error: Exception | None = None,
+    ) -> None:
         self.added: list[Any] = []
         self.commit_count = 0
         self._committed_idempotency_keys = committed_idempotency_keys
+        # Test-only escape hatch (security-review MEDIUM regression
+        # coverage): lets a test simulate an IntegrityError that is NOT
+        # the idempotency_key UNIQUE violation — e.g. a differently-typed
+        # driver exception — to prove _audit's expect_duplicate path
+        # only swallows the specific violation it's meant to.
+        self._force_integrity_error = force_integrity_error
 
     async def __aenter__(self) -> _FakeSession:
         return self
@@ -112,10 +125,24 @@ class _FakeSession:
         self.added.append(entity)
 
     async def flush(self) -> None:
+        if self._force_integrity_error is not None:
+            raise self._force_integrity_error
         for entity in self.added:
             key = getattr(entity, "idempotency_key", None)
             if key is not None and key in self._committed_idempotency_keys:
-                raise IntegrityError("duplicate idempotency_key", None, Exception(key))
+                # `.orig` is a real asyncpg.exceptions.UniqueViolationError,
+                # not a generic Exception — tool_executor.py's
+                # expect_duplicate path checks the driver-level exception
+                # TYPE (SQLSTATE 23505), not just IntegrityError generically,
+                # so the fake must mirror that shape to exercise it for real.
+                raise IntegrityError(
+                    "duplicate idempotency_key",
+                    None,
+                    asyncpg.exceptions.UniqueViolationError(
+                        f"duplicate key value violates unique constraint "
+                        f'"tool_invocations_idempotency_key_key": {key!r}'
+                    ),
+                )
             if getattr(entity, "invocation_id", None) is None:
                 entity.invocation_id = uuid4()
             if key is not None:
@@ -131,9 +158,12 @@ class _FakeSessionmaker:
         # Shared across every session this maker hands out — a real
         # UNIQUE index spans the whole table, not one transaction.
         self._committed_idempotency_keys: set[str] = set()
+        self.force_integrity_error: Exception | None = None
 
     def __call__(self) -> _FakeSession:
-        session = _FakeSession(self._committed_idempotency_keys)
+        session = _FakeSession(
+            self._committed_idempotency_keys, force_integrity_error=self.force_integrity_error
+        )
         self.sessions.append(session)
         return session
 
@@ -553,6 +583,46 @@ async def test_matching_reproposal_keeps_original_pending_anchor(
     rows = _audit_rows(sessionmaker)
     assert [row.status for row in rows] == ["pending_confirm", "pending_confirm"]
     assert rows[1].idempotency_key == f"{_SESSION_ID}:fake_limit:6"
+
+
+async def test_hold_gate_audit_only_swallows_the_unique_violation_not_other_integrity_errors(
+    executor: ToolExecutor,
+    fake_redis: _FakeRedisClient,
+    sessionmaker: _FakeSessionmaker,
+    principal: SessionUser,
+) -> None:
+    """Security review MEDIUM (found independently by two review passes on
+    the fix below): `_audit`'s `expect_duplicate=True` path must only
+    swallow the SPECIFIC `idempotency_key` UNIQUE violation
+    (`asyncpg.exceptions.UniqueViolationError`), not any `IntegrityError`
+    — a differently-typed driver exception (e.g. simulating a future
+    constraint or a FK violation) must still take the loud
+    `log.exception` path, never the silent info-level
+    `tool_audit_duplicate_hold_skipped` one."""
+    _register_confirm_tool("fake_limit")
+    sessionmaker.force_integrity_error = IntegrityError(
+        "simulated non-unique constraint violation",
+        None,
+        asyncpg.exceptions.ForeignKeyViolationError("simulated FK violation"),
+    )
+
+    with capture_logs() as logs:
+        results = await executor.execute(
+            [_call("fake_limit", {"current_limit": 25000, "requested_limit": 50000})],
+            principal=principal,
+            session_id=_SESSION_ID,
+            turn_no=10,
+        )
+
+    # The pipeline still degrades gracefully (never raises to the
+    # caller — `_audit` is best-effort by design) but the LOG must be
+    # loud, not the silent "expected duplicate" path.
+    assert results[0].status == ToolInvocationStatus.PENDING_CONFIRM
+    duplicate_skipped = [e for e in logs if e["event"] == "tool_audit_duplicate_hold_skipped"]
+    failed = [e for e in logs if e["event"] == "tool_audit_write_failed"]
+    assert duplicate_skipped == []
+    assert len(failed) == 1
+    assert failed[0]["log_level"] == "error"
 
 
 async def test_same_turn_reproposal_never_executes_and_writes_no_second_audit_row(
