@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from opentelemetry.trace import Status, StatusCode
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -60,8 +61,10 @@ from app.domain.types import ContextBundle, Message, Session
 from app.memory.session_memory import SessionMemory
 from app.models import Merchant
 from app.obs.logging import get_logger
+from app.obs.tracing import SPAN_CONTEXT_BUILD, get_tracer, safe_set_attribute
 
 log = get_logger(__name__)
+tracer = get_tracer(__name__)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -114,16 +117,45 @@ class ContextBuilder:
         self._business_rules = _load_prompt("business_rules.md")
 
     async def build(self, session: Session, *, current_utterance: str) -> ContextBundle:
-        user_profile = await self._build_user_profile(session.user_id)
-        conversation = await self._get_window(session.session_id)
-        return ContextBundle(
-            persona=self._persona,
-            business_rules=self._business_rules,
-            user_profile=user_profile,
-            # slots 4-7 stay at their "" defaults (Phase 4/5 scope)
-            conversation=tuple(conversation),
-            current_utterance=current_utterance,
-        )
+        # docs/04 §7.2's context.build span (previously deferred — see
+        # this module's git history). `session_id` is the one canon
+        # attribute this call site genuinely has: there's no
+        # prompt-prefix cache hit/miss signal anywhere in this class
+        # (judgment call #1 loads persona/business_rules once at
+        # construction, but never records a per-call hit/miss check) —
+        # `cache_hit` is deliberately NOT set here rather than forced to
+        # a guessed value.
+        #
+        # record_exception=False/set_status_on_exception=False (security
+        # review LOW, applied for consistency with llm_router.py's two
+        # spans, which fixed the same class of leak as a HIGH): OTel's
+        # defaults would attach str(exc) + a traceback verbatim to the
+        # span on any uncaught exception. Today _build_user_profile and
+        # _get_window each catch their full expected exception surface
+        # internally, so nothing content-bearing reaches this boundary —
+        # but that's an invariant of THOSE methods' except tuples, not of
+        # this span, and a future uncaught exception type (or a
+        # ContextBundle field constraint whose ValidationError echoes
+        # merchant data) would silently reopen the leak. The except
+        # branch below records the exception's TYPE NAME only.
+        with tracer.start_as_current_span(
+            SPAN_CONTEXT_BUILD, record_exception=False, set_status_on_exception=False
+        ) as span:
+            safe_set_attribute(span, "session_id", session.session_id)
+            try:
+                user_profile = await self._build_user_profile(session.user_id)
+                conversation = await self._get_window(session.session_id)
+                return ContextBundle(
+                    persona=self._persona,
+                    business_rules=self._business_rules,
+                    user_profile=user_profile,
+                    # slots 4-7 stay at their "" defaults (Phase 4/5 scope)
+                    conversation=tuple(conversation),
+                    current_utterance=current_utterance,
+                )
+            except Exception as exc:
+                span.set_status(Status(StatusCode.ERROR, description=type(exc).__name__))
+                raise
 
     async def _build_user_profile(self, merchant_id: str) -> str:
         # _format_profile inside the try (review MEDIUM): today every

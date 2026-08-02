@@ -39,21 +39,78 @@ Judgment calls, flagged per house style:
   any content, followed by the stream-final usage frame — pending calls
   are flushed immediately before the `UsageEvent` (so the caller sees
   whole calls, then usage) or at end of stream, whichever comes first.
-- **No spans opened here.** `llm.ttft`/`llm.total` (docs/04 §7.2) wrap
-  the whole turn's LLM stage and belong to ConversationManager's turn
-  orchestration (a later task); this module stays span-free rather than
-  guessing at that structure.
+- **`llm.total`/`llm.ttft` are opened here, not by ConversationManager.**
+  Earlier revisions of this docstring deferred span-opening to a later
+  task; this is that task. `llm.total` wraps this whole `stream()` call
+  (the async-generator body, closed via the existing try/finally so it
+  covers normal completion, an error, and an early `aclose()` alike);
+  `llm.ttft` nests inside it and wraps only `_open_with_ttft_retry(...)`
+  — the deadline/retry policy's own span, distinct from the full-stream
+  one. `model` is recorded on either span only once a `UsageEvent` (the
+  only `LLMEvent` shape carrying `.model`, per app/domain/types.py) has
+  actually been observed — `TokenEvent` doesn't carry it, so a stream
+  whose first event is content-only genuinely doesn't know the served
+  model yet at TTFT time. `cost_usd`/token counts stay off both spans:
+  this module sees the raw provider `usage` dict but never prices it
+  (CostTracker owns that, per the paragraph above), so setting them here
+  would either duplicate `CostTracker.record_turn`'s parsing of that same
+  dict (already recorded, on the enclosing `turn` span the caller passes
+  it) or risk disagreeing with it.
+- **Both spans disable OTel's default exception recording** (security
+  review HIGH, fixed): `start_as_current_span(..., record_exception=False,
+  set_status_on_exception=False)`. The SDK default would otherwise attach
+  `str(exc)` and a full traceback to the span on any uncaught exception —
+  `_ToolCallAssembler`'s own `ValueError`s (malformed tool-call fragments)
+  embed the raw fragment/argument text verbatim, which for a
+  money-moving agent can contain amounts or account numbers, exported
+  unredacted via Phase 2's default `ConsoleSpanExporter(out=sys.stderr)`
+  (`app/obs/tracing.py`'s own module docstring warns about exactly this).
+  Each `with`-block instead catches its own exceptions narrowly and sets
+  `Status(StatusCode.ERROR, description=type(exc).__name__)` — the
+  exception's TYPE name only, never its message or traceback — before
+  re-raising, so the span still shows *that* something failed without
+  ever carrying *what* the failure said. This sanitizing only covers
+  `llm.total`/`llm.ttft` themselves — the re-raised exception still
+  carries its original, unredacted `str(exc)`. An ANCESTOR span whose
+  own `start_as_current_span` still uses OTel's defaults would
+  independently re-apply its own `record_exception`/`set_status_on_exception`
+  and re-leak the same content one level up. Not exploitable today: the
+  only caller, `ConversationManager.on_stt_final`, catches every
+  exception from `_run_turn(...)` *inside* `SPAN_TURN`'s own `with`-block
+  before it ever reaches that span's boundary. But this makes the
+  guarantee an unenforced cross-file invariant — any future direct
+  caller of `stream()` under a default-configured ancestor span would
+  silently reopen this exact leak.
+- **The consumer-side closing requirement** (code review HIGH, found
+  here and CLOSED in this same PR once the confirm-gate fix merged and
+  unblocked editing the call site): `llm.total`'s span closes correctly
+  when the CONSUMER of `stream()` closes the generator from the same
+  task/context it iterates in — verified against the real
+  opentelemetry-sdk. It does NOT close correctly if a consumer's loop
+  body raises WITHOUT closing the generator first (Python's
+  async-generator finalizer then throws `GeneratorExit` from a
+  different task with its own copied `contextvars.Context`, and the
+  span's `context.detach()` fails against that mismatched Context — the
+  span silently never exports). Every consumer must therefore wrap
+  stream consumption in `contextlib.aclosing()`. The one Phase-2
+  consumer, `ConversationManager._run_tool_loop`, now does (its
+  judgment call #12), with a regression test proving the close happens
+  synchronously (`test_max_reply_chars_guard_closes_the_stream_
+  synchronously`). Any FUTURE direct caller of `stream()` inherits this
+  requirement — that's what this note is for.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Final, cast
 
 import orjson
+from opentelemetry.trace import Span, Status, StatusCode
 
 from app.config import Settings
 from app.domain.interfaces import LLMProvider
@@ -68,8 +125,10 @@ from app.domain.types import (
     UsageEvent,
 )
 from app.obs.logging import get_logger
+from app.obs.tracing import SPAN_LLM_TOTAL, SPAN_LLM_TTFT, get_tracer, safe_set_attribute
 
 log = get_logger(__name__)
+tracer = get_tracer(__name__)
 
 # docs/05 §3.4's tier table: the merchant-facing dialogue turn gets the
 # best model; invisible bookkeeping (summary folds, classification) gets
@@ -318,18 +377,123 @@ class LLMRouter:
         final `UsageEvent` through (the caller hands usage to
         CostTracker), and yield reassembled `ToolCallsEvent`s in place of
         raw tool-call fragments. See the module docstring for the policy
-        scope and judgment calls."""
+        scope, judgment calls, and the `llm.total`/`llm.ttft` span
+        boundaries (module docstring)."""
         wire_messages = [message.to_wire() for message in messages]
         models = self._models_for(tier)
-        upstream, first = await self._open_with_ttft_retry(
-            wire_messages, models=models, tools=tools, ttft_deadline_s=ttft_deadline_s
-        )
+        # llm.total wraps the ENTIRE call — opened here, closed on every
+        # exit path via the try/except below plus _forward_events' own
+        # try/finally (normal completion, an error, or the consumer
+        # aclose()-ing this generator early). A `with`-block's __exit__
+        # fires correctly across an async generator's yield points as
+        # long as the generator eventually resumes to one of those three
+        # outcomes (verified against the real opentelemetry-sdk with a
+        # standalone repro — see the module docstring's consumer-side
+        # closing-requirement note: consumers must close via
+        # contextlib.aclosing() from their own task, which the one
+        # Phase-2 consumer now does).
+        with tracer.start_as_current_span(
+            SPAN_LLM_TOTAL, record_exception=False, set_status_on_exception=False
+        ) as total_span:
+            safe_set_attribute(total_span, "tier", tier.value)
+            try:
+                upstream, first = await self._open_ttft_span(
+                    wire_messages,
+                    models=models,
+                    tools=tools,
+                    ttft_deadline_s=ttft_deadline_s,
+                    tier=tier,
+                )
+                # Security review HIGH, fixed: `async for event in
+                # self._forward_events(...): yield event` does NOT
+                # propagate this generator's own `.aclose()`/GeneratorExit
+                # into `_forward_events`' generator synchronously — bare
+                # `async for` only drops the reference, leaving asyncio's
+                # async-generator finalizer to schedule its `.aclose()`
+                # on a LATER event-loop tick. That deferred close ran
+                # AFTER total_span already closed (in this same `with`
+                # block, synchronously), so `_forward_events`' own
+                # `finally` (the `model` attribute write + closing
+                # `upstream`) either landed on an already-ended span
+                # (silently dropped — the SDK logs "Setting attribute on
+                # ended span") or closed the upstream HTTP response one
+                # tick late — both verified empirically with a standalone
+                # repro before relying on this. `async with
+                # contextlib.aclosing(...)` compiles to an in-frame
+                # try/finally, so its `__aexit__` (and therefore
+                # `_forward_events`' own `finally`) runs synchronously as
+                # part of THIS generator's own close, not deferred.
+                async with contextlib.aclosing(
+                    self._forward_events(upstream, first, total_span)
+                ) as events:
+                    async for event in events:
+                        yield event
+            except Exception as exc:
+                # Security review HIGH, fixed: never let str(exc)/the
+                # traceback reach the span (module docstring) — the type
+                # name alone is enough to see that this call failed.
+                total_span.set_status(Status(StatusCode.ERROR, description=type(exc).__name__))
+                raise
+
+    async def _open_ttft_span(
+        self,
+        wire_messages: list[dict[str, Any]],
+        *,
+        models: list[str],
+        tools: list[dict[str, Any]] | None,
+        ttft_deadline_s: float,
+        tier: ModelTier,
+    ) -> tuple[AsyncIterator[LLMEvent], LLMEvent | None]:
+        """llm.ttft: wraps only the TTFT deadline/retry policy's own
+        call, not the rest of the stream — extracted from `stream()` to
+        keep that method's nesting within house style (code-review
+        HIGH)."""
+        with tracer.start_as_current_span(
+            SPAN_LLM_TTFT, record_exception=False, set_status_on_exception=False
+        ) as ttft_span:
+            safe_set_attribute(ttft_span, "tier", tier.value)
+            try:
+                upstream, first = await self._open_with_ttft_retry(
+                    wire_messages, models=models, tools=tools, ttft_deadline_s=ttft_deadline_s
+                )
+            except Exception as exc:
+                ttft_span.set_status(Status(StatusCode.ERROR, description=type(exc).__name__))
+                raise
+            # `model` (which model in the fallback array actually served
+            # the request) is only knowable once a `UsageEvent` has been
+            # seen — `TokenEvent` carries no `model` field
+            # (app/domain/types.py). The common case (first event is
+            # streamed content) genuinely doesn't know it yet; omit
+            # rather than guess.
+            if isinstance(first, UsageEvent):
+                safe_set_attribute(ttft_span, "model", first.model)
+            return upstream, first
+
+    async def _forward_events(
+        self,
+        upstream: AsyncIterator[LLMEvent],
+        first: LLMEvent | None,
+        total_span: Span,
+    ) -> AsyncGenerator[LLMEvent, None]:
+        """Reassembles tool-call fragments and forwards events; records
+        the served model on `total_span` and closes `upstream` on every
+        exit path. Extracted from `stream()` to keep that method's
+        nesting within house style (code-review HIGH) — this generator
+        opens no span of its own (no `context.attach()`/`detach()`
+        pairing happens here), so its cleanup is safe to run from any
+        task/context, unlike `total_span`'s own `with`-block in the
+        caller."""
         assembler = _ToolCallAssembler()
+        served_model: str | None = None
         try:
             if first is not None:
+                if isinstance(first, UsageEvent):
+                    served_model = first.model
                 for out_event in assembler.process(first):
                     yield out_event
                 async for event in upstream:
+                    if isinstance(event, UsageEvent):
+                        served_model = event.model
                     for out_event in assembler.process(event):
                         yield out_event
             if assembler.has_pending:
@@ -337,6 +501,10 @@ class LLMRouter:
                 # stream so accumulated calls are never dropped.
                 yield ToolCallsEvent(tool_calls=assembler.flush())
         finally:
+            # Record before closing the span — set_attribute on an
+            # already-ended span is a silent no-op in the SDK.
+            if served_model is not None:
+                safe_set_attribute(total_span, "model", served_model)
             # The consumer may abandon this generator mid-stream
             # (aclose()); closing the provider stream here keeps the
             # underlying HTTP response from leaking. No-op when the
