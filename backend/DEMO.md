@@ -15,12 +15,22 @@ will, over stdin/stdout instead of an audio pipeline.
 
 ## Setup
 
+The compose file lives at the **repo root**, not in `backend/` — start it
+first, from a separate terminal or before changing directory:
+
 ```bash
-cd backend
+# from the repo root
+docker compose up -d postgres redis
+```
+
+Everything else assumes `backend/` as the working directory
+(`alembic.ini`, the `scripts` package, and `.env` all live there):
+
+```bash
+# from backend/
 cp .env.example .env
 # edit .env — set OPENROUTER_API_KEY to a real key
 
-docker compose up -d postgres redis     # from the repo root
 alembic upgrade head
 python -m scripts.seed
 ```
@@ -96,7 +106,8 @@ the full post-call audit trail.
   stdout; expect JSON log lines mixed into the `You:`/`Asha:` exchange,
   especially at `LOG_LEVEL=DEBUG`.
 - **No Grafana trace at the end.** The roadmap's "ending on the Grafana
-  trace for the turn" is a Phase 6 observability-stack milestone; Phase
-  2's substitute is the printed session id plus the OpenTelemetry spans
+  trace for the turn" is a Phase 5 milestone (docs/17-roadmap.md §2.5 —
+  Grafana dashboards over Tempo traces); Phase 2's substitute is the
+  printed session id plus the OpenTelemetry spans
   (`turn`, `tool.exec.<name>`) already being emitted to whatever
   `OTEL_EXPORTER_OTLP_ENDPOINT` is configured (or the console, if unset).

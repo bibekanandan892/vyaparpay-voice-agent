@@ -16,9 +16,12 @@ For a guided walkthrough of the demo, see [DEMO.md](DEMO.md).
 
 ```
 app/
+├── main.py         # ASGI entrypoint (Dockerfile CMD: uvicorn app.main:app) —
+│                   #   thin re-export shim over app/api/main.py's create_app()
 ├── api/            # FastAPI app factory, middleware, REST routes
 │   ├── main.py     #   create_app() + lifespan (builds every process singleton)
 │   ├── middleware.py   # RequestId -> Tracing -> Auth -> ErrorEnvelope
+│   ├── errors.py   #   AppError hierarchy + error/success envelope (shared with tools/)
 │   ├── deps.py     #   get_db, require_rate_limit, JWT verification
 │   └── routes/     #   health, wallet, payments, limits
 ├── agent/          # The agent brain (docs/05 §3) — one module per component
@@ -33,6 +36,7 @@ app/
 │   └── prompts/                # persona.md, business_rules.md (doc-verbatim prompt text)
 ├── tools/          # @tool registry + one module per business tool
 │   ├── registry.py             # @tool decorator, allowlist, tool-invocation bridge
+│   ├── errors.py                # validation/business/timeout error-shape builders
 │   ├── get_wallet_balance.py
 │   ├── get_payment_status.py
 │   └── request_limit_increase.py
@@ -48,7 +52,7 @@ scripts/
 ├── seed.py         # Idempotent demo fixture seeder (Rajesh/Kumar General Store/...)
 └── demo_cli.py     # Text REPL harness — stands in for the Phase-3 voice transport
 tests/
-├── agent/, api/, data/, models/, obs/, providers/, scripts/, tools/   # unit tests
+├── agent/, api/, data/, memory/, models/, obs/, providers/, scripts/, tools/  # unit tests
 └── e2e/            # test_canonical_conversation.py — the full 9-turn replay
 ```
 
@@ -57,9 +61,19 @@ Everything above is real, merged code — this map replaced Phase 1's
 
 ## Quickstart
 
+The compose file lives at the **repo root**, one level up from `backend/`
+— everything else below assumes `backend/` as the working directory
+(`alembic.ini`, `pyproject.toml`'s `scripts` package, and `.env` all live
+there). Two working directories, two steps:
+
 ```bash
-cp .env.example .env          # fill in OPENROUTER_API_KEY at minimum
+# from the repo root
 docker compose up -d postgres redis
+```
+
+```bash
+# from backend/
+cp .env.example .env          # fill in OPENROUTER_API_KEY at minimum
 alembic upgrade head
 python -m scripts.seed
 ```
@@ -69,11 +83,13 @@ Then either run the test suite or the interactive demo (see
 
 ## Development
 
+All commands below assume `backend/` as the working directory.
+
 ```bash
 pip install -e ".[dev]"
 
 pytest tests                  # unit tests: no Docker required
-pytest tests/models            # + tests/e2e — need Docker (testcontainers Postgres)
+pytest tests/models tests/e2e  # testcontainers-gated: need Docker (Postgres)
 ruff check .
 mypy app
 ```
