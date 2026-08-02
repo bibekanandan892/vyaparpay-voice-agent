@@ -125,6 +125,7 @@ tests/models/test_orm.py itself already establishes for this project.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -146,7 +147,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from testcontainers.postgres import PostgresContainer
 
 import app.tools  # noqa: F401 -- import side effect: registers the 3 Phase-2 tools
-import app.tools.registry as registry_module
 from app.agent import conversation_manager as conversation_manager_module
 from app.agent.context_builder import ContextBuilder
 from app.agent.conversation_manager import ConversationManager
@@ -466,7 +466,18 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
     setup_observability(settings, exporter=exporter)
 
     engine, sessionmaker = create_engine_and_sessionmaker(settings)
-    sessionmaker_snapshot = registry_module._sessionmaker  # type: ignore[attr-defined]
+    # `import app.tools.registry as X` resolves to the Registry() INSTANCE,
+    # not the module (app/tools/__init__.py's `from app.tools.registry
+    # import registry` overwrites the `app.tools.registry` attribute with
+    # it) — a footgun already documented in app/tools/registry.py's own
+    # module docstring, and fixed the same way here: importlib.import_module
+    # bypasses attribute lookup entirely and returns the real module, whose
+    # `_sessionmaker` global is what ToolExecutor's constructor sets via
+    # `configure()` and what this fixture needs to save/restore. Verified
+    # empirically (not assumed) that the plain `import ... as` form here
+    # would have raised AttributeError on the very next line.
+    registry_module = importlib.import_module("app.tools.registry")
+    sessionmaker_snapshot = registry_module._sessionmaker
     try:
         # -- Seed the canonical fixtures (in-process, via the real seed
         # module's entry point — docs/12 §8) -------------------------
@@ -870,7 +881,7 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         }
         assert len(spans) == _EXPECTED_CONVERSATION_TURN_SPANS + len(tool_exec_spans)
     finally:
-        registry_module._sessionmaker = sessionmaker_snapshot  # type: ignore[attr-defined]
+        registry_module._sessionmaker = sessionmaker_snapshot
         await engine.dispose()
 
 
