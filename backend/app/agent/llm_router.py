@@ -69,7 +69,18 @@ Judgment calls, flagged per house style:
   `Status(StatusCode.ERROR, description=type(exc).__name__)` — the
   exception's TYPE name only, never its message or traceback — before
   re-raising, so the span still shows *that* something failed without
-  ever carrying *what* the failure said.
+  ever carrying *what* the failure said. This sanitizing only covers
+  `llm.total`/`llm.ttft` themselves — the re-raised exception still
+  carries its original, unredacted `str(exc)`. An ANCESTOR span whose
+  own `start_as_current_span` still uses OTel's defaults would
+  independently re-apply its own `record_exception`/`set_status_on_exception`
+  and re-leak the same content one level up. Not exploitable today: the
+  only caller, `ConversationManager.on_stt_final`, catches every
+  exception from `_run_turn(...)` *inside* `SPAN_TURN`'s own `with`-block
+  before it ever reaches that span's boundary. But this makes the
+  guarantee an unenforced cross-file invariant — any future direct
+  caller of `stream()` under a default-configured ancestor span would
+  silently reopen this exact leak.
 - **KNOWN OPEN GAP, not fixed in this revision** (code review HIGH,
   tracked, not silently missed): `llm.total`'s span correctly closes when
   the CONSUMER of `stream()` calls `.aclose()` in the same task/context
