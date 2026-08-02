@@ -87,6 +87,16 @@ _SAFE_SPAN_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
         "input_tokens",
         "output_tokens",
         "cost_usd",
+        # Added by task 5.1 (ConversationManager's `turn` span): the id is
+        # already on every structlog line for the same call, and the five
+        # turn.* flags are booleans — nothing here can carry an account
+        # fact or PII.
+        "session_id",
+        "turn.affirmed",
+        "turn.failed",
+        "turn.tool_loop_bound_hit",
+        "turn.output_blocked",
+        "turn.over_budget",
     }
 )
 
