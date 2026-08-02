@@ -14,6 +14,8 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -295,3 +297,71 @@ def test_persona_md_bytes_are_pinned_verbatim() -> None:
 
 def test_business_rules_md_bytes_are_pinned_verbatim() -> None:
     assert _prompt_file_sha256("business_rules.md") == _BUSINESS_RULES_SHA256
+
+
+# --------------------------------------------------------------------------
+# context.build span (docs/04 §7.2 — previously never opened, see git
+# history). Real exported spans via `span_exporter` (tests/conftest.py),
+# not just "the context manager didn't raise" — same bar
+# tests/obs/test_tracing.py sets.
+# --------------------------------------------------------------------------
+
+
+async def test_build_opens_a_context_build_span(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    builder = make_builder()
+
+    await builder.build(make_call_session(), current_utterance="hi")
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["context.build"]
+
+
+async def test_context_build_span_records_session_id(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    builder = make_builder()
+
+    await builder.build(make_call_session(), current_utterance="hi")
+
+    otel_trace.get_tracer_provider().force_flush()
+    span = span_exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    assert span.attributes.get("session_id") == "sess_1"
+
+
+async def test_context_build_span_does_not_force_a_cache_hit_attribute(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """ContextBuilder has no prompt-prefix cache hit/miss signal anywhere
+    in the class (it loads persona/business_rules once at construction,
+    never re-checks per call) — `cache_hit` must never appear on this
+    span as a guessed value."""
+    builder = make_builder()
+
+    await builder.build(make_call_session(), current_utterance="hi")
+
+    otel_trace.get_tracer_provider().force_flush()
+    span = span_exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    assert "cache_hit" not in span.attributes
+
+
+async def test_context_build_span_still_closes_when_the_db_degrades(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """A degraded-slot path (judgment call #3) must not leave the span
+    open or unexported — the span wraps the whole call, error or not."""
+    db = make_db_session()
+    db.get.side_effect = SQLAlchemyError("connection refused")
+    builder = make_builder(db_session=db)
+
+    bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert bundle.user_profile == _PROFILE_UNAVAILABLE
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["context.build"]
+    assert spans[0].end_time is not None

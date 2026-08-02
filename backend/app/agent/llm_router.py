@@ -39,10 +39,23 @@ Judgment calls, flagged per house style:
   any content, followed by the stream-final usage frame — pending calls
   are flushed immediately before the `UsageEvent` (so the caller sees
   whole calls, then usage) or at end of stream, whichever comes first.
-- **No spans opened here.** `llm.ttft`/`llm.total` (docs/04 §7.2) wrap
-  the whole turn's LLM stage and belong to ConversationManager's turn
-  orchestration (a later task); this module stays span-free rather than
-  guessing at that structure.
+- **`llm.total`/`llm.ttft` are opened here, not by ConversationManager.**
+  Earlier revisions of this docstring deferred span-opening to a later
+  task; this is that task. `llm.total` wraps this whole `stream()` call
+  (the async-generator body, closed via the existing try/finally so it
+  covers normal completion, an error, and an early `aclose()` alike);
+  `llm.ttft` nests inside it and wraps only `_open_with_ttft_retry(...)`
+  — the deadline/retry policy's own span, distinct from the full-stream
+  one. `model` is recorded on either span only once a `UsageEvent` (the
+  only `LLMEvent` shape carrying `.model`, per app/domain/types.py) has
+  actually been observed — `TokenEvent` doesn't carry it, so a stream
+  whose first event is content-only genuinely doesn't know the served
+  model yet at TTFT time. `cost_usd`/token counts stay off both spans:
+  this module sees the raw provider `usage` dict but never prices it
+  (CostTracker owns that, per the paragraph above), so setting them here
+  would either duplicate `CostTracker.record_turn`'s parsing of that same
+  dict (already recorded, on the enclosing `turn` span the caller passes
+  it) or risk disagreeing with it.
 """
 
 from __future__ import annotations
@@ -68,8 +81,10 @@ from app.domain.types import (
     UsageEvent,
 )
 from app.obs.logging import get_logger
+from app.obs.tracing import SPAN_LLM_TOTAL, SPAN_LLM_TTFT, get_tracer, safe_set_attribute
 
 log = get_logger(__name__)
+tracer = get_tracer(__name__)
 
 # docs/05 §3.4's tier table: the merchant-facing dialogue turn gets the
 # best model; invisible bookkeeping (summary folds, classification) gets
@@ -318,30 +333,64 @@ class LLMRouter:
         final `UsageEvent` through (the caller hands usage to
         CostTracker), and yield reassembled `ToolCallsEvent`s in place of
         raw tool-call fragments. See the module docstring for the policy
-        scope and judgment calls."""
+        scope, judgment calls, and the `llm.total`/`llm.ttft` span
+        boundaries (module docstring)."""
         wire_messages = [message.to_wire() for message in messages]
         models = self._models_for(tier)
-        upstream, first = await self._open_with_ttft_retry(
-            wire_messages, models=models, tools=tools, ttft_deadline_s=ttft_deadline_s
-        )
-        assembler = _ToolCallAssembler()
-        try:
-            if first is not None:
-                for out_event in assembler.process(first):
-                    yield out_event
-                async for event in upstream:
-                    for out_event in assembler.process(event):
+        # llm.total wraps the ENTIRE call — opened here, closed in the
+        # `finally` below on every exit path (normal completion, an
+        # error, or the consumer aclose()-ing this generator early). A
+        # `with`-block's __exit__ fires correctly across an async
+        # generator's yield points as long as the generator eventually
+        # resumes to one of those three outcomes (verified against the
+        # real opentelemetry-sdk with a standalone repro before relying
+        # on it here — see this task's PR description).
+        with tracer.start_as_current_span(SPAN_LLM_TOTAL) as total_span:
+            safe_set_attribute(total_span, "tier", tier.value)
+            # llm.ttft nests inside it and covers only the TTFT
+            # deadline/retry policy's own call — not the rest of the
+            # stream.
+            with tracer.start_as_current_span(SPAN_LLM_TTFT) as ttft_span:
+                safe_set_attribute(ttft_span, "tier", tier.value)
+                upstream, first = await self._open_with_ttft_retry(
+                    wire_messages, models=models, tools=tools, ttft_deadline_s=ttft_deadline_s
+                )
+                # `model` (which model in the fallback array actually
+                # served the request) is only knowable once a
+                # `UsageEvent` has been seen — `TokenEvent` carries no
+                # `model` field (app/domain/types.py). The common case
+                # (first event is streamed content) genuinely doesn't
+                # know it yet; omit rather than guess.
+                if isinstance(first, UsageEvent):
+                    safe_set_attribute(ttft_span, "model", first.model)
+
+            assembler = _ToolCallAssembler()
+            served_model: str | None = None
+            try:
+                if first is not None:
+                    for out_event in assembler.process(first):
+                        if isinstance(out_event, UsageEvent):
+                            served_model = out_event.model
                         yield out_event
-            if assembler.has_pending:
-                # Stream ended without a usage frame — flush at end of
-                # stream so accumulated calls are never dropped.
-                yield ToolCallsEvent(tool_calls=assembler.flush())
-        finally:
-            # The consumer may abandon this generator mid-stream
-            # (aclose()); closing the provider stream here keeps the
-            # underlying HTTP response from leaking. No-op when the
-            # stream is already exhausted.
-            await _close_quietly(upstream)
+                    async for event in upstream:
+                        for out_event in assembler.process(event):
+                            if isinstance(out_event, UsageEvent):
+                                served_model = out_event.model
+                            yield out_event
+                if assembler.has_pending:
+                    # Stream ended without a usage frame — flush at end of
+                    # stream so accumulated calls are never dropped.
+                    yield ToolCallsEvent(tool_calls=assembler.flush())
+            finally:
+                # Record before closing the span — set_attribute on an
+                # already-ended span is a silent no-op in the SDK.
+                if served_model is not None:
+                    safe_set_attribute(total_span, "model", served_model)
+                # The consumer may abandon this generator mid-stream
+                # (aclose()); closing the provider stream here keeps the
+                # underlying HTTP response from leaking. No-op when the
+                # stream is already exhausted.
+                await _close_quietly(upstream)
 
     def _models_for(self, tier: ModelTier) -> list[str]:
         """docs/05 §3.4: dialogue rides the fallback array (primary +

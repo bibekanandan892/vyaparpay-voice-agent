@@ -18,6 +18,8 @@ from typing import Any, cast
 
 import orjson
 import pytest
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from app.agent.llm_router import LLMRouter
 from app.config import Settings
@@ -550,3 +552,196 @@ async def test_ttft_first_attempt_cancellation_still_closes_its_stream(
         await task
 
     assert provider.closed is True
+
+
+# --------------------------------------------------------------------------
+# llm.ttft / llm.total spans (docs/04 §7.2 — previously never opened, see
+# git history). Real exported spans via `span_exporter` (tests/conftest.py),
+# not just "the context manager didn't raise" — same bar
+# tests/obs/test_tracing.py sets, adapted for an async-generator caller
+# (tests/conftest.py's `_session_span_exporter` docstring explains why this
+# needs a session-scoped provider rather than a per-test one).
+# --------------------------------------------------------------------------
+
+
+async def test_stream_opens_llm_total_and_ttft_spans_correctly_nested(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    fake_llm.script_turn(TokenEvent(delta={"content": "hi"}), _usage_event())
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert {s.name for s in spans} == {"llm.total", "llm.ttft"}
+
+    total = next(s for s in spans if s.name == "llm.total")
+    ttft = next(s for s in spans if s.name == "llm.ttft")
+    assert ttft.parent is not None
+    assert ttft.parent.span_id == total.context.span_id
+    assert total.end_time is not None
+    assert ttft.end_time is not None
+    # ttft closes at first-event time, strictly before the full stream does.
+    assert ttft.end_time <= total.end_time
+
+
+async def test_both_spans_record_the_requested_tier(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    fake_llm.script_turn(TokenEvent(delta={"content": "hi"}), _usage_event())
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.UTILITY))
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 2
+    for span in spans:
+        assert span.attributes is not None
+        assert span.attributes.get("tier") == "utility"
+
+
+async def test_ttft_span_has_no_model_when_first_event_is_content(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """`TokenEvent` carries no `.model` field (app/domain/types.py) — the
+    common case (content streamed first) genuinely doesn't know which
+    model served the request yet at TTFT time, so `llm.ttft` must not
+    guess one."""
+    fake_llm.script_turn(TokenEvent(delta={"content": "hi"}), _usage_event())
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    otel_trace.get_tracer_provider().force_flush()
+    ttft = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.ttft")
+    assert ttft.attributes is not None
+    assert "model" not in ttft.attributes
+
+
+async def test_ttft_span_records_model_when_the_first_event_is_usage(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """The one case `model` IS knowable at TTFT time: the stream's very
+    first event is itself the `UsageEvent`."""
+    scripted_usage = _usage_event(model="anthropic/claude-sonnet-5")
+    fake_llm.script_turn(scripted_usage)
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    otel_trace.get_tracer_provider().force_flush()
+    ttft = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.ttft")
+    assert ttft.attributes is not None
+    assert ttft.attributes.get("model") == "anthropic/claude-sonnet-5"
+
+
+async def test_total_span_records_model_once_the_usage_event_is_seen(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """Unlike `llm.ttft`, `llm.total` spans the whole call — it sees the
+    `UsageEvent` even when it arrives after content, so it can record
+    `model` in the common case ttft genuinely cannot."""
+    scripted_usage = _usage_event(model="anthropic/claude-sonnet-5")
+    fake_llm.script_turn(TokenEvent(delta={"content": "hi"}), scripted_usage)
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    otel_trace.get_tracer_provider().force_flush()
+    total = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.total")
+    assert total.attributes is not None
+    assert total.attributes.get("model") == "anthropic/claude-sonnet-5"
+
+
+async def test_total_span_has_no_model_when_no_usage_event_ever_arrives(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    fake_llm.script_turn(TokenEvent(delta={"content": "hi"}))
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    otel_trace.get_tracer_provider().force_flush()
+    total = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.total")
+    assert total.attributes is not None
+    assert "model" not in total.attributes
+
+
+async def test_neither_span_ever_carries_cost_or_token_attributes(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """LLMRouter never prices anything (`CostTracker` owns `cost_usd`) and
+    doesn't duplicate `CostTracker`'s usage-dict parsing for
+    `input_tokens`/`output_tokens` either — see the module docstring's
+    "who owns this data" note."""
+    fake_llm.script_turn(TokenEvent(delta={"content": "hi"}), _usage_event())
+    router = _router(fake_llm, settings)
+
+    await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 2
+    for span in spans:
+        assert span.attributes is not None
+        assert "cost_usd" not in span.attributes
+        assert "input_tokens" not in span.attributes
+        assert "output_tokens" not in span.attributes
+
+
+async def test_both_spans_close_with_error_status_when_ttft_deadline_exhausts_both_attempts(
+    settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """A `TimeoutError` propagating out of `stream()` must not leave
+    either span open/unexported — the nested `with`-blocks' `__exit__`
+    fires on the exception path too, all the way out through
+    `llm.total`."""
+    provider = _StallingLLM([], stall_attempts=2)
+    router = _router(provider, settings)
+
+    with pytest.raises(TimeoutError):
+        await _collect(
+            router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE, ttft_deadline_s=0.05)
+        )
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert {s.name for s in spans} == {"llm.total", "llm.ttft"}
+    for span in spans:
+        assert span.end_time is not None
+        assert span.status.status_code is otel_trace.StatusCode.ERROR
+
+
+async def test_both_spans_close_when_the_consumer_abandons_the_stream_early(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """A consumer that `aclose()`s the generator after the first event
+    (a barge-in, ConversationManager's `_MAX_REPLY_CHARS` guard) must
+    still close both spans — the `try`/`finally` wrapping the yields
+    handles `GeneratorExit` the same as any other exit path. Verified
+    against the real SDK with a standalone async-generator+span repro
+    before relying on this in production code (see PR description);
+    `GeneratorExit` is a `BaseException`, not an `Exception`, so
+    `opentelemetry.trace.use_span` deliberately does NOT mark these
+    spans as errored (its own source: "classes that directly inherit
+    BaseException are not technically errors") — only that they close."""
+    fake_llm.script_turn(
+        TokenEvent(delta={"content": "one"}),
+        TokenEvent(delta={"content": "two"}),
+        _usage_event(),
+    )
+    router = _router(fake_llm, settings)
+    agen = router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE)
+
+    first = await agen.__anext__()
+    assert first == TokenEvent(delta={"content": "one"})
+    await agen.aclose()
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    assert {s.name for s in spans} == {"llm.total", "llm.ttft"}
+    for span in spans:
+        assert span.end_time is not None
+        assert span.status.status_code is not otel_trace.StatusCode.ERROR
