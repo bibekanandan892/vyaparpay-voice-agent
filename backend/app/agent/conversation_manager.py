@@ -22,8 +22,12 @@ Judgment calls, flagged per house style rather than silently guessed at:
 2. **The tool loop is bounded at 2 execution rounds** (docs/05 §2: "the
    loop bound is small (typically 0–2 iterations)"; the Phase-2 plan
    pins "0–2"). If the model emits tool calls a third time, the loop
-   stops executing and falls back to whatever content has accumulated —
-   a bounded-but-thin answer beats an unbounded loop on a voice budget.
+   stops executing AND discards that round's narration (security review
+   HIGH, fixed — an earlier revision kept it): text streamed alongside
+   a dropped batch describes calls that never ran, in the worst case
+   announcing a confirm-gated action that was never gated. The turn
+   degrades to `_screen_output`'s `_BLOCKED_OUTPUT_FALLBACK` hedge
+   instead — see the bound-hit comment in `_run_tool_loop`.
 3. **Turn records for `session:{id}:turns` are NOT appended here.**
    docs/12 §7 and `RedisClient.append_turn`'s own comment name
    CostTracker (task 4.3, sibling branch) as the appender; writing them
@@ -323,17 +327,28 @@ class ConversationManager:
                     self.state = TurnState.SPEAKING
                 break
             if tool_rounds >= _MAX_TOOL_ROUNDS:
-                # Judgment call #2: bound reached — stop executing, keep
-                # whatever the model already said. This round's content
-                # (if any) is narration for a call that never ran, not
-                # the final answer — never promoted to SPEAKING.
+                # Judgment call #2: bound reached — stop executing.
+                # Security review HIGH, fixed: this round's content (if
+                # any) is narration for calls that never ran — including,
+                # in the worst case, the model announcing a
+                # confirm-gated action ("I've submitted your request…")
+                # that was neither executed NOR ever gated, since the
+                # dropped batch never reached ToolExecutor. Voicing it
+                # would be a hallucinated action claim SafetyLayer can't
+                # reliably catch (narration without figures passes the
+                # number screen). Discard it; the empty reply then takes
+                # `_screen_output`'s existing dead-air fallback
+                # (_BLOCKED_OUTPUT_FALLBACK), which offers a re-check
+                # and names no action or account fact.
                 log.warning(
                     "tool_loop_bound_reached",
                     session_id=self._session.session_id,
                     turn_no=self._turn_no,
                     dropped_calls=[c.name for c in tool_calls],
+                    discarded_narration_chars=len(reply_text),
                 )
                 safe_set_attribute(span, "turn.tool_loop_bound_hit", True)
+                reply_text = ""
                 break
 
             tool_rounds += 1

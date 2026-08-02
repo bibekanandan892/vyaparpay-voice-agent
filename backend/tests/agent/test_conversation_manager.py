@@ -393,6 +393,34 @@ async def test_tool_loop_bound_stops_executing_after_two_rounds() -> None:
     assert reply == _BLOCKED_OUTPUT_FALLBACK  # no content accumulated
 
 
+async def test_bound_hit_discards_narration_for_calls_that_never_ran() -> None:
+    """Security review HIGH, fixed (judgment call #2): when the bound
+    trips, the dropped round's narration describes tool calls that never
+    executed — in the worst case the model announcing a confirm-gated
+    action that was never even gated (the batch never reached
+    ToolExecutor). That narration must NEVER be voiced or land in the
+    transcript as Asha's reply; the turn degrades to the safe hedge.
+    Distinct from the test above, whose bound-trip round streams no
+    content at all — here the round carries exactly the dangerous
+    shape: narration + a dropped confirm-required call."""
+    hallucinated = "Done! I've submitted your limit increase request."
+    router = FakeRouter()
+    executing_batch = [ToolCallsBatch(tool_calls=(_call(),)), *_text_events()]
+    bound_trip_batch = [
+        ToolCallsBatch(tool_calls=(_call("request_limit_increase", "c3"),)),
+        *_text_events(hallucinated),
+    ]
+    router.script(list(executing_batch), list(executing_batch), bound_trip_batch)
+    manager, executor, memory, _ = _manager(router)
+
+    reply = await manager.on_stt_final("raise my limit")
+
+    assert len(executor.calls) == 2  # the confirm-required batch never executed
+    assert reply == _BLOCKED_OUTPUT_FALLBACK
+    assert hallucinated not in reply
+    assert memory.appended[-1].content == _BLOCKED_OUTPUT_FALLBACK  # transcript too
+
+
 # ---------------------------------------------------------------------------
 # Affirmation pairing (docs/10 §4 via judgment call #6)
 # ---------------------------------------------------------------------------
