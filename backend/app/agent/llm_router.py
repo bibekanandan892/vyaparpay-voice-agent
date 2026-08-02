@@ -94,8 +94,9 @@ Judgment calls, flagged per house style:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Final, cast
 
@@ -392,8 +393,30 @@ class LLMRouter:
                     ttft_deadline_s=ttft_deadline_s,
                     tier=tier,
                 )
-                async for event in self._forward_events(upstream, first, total_span):
-                    yield event
+                # Security review HIGH, fixed: `async for event in
+                # self._forward_events(...): yield event` does NOT
+                # propagate this generator's own `.aclose()`/GeneratorExit
+                # into `_forward_events`' generator synchronously — bare
+                # `async for` only drops the reference, leaving asyncio's
+                # async-generator finalizer to schedule its `.aclose()`
+                # on a LATER event-loop tick. That deferred close ran
+                # AFTER total_span already closed (in this same `with`
+                # block, synchronously), so `_forward_events`' own
+                # `finally` (the `model` attribute write + closing
+                # `upstream`) either landed on an already-ended span
+                # (silently dropped — the SDK logs "Setting attribute on
+                # ended span") or closed the upstream HTTP response one
+                # tick late — both verified empirically with a standalone
+                # repro before relying on this. `async with
+                # contextlib.aclosing(...)` compiles to an in-frame
+                # try/finally, so its `__aexit__` (and therefore
+                # `_forward_events`' own `finally`) runs synchronously as
+                # part of THIS generator's own close, not deferred.
+                async with contextlib.aclosing(
+                    self._forward_events(upstream, first, total_span)
+                ) as events:
+                    async for event in events:
+                        yield event
             except Exception as exc:
                 # Security review HIGH, fixed: never let str(exc)/the
                 # traceback reach the span (module docstring) — the type
@@ -440,7 +463,7 @@ class LLMRouter:
         upstream: AsyncIterator[LLMEvent],
         first: LLMEvent | None,
         total_span: Span,
-    ) -> AsyncIterator[LLMEvent]:
+    ) -> AsyncGenerator[LLMEvent, None]:
         """Reassembles tool-call fragments and forwards events; records
         the served model on `total_span` and closes `upstream` on every
         exit path. Extracted from `stream()` to keep that method's

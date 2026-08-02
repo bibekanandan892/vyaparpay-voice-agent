@@ -747,6 +747,38 @@ async def test_both_spans_close_when_the_consumer_abandons_the_stream_early(
         assert span.status.status_code is not otel_trace.StatusCode.ERROR
 
 
+async def test_model_attribute_survives_an_early_abandon_right_after_a_usage_event(
+    fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
+) -> None:
+    """Code-review HIGH, fixed: an earlier version of `stream()` consumed
+    `_forward_events(...)` via a bare `async for`, which does NOT
+    propagate this generator's own `.aclose()` into `_forward_events`'
+    generator synchronously — its `finally` (which records `model` on
+    `total_span` and closes `upstream`) was deferred to a LATER
+    event-loop tick, by which point `total_span` had already closed
+    (in `stream()`'s own frame, synchronously), silently dropping the
+    attribute (the SDK logs "Setting attribute on ended span"). Fixed by
+    consuming `_forward_events(...)` through `contextlib.aclosing()`,
+    whose `__aexit__` runs synchronously as part of THIS generator's own
+    close. This test aborts immediately after the FIRST event, which is
+    itself the `UsageEvent` — the one scenario where `served_model` is
+    knowable right away, making a dropped attribute directly observable
+    rather than looking identical to the "never learned it" case."""
+    fake_llm.script_turn(_usage_event(model="anthropic/claude-sonnet-5"))
+    router = _router(fake_llm, settings)
+    agen = router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE)
+
+    first = await agen.__anext__()
+    assert first == _usage_event(model="anthropic/claude-sonnet-5")
+    await agen.aclose()
+
+    otel_trace.get_tracer_provider().force_flush()
+    spans = span_exporter.get_finished_spans()
+    total_span = next(s for s in spans if s.name == "llm.total")
+    assert total_span.attributes is not None
+    assert total_span.attributes.get("model") == "anthropic/claude-sonnet-5"
+
+
 async def test_error_status_never_carries_the_exception_message_or_a_recorded_event(
     fake_llm: FakeLLM, settings: Settings, span_exporter: InMemorySpanExporter
 ) -> None:
