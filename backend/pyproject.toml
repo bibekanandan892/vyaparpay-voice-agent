@@ -43,6 +43,23 @@ dev = [
     "ruff>=0.7",
     "mypy>=1.13",
 ]
+# Phase-3 voice worker only — agent-api and the test suite never import
+# these, so the base install stays lean (`pip install -e ".[dev,voice]"`
+# to get them). Floors are the versions current on PyPI at pin time
+# (2026-08), matching the base-deps convention above.
+voice = [
+    # --- WebRTC transport (aiortc + its codec/container layer) ---
+    "aiortc>=1.15",
+    # NOT ">=18": av 18.0 is current on PyPI, but aiortc 1.15 pins
+    # av>=14,<18 — an av>=18 floor here would make the extra unresolvable.
+    "av>=17.0",
+    # --- Silero VAD inference (docs/06 §5) ---
+    "onnxruntime>=1.28",
+    # --- Deepgram/ElevenLabs streaming websockets ---
+    "websockets>=17.0",
+    # --- PCM frame math (resample/convert paths) ---
+    "numpy>=2.5",
+]
 
 [tool.hatch.build.targets.wheel]
 # src-less layout: the package root *is* backend/, importable as `app.*`.

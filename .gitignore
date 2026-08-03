@@ -45,3 +45,9 @@ Thumbs.db
 
 # --- Docker / infra local state ---
 infra/docker/volumes/
+
+# --- Fetched model artifacts (backend/scripts/fetch_models.py) ---
+# Ignore the model files, keep the dir tracked via .gitkeep (same
+# ignore-contents-not-marker shape as the .env.* / !.env.example pair).
+backend/app/voice/models/*
+!backend/app/voice/models/.gitkeep
