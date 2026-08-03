@@ -296,6 +296,44 @@ async def test_enforce_rate_rejects_a_colon_in_user_id(fake_redis: _FakeRedis) -
         await enforce_rate(fake_redis, "usr:evil", limit=5)  # type: ignore[arg-type]
 
 
+async def test_signal_token_key_rejects_a_colon_in_session_id(client: RedisClient) -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        await client.take_signaling_token_hash("sess:evil")
+
+
+async def test_session_control_channel_rejects_a_colon_in_session_id(
+    client: RedisClient,
+) -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        await client.publish_session_control("sess:evil", "end")
+
+
+# --------------------------------------------------------------------------
+# session_control:{id} pub/sub (docs/13 §2.2's explicit hang-up)
+# --------------------------------------------------------------------------
+
+
+async def test_publish_session_control_uses_the_canon_channel_and_returns_subscribers(
+    client: RedisClient, fake_redis: _FakeRedis
+) -> None:
+    fake_redis.subscribers = 1
+
+    delivered = await client.publish_session_control("sess_1", "end")
+
+    assert delivered == 1
+    assert fake_redis.published == [("session_control:sess_1", "end")]
+
+
+async def test_publish_session_control_with_no_listener_is_not_an_error(
+    client: RedisClient, fake_redis: _FakeRedis
+) -> None:
+    """Pub/sub has no persistence: a worker that already tore the call
+    down is the normal reason nobody is listening, so 0 is a value the
+    caller logs, not an exception this wrapper raises."""
+    assert await client.publish_session_control("sess_1", "end") == 0
+    assert fake_redis.published == [("session_control:sess_1", "end")]
+
+
 # --------------------------------------------------------------------------
 # session:{id}:turns defensive size cap (review finding: no bound on
 # growth beyond the 24h session TTL — a stuck retry loop or an abusively

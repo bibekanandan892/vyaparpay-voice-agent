@@ -1,0 +1,559 @@
+"""The four session-lifecycle endpoints (docs/13-api-contracts.md §2).
+
+    POST   /v1/sessions               mint a call session + connect bundle
+    POST   /v1/sessions/{id}/token    re-mint token + TURN creds (reconnect)
+    DELETE /v1/sessions/{id}          explicit hang-up, idempotent
+    GET    /v1/sessions/{id}/summary  post-call summary card
+
+This is the most credential-sensitive route module in the repo: two of the
+four endpoints mint live bearer material (a one-time signaling token and a
+10-minute TURN HMAC pair). The rules it holds itself to:
+
+- **Nothing here logs a token, a TURN credential, or `TURN_SECRET.`** The
+  minting modules (app/auth/) don't log at all; this module logs
+  session ids and outcomes only. `SessionCredentials`/`IceServer` carry
+  `Field(repr=False)` on their secret fields (app/domain/voice.py's
+  judgment call 8) so even an accidental f-string of a whole bundle is
+  inert — but the rule is "don't", not "the model will save you".
+- **The wire shape comes from `SessionCredentials.to_wire()`**, never a
+  hand-rolled dict: a STUN entry must *omit* `username`/`credential`
+  rather than null them, which is exactly the trap `to_wire()` exists to
+  close.
+- **`user_id` in the body is never trusted.** docs/13 §1.2: "No request
+  body anywhere accepts a `user_id` that the server trusts — `POST
+  /v1/sessions` carries one, but the server verifies it equals `sub` and
+  rejects a mismatch rather than honoring it." Everything downstream is
+  handed `principal.user_id`, not the body field, so even a future
+  refactor that drops the equality check cannot escalate.
+- **Session existence is information** (docs/13 §1.1): an unknown id and
+  another merchant's id both answer `404 SESSION_NOT_FOUND`, with only
+  the id the caller already supplied in `details`.
+
+Judgment calls, flagged rather than buried:
+
+1. **`DELETE` publishes, it does not write `conversations.state`.**
+   docs/12 §4.1 gives that column exactly one update, at hang-up, and
+   `SessionManager.end()` owns it — including the finalize-before-end
+   invariant (that method's judgment call #9) which requires a
+   `call_costs` row that only `CostTracker.finalize()` in the voice-worker
+   process can have written. agent-api therefore cannot legitimately call
+   `end()`; it publishes `"end"` on `session_control:{id}` and the worker
+   that owns the peer connection runs finalize-then-end. The response is
+   the docs' `{"session_id", "state": "ended"}` either way — it reports
+   the terminal state the hang-up commits the call to, not a state read
+   back from the row. A repeat DELETE re-publishes and returns the same
+   body (docs/13 §2.2: "a repeat call returns the same body, not a 409"),
+   which is safe because pub/sub is lossy and the worker's handler must be
+   idempotent regardless.
+2. **The summary is mechanical, no LLM.** docs/13 §2.3's example prose is
+   a Phase-5 Summarizer output; Phase 3 assembles the same *fields* from
+   `conversations` + drained `conversation_turns` + `tool_invocations` and
+   templates the `summary` string. Nothing here calls a model, so the
+   endpoint is deterministic and free.
+3. **`SESSION_SUMMARY_PENDING` sets its own `Retry-After` header instead
+   of raising.** `ErrorEnvelopeMiddleware` (app/api/middleware.py) only
+   special-cases `RateLimitedError` for that header; generalizing it to
+   any error carrying `retry_after` is the better fix but middleware.py
+   is outside this task's file ownership, so the handler renders that one
+   error body itself via `error_envelope()` and sets the header on the
+   injected `Response`. Same status code, same envelope, same `error.code`
+   — only the plumbing differs, and the swap is a two-line change once
+   middleware is in scope.
+4. **Only `POST /v1/sessions` is rate-limited.** docs/13 §1.1 budgets
+   `rate:{user_id}` at "5 session creates/min" and `require_rate_limit`
+   keys one shared window per user. Attaching it to the re-mint endpoint
+   too would let five session creates starve a mid-call reconnect — an
+   availability bug on the exact path docs/13 §6.1 designs for network
+   changes. Re-mint is bounded instead by needing a valid JWT *and* a
+   live session the caller owns, and each mint overwrites the previous
+   digest, so at most one token per session is ever live.
+5. **A `user_id != sub` mismatch answers `400 VALIDATION_SCHEMA`.**
+   docs/13 §1.2 mandates the rejection but names no code, and the §1.1
+   taxonomy has no 403 at all. The body genuinely fails the contract
+   `protocol/schemas/session_create_request.v1.json` states for that field
+   ("Must equal the JWT sub claim"), so the validation class is the honest
+   one; `details.fields` names the offending field without echoing either
+   value.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final
+
+from fastapi import APIRouter, Depends, Request, Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agent.session_manager import SessionManager
+from app.api.deps import get_db, get_principal, require_rate_limit
+from app.api.errors import (
+    SessionAlreadyEndedError,
+    SessionNotFoundError,
+    SessionSummaryPendingError,
+    ValidationSchemaError,
+    ValidationUnsupportedVersionError,
+    error_envelope,
+    success_envelope,
+)
+from app.auth.signaling import SignalingToken, mint_signaling_token, store_signaling_token
+from app.auth.turn_credentials import mint_ice_servers
+from app.config import Settings
+from app.data.redis_client import RedisClient
+from app.data.repositories import ConversationRepo, ToolAuditRepo
+from app.domain.types import SessionState, SessionUser, ToolInvocationStatus
+from app.domain.voice import SessionCredentials
+from app.models import Conversation, ConversationTurn, ToolInvocation
+from app.obs.logging import get_logger
+
+log = get_logger(__name__)
+
+router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
+
+# The only `screen_context` version this server understands
+# (protocol/schemas/session_create_request.v1.json's `"const"`).
+_SCREEN_CONTEXT_V1: Final = "screen_context/v1"
+
+# The control message DELETE publishes on `session_control:{id}` for the
+# voice-worker (judgment call 1). One word, no envelope: this channel
+# carries operator intent, not the docs/13 §6 signaling protocol.
+SESSION_CONTROL_END: Final = "end"
+
+# docs/13 §2.3's `resolution.type` for the canonical incident's outcome.
+_RESOLUTION_LIMIT_INCREASE: Final = "limit_increase_requested"
+_LIMIT_INCREASE_TOOL: Final = "request_limit_increase"
+
+_SECONDS_PER_MINUTE: Final = 60
+
+# Defensive cap on `recent_events`, not a product rule: docs/13 §2.1 says
+# the client sends "the last ~15 timeline events" and the schema sets no
+# maxItems, so an unbounded array is a free memory/parse amplifier on an
+# unauthenticated-adjacent surface. Generous enough never to bind on a
+# real capture — the same shape as `_MAX_TURNS_PER_SESSION`
+# (app/data/redis_client.py) and the tool layer's `_MAX_LIMIT_RUPEES`.
+_MAX_RECENT_EVENTS: Final = 50
+
+
+# --------------------------------------------------------------------------
+# Request bodies (protocol/schemas/session_create_request.v1.json)
+# --------------------------------------------------------------------------
+
+
+class RecentEvent(BaseModel):
+    """One `app_event/v1` timeline entry. Only the three fields every
+    event variant carries are pinned (the schema's own scope); extras are
+    allowed through because docs/07/08 own the per-variant shapes and
+    docs/13 §9 makes new fields additive."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    name: str
+    ts: int
+
+
+class CreateSessionRequest(BaseModel):
+    """docs/13 §2.1's request body. `extra="forbid"` mirrors the schema's
+    `additionalProperties: false` — "new request fields are a server-
+    contract change, never a client improvisation". All three fields are
+    required (the schema's `required` list); Phase 3 clients send
+    `screen_context: null` and `recent_events: []`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1)
+    screen_context: dict[str, Any] | None
+    recent_events: list[RecentEvent] = Field(max_length=_MAX_RECENT_EVENTS)
+
+
+# --------------------------------------------------------------------------
+# Request-scope accessors for the process singletons this module needs
+# --------------------------------------------------------------------------
+
+
+def get_redis(request: Request) -> RedisClient:
+    """`app.state.redis`, the lifespan-built singleton (docs/04 §4).
+    A dependency rather than a direct `request.app.state` read so tests
+    can swap it through `dependency_overrides`, the same seam `get_db`
+    gives the SQL side."""
+    return request.app.state.redis
+
+
+def get_voice_settings(request: Request) -> Settings:
+    """`app.state.settings` — the signaling/TURN block (docs/04 §3)."""
+    return request.app.state.settings
+
+
+def get_session_manager(request: Request) -> SessionManager:
+    """`SessionManager` owns its own transaction per method (that class's
+    docstring), so it takes the sessionmaker, not `get_db`'s
+    request-scoped session. Built per request: it holds no state beyond
+    the two injected singletons.
+
+    Typed against the concrete class rather than `SessionManagerProto`
+    (which `get_llm`'s `LLMProvider` return type would suggest by
+    analogy) for a specific reason: the frozen Protocol pins `create()`
+    at three positional arguments, and this route passes the
+    `signaling_token_hash` keyword the Protocol doesn't know about. The
+    Protocol stays the contract for callers that don't mint tokens; this
+    one does.
+    """
+    return SessionManager(request.app.state.sessionmaker, request.app.state.redis)
+
+
+# --------------------------------------------------------------------------
+# Validation + ownership helpers
+# --------------------------------------------------------------------------
+
+
+def _require_matching_user_id(body_user_id: str, principal: SessionUser) -> None:
+    """docs/13 §1.2's verify-don't-honor rule (judgment call 5). Neither
+    value is echoed back — the response says which field is wrong, not
+    what the server thinks the right answer is."""
+    if body_user_id != principal.user_id:
+        raise ValidationSchemaError(
+            "user_id must equal the authenticated principal",
+            details={
+                "fields": [
+                    {"loc": ["body", "user_id"], "msg": "must equal the JWT sub claim"}
+                ]
+            },
+        )
+
+
+def _require_supported_screen_context(screen_context: dict[str, Any] | None) -> None:
+    """`null` is valid and normal in Phase 3. A present snapshot must
+    carry `v` (schema `required`) and it must be the one version this
+    server ingests — an unknown version is `400
+    VALIDATION_UNSUPPORTED_VERSION`, not `VALIDATION_SCHEMA` (docs/13
+    §1.1). Whole-body rejection either way: never a partial ingest
+    (docs/13 §2.1)."""
+    if screen_context is None:
+        return
+    version = screen_context.get("v")
+    if version is None:
+        raise ValidationSchemaError(
+            "screen_context is missing its version marker",
+            details={"fields": [{"loc": ["body", "screen_context", "v"], "msg": "field required"}]},
+        )
+    if version != _SCREEN_CONTEXT_V1:
+        raise ValidationUnsupportedVersionError(
+            "Unsupported screen_context version",
+            details={"supported": [_SCREEN_CONTEXT_V1]},
+        )
+
+
+async def _require_own_session(
+    db: AsyncSession, session_id: str, principal: SessionUser
+) -> Conversation:
+    """Load the session or raise the ownership-blind `404
+    SESSION_NOT_FOUND` (docs/13 §1.1/§2.2: an id owned by someone else is
+    deliberately indistinguishable from a wrong id)."""
+    conversation = await ConversationRepo(db).get(session_id)
+    if conversation is None or conversation.user_id != principal.user_id:
+        raise SessionNotFoundError(
+            "No session found for this id", details={"session_id": session_id}
+        )
+    return conversation
+
+
+def _require_signaling_url(settings: Settings) -> str:
+    """`SIGNALING_PUBLIC_URL` is optional-with-default in `Settings` so
+    agent-api boots with no voice env (app/config.py's stated design) —
+    which makes this endpoint the place that actually needs it. Raises a
+    plain `RuntimeError` for the same reason `turn_credentials.py` does
+    (its note 4): an operator misconfiguration, rendered to the client as
+    the generic `500 INTERNAL`."""
+    if not settings.signaling_public_url:
+        raise RuntimeError(
+            "SIGNALING_PUBLIC_URL is not configured — agent-api cannot tell a client "
+            "where the voice-worker's /v1/signal WebSocket lives (docs/13 §2.1)."
+        )
+    return settings.signaling_public_url
+
+
+# --------------------------------------------------------------------------
+# The connect bundle (docs/13 §2.1)
+# --------------------------------------------------------------------------
+
+
+async def _issue_connect_bundle(
+    *,
+    session_id: str,
+    minted: SignalingToken,
+    settings: Settings,
+    redis: RedisClient,
+    now: datetime,
+) -> SessionCredentials:
+    """Compute the TURN pair, store the token's digest under its 5-minute
+    TTL, and assemble the bundle. `expires` is the *token's* connect
+    deadline, not the session's lifetime (docs/13 §2.1), so it is derived
+    from the same TTL the Redis key just got — one number, two places it
+    must agree.
+
+    Ordering inside this function is deliberate on both ends: every
+    fallible *computation* (misconfigured `SIGNALING_PUBLIC_URL`,
+    `TURN_SECRET`, `COTURN_HOST`) happens before the Redis write, so a
+    misconfigured deployment leaves no orphan token digests behind; and
+    the write happens before the function returns, so the plaintext can
+    never leave this process as a token the worker has no way to verify.
+
+    Scope note: this covers Redis only. `POST /v1/sessions` inserts the
+    `conversations` row *before* calling here — that is docs/13 §2.1's own
+    ordering ("mint `a1f3c9` ... then mint the one-time signaling token")
+    — so a misconfigured deployment does accumulate orphan `conversations`
+    rows, one per failed attempt, until the config is fixed. Left as-is
+    rather than reordered: the row is the session's identity and the token
+    is minted *for* a session id, so inverting them would mean minting
+    credentials for an id that might never be persisted.
+    """
+    signaling_url = _require_signaling_url(settings)
+    ice_servers = mint_ice_servers(session_id, settings, now=now)
+    await store_signaling_token(
+        redis, session_id, minted.token_hash, ttl_s=settings.signaling_token_ttl_s
+    )
+    return SessionCredentials(
+        session_id=session_id,
+        signaling_url=signaling_url,
+        signaling_token=minted.token,
+        ice_servers=ice_servers,
+        expires=now + timedelta(seconds=settings.signaling_token_ttl_s),
+    )
+
+
+# --------------------------------------------------------------------------
+# Summary assembly (docs/13 §2.3) — mechanical, no LLM (judgment call 2)
+# --------------------------------------------------------------------------
+
+
+def _format_duration(duration_s: int) -> str:
+    minutes, seconds = divmod(duration_s, _SECONDS_PER_MINUTE)
+    return f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+
+def _resolution(invocations: list[ToolInvocation]) -> dict[str, Any] | None:
+    """docs/13 §2.3's `resolution`, pulled from the most recent successful
+    `request_limit_increase` audit row. `output` is that tool's
+    `RequestLimitIncreaseOut` dumped to JSON by `ToolExecutor`
+    (app/agent/tool_executor.py), so `request_id`/`eta_hours` are the
+    tool's own contract (docs/10 §3.1) rather than a shape invented here.
+    Returns `None` when the call reached no such resolution — the field
+    stays present-and-null so clients can branch on it."""
+    for invocation in reversed(invocations):
+        if invocation.tool_name != _LIMIT_INCREASE_TOOL:
+            continue
+        if invocation.status != ToolInvocationStatus.OK.value:
+            continue
+        output = invocation.output or {}
+        reference = output.get("request_id")
+        if reference is None:
+            continue
+        return {
+            "type": _RESOLUTION_LIMIT_INCREASE,
+            "reference": reference,
+            "eta_hours": output.get("eta_hours"),
+        }
+    return None
+
+
+def _summary_text(
+    *,
+    duration_s: int,
+    turn_count: int,
+    tools_used: list[str],
+    resolution: dict[str, Any] | None,
+) -> str:
+    """The template `summary` string (judgment call 2). Deterministic and
+    fact-only: every clause restates a number this endpoint already
+    returns as a structured field, so the prose can never disagree with
+    the data beside it — the Phase-5 Summarizer replaces this wholesale
+    rather than being approximated here."""
+    parts = [f"Call lasted {_format_duration(duration_s)} over {turn_count} turns."]
+    parts.append(f"Tools used: {', '.join(tools_used)}." if tools_used else "No tools were used.")
+    if resolution is not None:
+        eta_hours = resolution.get("eta_hours")
+        eta = f", ETA {eta_hours} hours" if eta_hours is not None else ""
+        parts.append(
+            f"Submitted a daily-limit increase, reference {resolution['reference']}{eta}."
+        )
+    return " ".join(parts)
+
+
+def _summary_payload(
+    conversation: Conversation,
+    ended_at: datetime,
+    turns: list[ConversationTurn],
+    invocations: list[ToolInvocation],
+) -> dict[str, Any]:
+    """docs/13 §2.3's `data` object. Deliberately absent, per that
+    section: cost fields (`call_costs` is internal) and the transcript
+    (never persisted — docs/12 §4.2; the summary *is* the record).
+
+    `ended_at` is passed in rather than re-read off `conversation` so the
+    not-null narrowing lives at the caller's pending gate — the one place
+    that actually establishes it — instead of an assert down here.
+    """
+    duration_s = int((ended_at - conversation.started_at).total_seconds())
+    actions = [{"tool": i.tool_name, "status": i.status} for i in invocations]
+    resolution = _resolution(invocations)
+    # dict.fromkeys, not set(): first-use order, so the sentence reads in
+    # the order the call actually used the tools.
+    tools_used = list(dict.fromkeys(i.tool_name for i in invocations))
+    return {
+        "session_id": conversation.session_id,
+        "started_at": conversation.started_at.isoformat(),
+        "duration_s": duration_s,
+        "turn_count": len(turns),
+        "summary": _summary_text(
+            duration_s=duration_s,
+            turn_count=len(turns),
+            tools_used=tools_used,
+            resolution=resolution,
+        ),
+        "resolution": resolution,
+        "actions": actions,
+    }
+
+
+# --------------------------------------------------------------------------
+# Endpoints
+# --------------------------------------------------------------------------
+
+
+@router.post("", status_code=201, dependencies=[Depends(require_rate_limit)])
+async def create_session(
+    body: CreateSessionRequest,
+    principal: SessionUser = Depends(get_principal),  # noqa: B008
+    session_manager: SessionManager = Depends(get_session_manager),  # noqa: B008
+    redis: RedisClient = Depends(get_redis),  # noqa: B008
+    settings: Settings = Depends(get_voice_settings),  # noqa: B008
+) -> dict[str, Any]:
+    """docs/13 §2.1. Order of server-side effects, as that section pins
+    them: validate the whole body -> rate-limit (the `require_rate_limit`
+    dependency, which runs before this body) -> mint the session ->
+    store the hashed one-time token -> compute the TURN pair -> return.
+
+    Not implemented in this task, and deliberately not faked: writing
+    `ctx:{id}` + the events list (Phase 4 owns ScreenContext ingestion —
+    Phase 3 clients always send `null`/`[]`, per
+    `protocol/schemas/session_create_request.v1.json`) and the speculative
+    context prefetch (no prefetcher exists yet). Both are additive later
+    without changing this response.
+    """
+    _require_matching_user_id(body.user_id, principal)
+    _require_supported_screen_context(body.screen_context)
+
+    minted = mint_signaling_token()
+    session = await session_manager.create(
+        principal.user_id,
+        body.screen_context,
+        [event.model_dump() for event in body.recent_events],
+        signaling_token_hash=minted.token_hash,
+    )
+    credentials = await _issue_connect_bundle(
+        session_id=session.session_id,
+        minted=minted,
+        settings=settings,
+        redis=redis,
+        now=datetime.now(UTC),
+    )
+    log.info("session_created", session_id=session.session_id, user_id=principal.user_id)
+    return success_envelope(credentials.to_wire())
+
+
+@router.post("/{session_id}/token")
+async def remint_session_token(
+    session_id: str,
+    principal: SessionUser = Depends(get_principal),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    redis: RedisClient = Depends(get_redis),  # noqa: B008
+    settings: Settings = Depends(get_voice_settings),  # noqa: B008
+) -> dict[str, Any]:
+    """docs/13 §2.2's reconnect path: a fresh one-time token and fresh
+    TURN credentials for a session whose state is intact (docs/13 §6.1 —
+    the client calls this after a network change killed its WebSocket,
+    then reconnects and re-offers with `iceRestart`).
+
+    The new digest overwrites the old one, so the token this replaces
+    stops verifying immediately — a re-mint is also a revoke. An ended
+    session is `409 SESSION_ALREADY_ENDED`: there is nothing left to
+    connect to, and minting a live credential for a dead call would be a
+    small credential leak with no upside.
+    """
+    conversation = await _require_own_session(db, session_id, principal)
+    if conversation.state == SessionState.ENDED.value:
+        raise SessionAlreadyEndedError(
+            "This session has already ended", details={"session_id": session_id}
+        )
+
+    credentials = await _issue_connect_bundle(
+        session_id=session_id,
+        minted=mint_signaling_token(),
+        settings=settings,
+        redis=redis,
+        now=datetime.now(UTC),
+    )
+    log.info("signaling_token_reminted", session_id=session_id)
+    return success_envelope(credentials.to_wire())
+
+
+@router.delete("/{session_id}")
+async def end_session(
+    session_id: str,
+    principal: SessionUser = Depends(get_principal),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    redis: RedisClient = Depends(get_redis),  # noqa: B008
+) -> dict[str, Any]:
+    """docs/13 §2.2's explicit hang-up — idempotent by contract: a repeat
+    call returns the same body, never a `409`, because hang-up races the
+    in-band `bye` and aiortc's own teardown constantly and every path
+    converges on the same terminal state.
+
+    See judgment call 1 for why this publishes rather than writing
+    `conversations.state` itself. `subscribers=0` is logged, not raised:
+    pub/sub is lossy and a worker that already tore the call down is the
+    normal reason nobody is listening.
+    """
+    await _require_own_session(db, session_id, principal)
+    subscribers = await redis.publish_session_control(session_id, SESSION_CONTROL_END)
+    log.info("session_end_requested", session_id=session_id, subscribers=subscribers)
+    return success_envelope(
+        {"session_id": session_id, "state": SessionState.ENDED.value}
+    )
+
+
+@router.get("/{session_id}/summary")
+async def get_session_summary(
+    session_id: str,
+    response: Response,
+    principal: SessionUser = Depends(get_principal),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """docs/13 §2.3's post-call summary card, assembled mechanically
+    (judgment call 2).
+
+    The pending gate is `SessionManager.end()` having *committed*: that
+    method flips `state`/`ended_at` and drains `session:{id}:turns` into
+    `conversation_turns` in one transaction, so `state == 'ended'` is
+    exactly the point at which the turn rows this endpoint counts are
+    visible. Reading a half-drained session is therefore not possible —
+    it either sees the whole post-call write or answers `404
+    SESSION_SUMMARY_PENDING` with `Retry-After: 2` (judgment call 3).
+    """
+    conversation = await _require_own_session(db, session_id, principal)
+    ended_at = conversation.ended_at
+    if conversation.state != SessionState.ENDED.value or ended_at is None:
+        pending = SessionSummaryPendingError(
+            "The post-call summary for this session is not ready yet",
+            details={"session_id": session_id},
+        )
+        response.status_code = pending.status_code
+        response.headers["Retry-After"] = str(pending.retry_after)
+        return error_envelope(pending)
+
+    turns = await ConversationRepo(db).list_turns(session_id)
+    invocations = await ToolAuditRepo(db).list_for_session(session_id)
+    return success_envelope(_summary_payload(conversation, ended_at, turns, invocations))
+
+
+__all__ = ["SESSION_CONTROL_END", "router"]

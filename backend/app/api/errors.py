@@ -64,9 +64,69 @@ class InsufficientBalanceError(AppError):
     code = "INSUFFICIENT_BALANCE"
 
 
+class ValidationUnsupportedVersionError(AppError):
+    """docs/13 §1.1: a `screen_context` or event payload carrying an
+    unknown schema version. Distinct from `VALIDATION_SCHEMA` on purpose —
+    the body is well-formed, it just speaks a version this server does not
+    know, which is a client-upgrade signal rather than a bug in the
+    request."""
+
+    status_code = 400
+    code = "VALIDATION_UNSUPPORTED_VERSION"
+
+
 class ResourceNotFoundError(AppError):
     status_code = 404
     code = "RESOURCE_NOT_FOUND"
+
+
+class SessionNotFoundError(AppError):
+    """docs/13 §1.1's `SESSION_NOT_FOUND`, the session-scoped sibling of
+    `RESOURCE_NOT_FOUND`. Raised both for an unknown session id AND for a
+    session owned by another merchant — "deliberately indistinguishable —
+    existence is information" (docs/13 §1.1, §2.2). Callers must therefore
+    never put anything ownership-revealing in `details`."""
+
+    status_code = 404
+    code = "SESSION_NOT_FOUND"
+
+
+# docs/13 §2.3: the summary endpoint answers `Retry-After: 2` while the
+# post-call pipeline is still running, and the client "polls once or twice".
+SESSION_SUMMARY_RETRY_AFTER_S = 2
+
+
+class SessionSummaryPendingError(AppError):
+    """docs/13 §1.1/§2.3: `GET /v1/sessions/{id}/summary` before the
+    post-call pipeline has landed. A 404 rather than a 202 because the
+    summary resource genuinely does not exist yet; `retry_after` carries
+    the documented 2 s so the route can set the header (see
+    `app/api/routes/sessions.py` for why the route, not
+    `ErrorEnvelopeMiddleware`, sets it today)."""
+
+    status_code = 404
+    code = "SESSION_SUMMARY_PENDING"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        retry_after: int = SESSION_SUMMARY_RETRY_AFTER_S,
+    ) -> None:
+        super().__init__(message, details=details, retryable=True)
+        self.retry_after = retry_after
+
+
+class SessionAlreadyEndedError(AppError):
+    """docs/13 §1.1: an operation on a session in a terminal state. Note
+    that `DELETE /v1/sessions/{id}` deliberately does NOT raise this —
+    hang-up is idempotent by contract (docs/13 §2.2); this is for the
+    operations that genuinely cannot proceed on a dead session, i.e.
+    re-minting a signaling token for it."""
+
+    status_code = 409
+    code = "SESSION_ALREADY_ENDED"
 
 
 class LimitRequestAlreadyPendingError(AppError):

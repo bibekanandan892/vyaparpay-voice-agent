@@ -17,14 +17,22 @@ rather than silently guessed at:
    demo or pilot scale. Hex can never contain `:`, so ids compose safely
    with `RedisClient`'s colon-delimited keyspace (its
    `_reject_key_delimiter` guard).
-2. **`signaling_token_hash` is a deterministic placeholder.** The column
-   is NOT NULL (docs/12 §4.1, app/models/orm.py) but Phase 2 has no
-   signaling and mints no token (that's Phase 3, docs/17). The constant
-   below is the SHA-256 of a public sentinel string — a well-formed
-   64-hex digest so the row is production-shaped, identical on every
-   Phase-2 row and greppable back to this one definition, so it can
-   never be mistaken for (or collide meaningfully with) a real one-time
-   token's hash.
+2. **`signaling_token_hash` is supplied by whoever owns the token.**
+   Phase 3's `POST /v1/sessions` (app/api/routes/sessions.py) mints the
+   real one-time signaling token, passes `create()` only its SHA-256
+   digest for the NOT NULL column (docs/12 §4.1), and separately writes
+   the same digest to `signal_token:{id}` in Redis — the copy the
+   voice-worker actually verifies and burns (docs/13 §5, §6.2). The
+   parameter is keyword-only with a `None` default solely so the callers
+   that predate the endpoint keep working against `SessionManagerProto`'s
+   frozen three-argument signature (scripts/demo_cli.py, the E2E
+   harness): omitting it mints a real token via `app/auth/signaling.py`
+   and immediately discards the plaintext, so the stored digest has no
+   reachable preimage and no candidate token can ever hash-match it —
+   the same fail-closed property the deleted `_mint_placeholder_token_hash`
+   provided, without a second minting function to keep in sync. This
+   class still knows nothing about Redis keys or HTTP (judgment call #3's
+   discipline): it consumes a digest, it never stores or serves one.
 3. **`create` does not write the `session:{id}` Redis hash.** docs/09 §3
    says the hash is "created by agent-api at POST /v1/sessions", but the
    frozen `RedisClient` exposes no create-the-hash primitive — every
@@ -100,7 +108,6 @@ rather than silently guessed at:
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -111,6 +118,7 @@ from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.errors import ResourceNotFoundError
+from app.auth.signaling import mint_signaling_token
 from app.data.redis_client import RedisClient
 from app.data.repositories.conversation_repo import ConversationRepo
 from app.data.repositories.cost_repo import CostRepo
@@ -123,20 +131,6 @@ log = get_logger(__name__)
 # Judgment call #1 (module docstring): 12 hex chars, not the canon
 # example's collision-prone 6.
 _SESSION_ID_HEX_CHARS = 12
-
-def _mint_placeholder_token_hash() -> str:
-    """Judgment call #2, hardened after security review (HIGH): the NOT
-    NULL `signaling_token_hash` column gets a PER-ROW random digest with
-    no known preimage — `sha256(uuid4().bytes)` where the input is
-    discarded — instead of the earlier shared constant derived from a
-    committed plaintext. With the constant, a future Phase-3 verifier
-    doing the natural `sha256(candidate) == row.signaling_token_hash`
-    would have authenticated the publicly-known plaintext against EVERY
-    Phase-2 row; with a preimage-free per-row value, no candidate token
-    can ever hash-match, so the naive comparison fails closed by
-    construction. Phase 3's real token minting replaces this function
-    outright."""
-    return hashlib.sha256(uuid4().bytes).hexdigest()
 
 
 def _mint_session_id() -> str:
@@ -234,19 +228,31 @@ class SessionManager:
         user_id: str,
         screen_context: dict[str, Any] | None,
         recent_events: list[dict[str, Any]],
+        *,
+        signaling_token_hash: str | None = None,
     ) -> Session:
         """Mint a session id and insert the `conversations` anchor row
         (docs/05 §3.1, docs/12 §4.1). `screen_context`/`recent_events`
-        are accepted and ignored — always `None`/`[]` in Phase 2 per
-        `SessionManagerProto`'s docstring; the ScreenContext/AppEvent
-        pipelines are Phase 3/4. `state` is owned by the column's
-        server_default (`'created'`), never set here."""
+        are accepted and ignored — always `None`/`[]` in Phase 3 per
+        `SessionManagerProto`'s docstring and
+        `protocol/schemas/session_create_request.v1.json`; the
+        ScreenContext/AppEvent pipelines are Phase 4. `state` is owned by
+        the column's server_default (`'created'`), never set here.
+
+        `signaling_token_hash` is the SHA-256 digest of the one-time
+        signaling token the *caller* minted and is storing in Redis
+        (judgment call #2). Omitting it mints a real token here and drops
+        the plaintext on the floor, producing a preimage-free digest for
+        the NOT NULL column — the pre-REST callers' path."""
         session_id = _mint_session_id()
         started_at = datetime.now(UTC)  # judgment call #4 (module docstring)
+        token_hash = (
+            signaling_token_hash
+            if signaling_token_hash is not None
+            else mint_signaling_token().token_hash
+        )
         async with self._transaction() as db:
-            await ConversationRepo(db).create(
-                session_id, user_id, _mint_placeholder_token_hash()
-            )
+            await ConversationRepo(db).create(session_id, user_id, token_hash)
         return Session(
             session_id=session_id,
             user_id=user_id,

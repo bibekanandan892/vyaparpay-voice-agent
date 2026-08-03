@@ -14,10 +14,13 @@ middleware.py) so it is independently unit-testable
 (tests/api/test_deps.py) without spinning up the ASGI stack.
 
 `require_rate_limit` is the route dependency form of docs/04 §6's
-`enforce_rate` — applied only to the two mutating endpoints (`POST
-/v1/payments`, `POST /v1/limits/increase-requests`, per the Phase-2 plan's
-decision #7: Phase 2 has no `POST /v1/sessions` to attach
-`RATE_LIMIT_SESSIONS_PER_MIN` to instead). It depends on `get_principal`
+`enforce_rate`. Phase 2 applied it to the two mutating business endpoints
+only (`POST /v1/payments`, `POST /v1/limits/increase-requests`, per that
+plan's decision #7, because Phase 2 had no `POST /v1/sessions` to attach
+`RATE_LIMIT_SESSIONS_PER_MIN` to instead); Phase 3's `POST /v1/sessions`
+(app/api/routes/sessions.py) now attaches it too — the endpoint docs/13
+§1.1's "5 session creates/min" was always about — so all three share the
+one `rate:{user_id}` window described below. It depends on `get_principal`
 so it always runs *after* auth, keying the window on the verified `sub`
 claim, never a spoofable body field (docs/04 §4.1). The limit figure
 itself is read from `Settings.rate_limit_sessions_per_min` at call time
