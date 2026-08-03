@@ -82,6 +82,15 @@ def execute_result(*, scalar: object = None, row: object = None) -> MagicMock:
     return result
 
 
+def scalars_result(rows: list[object]) -> MagicMock:
+    """A fake `Result` for the list-returning repo methods, which walk
+    `result.scalars().all()` rather than one of the single-row accessors
+    `execute_result` covers."""
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = rows
+    return result
+
+
 # --------------------------------------------------------------------------
 # base.SqlAlchemyRepository
 # --------------------------------------------------------------------------
@@ -701,6 +710,28 @@ async def test_conversation_repo_append_turn_passes_through_explicit_fields() ->
     assert turn.started_at == started
 
 
+async def test_conversation_repo_list_turns_filters_by_session_and_orders_by_turn_no() -> None:
+    """`GET /v1/sessions/{id}/summary`'s `turn_count` is a count of these
+    rows, so a dropped WHERE clause would silently count another call's
+    turns. Inspects the compiled statement, not just the mocked return
+    value — same reasoning as the `get_payment_status` scoping test above.
+    """
+    session = make_session()
+    turns = [
+        ConversationTurn(
+            session_id="sess_1", turn_no=1, role="user", started_at=datetime.now(UTC)
+        )
+    ]
+    session.execute.return_value = scalars_result(turns)
+    repo = ConversationRepo(session)
+
+    assert await repo.list_turns("sess_1") == turns
+
+    compiled = str(session.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+    assert "WHERE conversation_turns.session_id" in compiled
+    assert "ORDER BY conversation_turns.turn_no" in compiled
+
+
 # --------------------------------------------------------------------------
 # ToolAuditRepo
 # --------------------------------------------------------------------------
@@ -748,6 +779,28 @@ async def test_tool_audit_repo_insert_error_row_carries_error_code() -> None:
     assert invocation.error_code == "STALE_LIMIT_VIEW"
     assert invocation.turn_no is None
     assert invocation.output is None
+
+
+async def test_tool_audit_repo_list_for_session_filters_and_orders_by_created_at() -> None:
+    """Feeds the summary card's `actions` list and its `resolution`
+    lookup, so the session filter is what keeps one merchant's tool
+    timeline out of another's summary; `created_at` ordering is what makes
+    "the most recent successful request_limit_increase" mean what it says.
+    """
+    session = make_session()
+    invocations = [
+        ToolInvocation(
+            session_id="sess_1", tool_name="get_wallet_balance", input={}, status="ok", latency_ms=9
+        )
+    ]
+    session.execute.return_value = scalars_result(invocations)
+    repo = ToolAuditRepo(session)
+
+    assert await repo.list_for_session("sess_1") == invocations
+
+    compiled = str(session.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+    assert "WHERE tool_invocations.session_id" in compiled
+    assert "ORDER BY tool_invocations.created_at" in compiled
 
 
 # --------------------------------------------------------------------------

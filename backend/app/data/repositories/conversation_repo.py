@@ -17,6 +17,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from sqlalchemy import select
+
 from app.data.repositories.base import SqlAlchemyRepository
 from app.models import Conversation, ConversationTurn
 
@@ -92,3 +94,23 @@ class ConversationRepo(SqlAlchemyRepository[Conversation]):
         self._session.add(turn)
         await self._session.flush()
         return turn
+
+    async def list_turns(self, session_id: str) -> list[ConversationTurn]:
+        """Every drained `conversation_turns` row for one session, in
+        `turn_no` order. Added for `GET /v1/sessions/{id}/summary`
+        (docs/13 §2.3), whose `turn_count` is a count of these rows —
+        one row per turn, since the table's PK is `(session_id, turn_no)`
+        (docs/12 §4.2).
+
+        The class docstring's "append-only in Phase 2 — nothing reads one
+        back" (and `base.py`'s note that this repo exposes no keyed `get`
+        for turns) still holds: this is a whole-session read for the
+        post-call summary, not a keyed lookup, so it doesn't reopen the
+        composite-PK `get` question base.py deliberately declined.
+        """
+        result = await self._session.execute(
+            select(ConversationTurn)
+            .where(ConversationTurn.session_id == session_id)
+            .order_by(ConversationTurn.turn_no)
+        )
+        return list(result.scalars().all())

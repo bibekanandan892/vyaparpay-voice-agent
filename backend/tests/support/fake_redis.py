@@ -1,9 +1,10 @@
 """`FakeRedis` — a hand-rolled, in-memory stand-in for `redis.asyncio.Redis`,
 implementing just the subset of the Redis command surface `RedisClient`
 (`app/data/redis_client.py`) and `enforce_rate` actually issue (hash/list/
-string ops, plus a pipelined ZSET sequence), with `decode_responses=True`
-semantics — everything stored and returned as `str`, matching how
-`RedisClient.from_settings` constructs the real client.
+string ops including `GETDEL`, a pub/sub `PUBLISH`, plus a pipelined ZSET
+sequence), with `decode_responses=True` semantics — everything stored and
+returned as `str`, matching how `RedisClient.from_settings` constructs the
+real client.
 
 Promoted here (task 6.2, the E2E canonical-conversation test) from its
 original home as a private class in `tests/data/test_redis_client.py`
@@ -67,6 +68,13 @@ class FakeRedis:
         self.strings: dict[str, str] = {}
         self.zsets: dict[str, dict[str, float]] = {}
         self.ttls: dict[str, int] = {}
+        # (channel, message) in publish order — pub/sub has no server-side
+        # storage, so this exists purely so a test can assert what was
+        # published (e.g. DELETE /v1/sessions' "end" on
+        # session_control:{id}). `subscribers` is what publish() reports
+        # back; tests that care about the "nobody listening" path set it.
+        self.published: list[tuple[str, str]] = []
+        self.subscribers = 0
 
     # -- hash --------------------------------------------------------
     async def hget(self, key: str, field: str) -> str | None:
@@ -101,6 +109,22 @@ class FakeRedis:
         self.strings[key] = value
         if ex is not None:
             self.ttls[key] = ex
+
+    async def getdel(self, key: str) -> str | None:
+        """Real Redis `GETDEL`: return the value and delete the key in one
+        atomic step. Single-threaded in-memory here, so "atomic" is free —
+        what matters for the tests using it is the *semantics*, i.e. that a
+        second call on the same key returns `None` (the one-time signaling
+        token's burn, docs/13 §6.2)."""
+        self.ttls.pop(key, None)
+        return self.strings.pop(key, None)
+
+    # -- pub/sub --------------------------------------------------------
+    async def publish(self, channel: str, message: str) -> int:
+        """Records the (channel, message) pair and returns the configured
+        subscriber count, mirroring the real command's return value."""
+        self.published.append((channel, message))
+        return self.subscribers
 
     # -- zset (pipeline-only; mirrors the sync ops a real pipeline queues) --
     def _zremrangebyscore(self, key: str, min_: float, max_: float) -> int:

@@ -25,6 +25,7 @@ from structlog.testing import capture_logs
 
 from app.agent.session_manager import SessionManager
 from app.api.errors import ResourceNotFoundError
+from app.auth.signaling import mint_signaling_token
 from app.data.redis_client import RedisClient
 from app.domain.interfaces import SessionManagerProto
 from app.domain.types import EndReason, Session, SessionState
@@ -144,13 +145,29 @@ async def test_create_mints_short_hex_session_ids_that_are_unique(
     assert first.session_id != second.session_id
 
 
-async def test_create_uses_a_preimage_free_per_row_token_hash_placeholder(
+async def test_create_persists_the_caller_supplied_token_digest(
     manager: SessionManager, db_session: AsyncMock
 ) -> None:
-    """NOT NULL column, no Phase-2 signaling token to hash (judgment call
-    #2, hardened after security review HIGH): a well-formed 64-hex digest
-    that is PER-ROW random with no known preimage — never a shared,
-    publicly-derivable constant a naive future verifier could be fed."""
+    """Judgment call #2 (Phase 3): `POST /v1/sessions` mints the real
+    one-time signaling token and hands this method only its SHA-256
+    digest, which must land verbatim in the NOT NULL column — the same
+    value the route writes to `signal_token:{id}` in Redis."""
+    minted = mint_signaling_token()
+
+    await manager.create("usr_rajesh01", None, [], signaling_token_hash=minted.token_hash)
+
+    assert db_session.add.call_args.args[0].signaling_token_hash == minted.token_hash
+
+
+async def test_create_without_a_digest_falls_back_to_a_preimage_free_one(
+    manager: SessionManager, db_session: AsyncMock
+) -> None:
+    """The pre-REST callers' path (scripts/demo_cli.py, the E2E harness)
+    against `SessionManagerProto`'s frozen three-argument signature: a
+    well-formed 64-hex digest that is PER-ROW random with no reachable
+    preimage — the plaintext is minted and dropped — so no candidate
+    token can ever hash-match it and a naive `sha256(candidate) ==
+    row.signaling_token_hash` verifier fails closed by construction."""
     await manager.create("usr_rajesh01", None, [])
     first = db_session.add.call_args.args[0].signaling_token_hash
     assert _SHA256_HEX_RE.match(first)

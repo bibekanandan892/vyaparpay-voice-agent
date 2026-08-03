@@ -3,10 +3,11 @@ helpers keyed by the canon keyspace (docs/12-data-models.md §7, docs/04-
 backend-architecture.md §5's "Redis access module" paragraph).
 
 Callers never assemble `session:{id}`, `session:{id}:turns`,
-`idempotency:{key}`, or `rate:{user_id}` strings by hand — `RedisClient`
-(and the standalone `enforce_rate` below) own every prefix internally, so
-a typo can't silently read/write the wrong namespace and every key stays
-greppable back to one definition (docs/04 §5's stated design).
+`idempotency:{key}`, `signal_token:{id}`, `session_control:{id}`, or
+`rate:{user_id}` strings by hand — `RedisClient` (and the standalone
+`enforce_rate` below) own every prefix internally, so a typo can't
+silently read/write the wrong namespace and every key stays greppable
+back to one definition (docs/04 §5's stated design).
 
 Two things this module deliberately is NOT:
 
@@ -77,6 +78,21 @@ def _session_key(session_id: str) -> str:
 
 def _session_turns_key(session_id: str) -> str:
     return f"session:{_reject_key_delimiter(session_id, field='session_id')}:turns"
+
+
+def _signal_token_key(session_id: str) -> str:
+    # docs/13 §6.2 / §5: the hashed one-time signaling token agent-api
+    # writes at mint and the voice-worker burns at WS accept. Its TTL is
+    # the connect deadline itself, so this key intentionally has no
+    # companion "expires_at" field to drift from.
+    return f"signal_token:{_reject_key_delimiter(session_id, field='session_id')}"
+
+
+def _session_control_channel(session_id: str) -> str:
+    # Pub/sub CHANNEL, not a key — the REST hang-up (DELETE /v1/sessions/{id})
+    # publishes here and the voice-worker that owns the peer connection
+    # reacts. Same colon-delimited namespace discipline as the keys above.
+    return f"session_control:{_reject_key_delimiter(session_id, field='session_id')}"
 
 
 def _idempotency_key(session_id: str, tool_name: str, turn_no: int) -> str:
@@ -218,6 +234,59 @@ class RedisClient:
             value,
             ex=_IDEMPOTENCY_TTL_SECONDS,
         )
+
+    # ----------------------------------------------------------------
+    # signal_token:{id} string (docs/13 §6.2) — the SHA-256 digest of the
+    # one-time signaling token. Policy (format, entropy, verify-and-burn
+    # ordering) lives in app/auth/signaling.py; this class only owns the
+    # key name and the two Redis commands, the same split the module
+    # docstring draws against SessionMemory.
+    # ----------------------------------------------------------------
+
+    async def set_signaling_token_hash(
+        self, session_id: str, token_hash: str, *, ttl_s: int
+    ) -> None:
+        """`SET signal_token:{id} <digest> EX ttl_s`. The TTL is the
+        connect deadline (docs/13 §6.2: "enforced by the Redis key's own
+        expiry... no code path can forget to check it"), so a
+        non-positive TTL would mint a token that is either immortal
+        (Redis rejects `EX 0`) or already dead — refused here rather
+        than surfacing as a driver error at an unrelated call site.
+        """
+        if ttl_s <= 0:
+            raise ValueError(f"ttl_s must be positive, got {ttl_s}")
+        await self._redis.set(_signal_token_key(session_id), token_hash, ex=ttl_s)
+
+    async def take_signaling_token_hash(self, session_id: str) -> str | None:
+        """`GETDEL` — read and delete in ONE atomic command, returning the
+        stored digest or `None` if the key was absent (never minted,
+        already burned, or expired).
+
+        Atomicity is the whole point: a `GET` followed by a `DEL` lets two
+        concurrent WebSocket accepts both read the same digest and both
+        succeed, which defeats the one-time property docs/13 §6.2 requires.
+        The verification itself is `app/auth/signaling.verify_and_burn`'s
+        job — this method deliberately returns the digest rather than a
+        boolean so the comparison stays in one place, next to the hashing.
+        """
+        return _as_str(await self._redis.getdel(_signal_token_key(session_id)))
+
+    # ----------------------------------------------------------------
+    # session_control:{id} pub/sub (docs/13 §2.2's explicit hang-up)
+    # ----------------------------------------------------------------
+
+    async def publish_session_control(self, session_id: str, message: str) -> int:
+        """Publish one control message (e.g. `"end"`) on
+        `session_control:{session_id}`; returns the number of subscribers
+        that received it.
+
+        Fire-and-forget by nature: Redis pub/sub has no persistence, so a
+        return of 0 means "no voice-worker is currently listening for this
+        session", not "the call failed to end". `DELETE /v1/sessions/{id}`
+        is idempotent precisely because this channel is lossy — the caller
+        logs the subscriber count rather than treating 0 as an error.
+        """
+        return int(await self._redis.publish(_session_control_channel(session_id), message))
 
 
 async def enforce_rate(redis: Redis, user_id: str, *, limit: int, window_s: int = 60) -> None:

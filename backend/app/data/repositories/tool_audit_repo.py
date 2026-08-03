@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import select
+
 from app.data.repositories.base import SqlAlchemyRepository
 from app.models import ToolInvocation
 
@@ -65,3 +67,22 @@ class ToolAuditRepo(SqlAlchemyRepository[ToolInvocation]):
             idempotency_key=idempotency_key,
         )
         return await self.add(invocation)
+
+    async def list_for_session(self, session_id: str) -> list[ToolInvocation]:
+        """Every audit row for one session, oldest first — the source of
+        `GET /v1/sessions/{id}/summary`'s `actions` list and its
+        `resolution` lookup (docs/13 §2.3).
+
+        This is a read, but not a retraction of the "insert-only from the
+        tool path" note above: nothing here mutates an audit row, and the
+        `idx_tool_session` index (`session_id, created_at`,
+        app/models/orm.py) exists for exactly this access pattern.
+        Ordering is by `created_at` — the same column the index carries —
+        so a session's tool timeline reads in the order it happened.
+        """
+        result = await self._session.execute(
+            select(ToolInvocation)
+            .where(ToolInvocation.session_id == session_id)
+            .order_by(ToolInvocation.created_at)
+        )
+        return list(result.scalars().all())
