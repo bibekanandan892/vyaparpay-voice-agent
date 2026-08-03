@@ -87,6 +87,19 @@ services:
           echo "coturn: sides must read the same value. See backend/.env.example." >&2
           exit 1
         fi
+        case "$$TURN_SECRET" in *'#'*)
+          echo "coturn: TURN_SECRET contains '#', which coturn's conf parser" >&2
+          echo "coturn: treats as a comment start - the secret would be silently" >&2
+          echo "coturn: truncated and every TURN allocation would fail against" >&2
+          echo "coturn: agent-api's HMAC. Use a '#'-free value (see .env.example)." >&2
+          exit 1
+        ;; esac
+        if [ "$$(printf '%s' "$$TURN_SECRET" | wc -l)" -ne 0 ]; then
+          echo "coturn: TURN_SECRET contains an embedded newline - it would" >&2
+          echo "coturn: split into extra conf lines and desync from agent-api's" >&2
+          echo "coturn: HMAC. Single-line values only." >&2
+          exit 1
+        fi
         if [ ! -r /etc/coturn/certs/turn_server_cert.pem ] \
         || [ ! -r /etc/coturn/certs/turn_server_pkey.pem ]; then
           echo "coturn: TLS cert/key missing or unreadable under /etc/coturn/certs." >&2

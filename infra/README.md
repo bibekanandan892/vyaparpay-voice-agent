@@ -106,9 +106,14 @@ identical value, which is why both containers read the same
 `TURN_SECRET` is empty or the TLS cert is missing, rather than starting a
 coturn that rejects every allocation.
 
-Generate a secret with something like `openssl rand -hex 32`. Keep it
-alphanumeric — it passes through a shell in the entrypoint, and a value
-containing quotes or backticks is asking for trouble.
+Generate a secret with something like `openssl rand -hex 32`. The shell
+expansion in the entrypoint is fully quoted, so quotes/backticks in the
+value are actually safe — the real hazards are `#` (coturn's conf parser
+treats it as a comment start, silently truncating the secret) and
+embedded newlines (they split into extra conf lines). The entrypoint
+rejects both with an explicit error instead of letting coturn desync
+from agent-api's HMAC; `openssl rand -hex` output can never contain
+either.
 
 ---
 
