@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 android {
@@ -32,7 +33,18 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:screencontext"))
 
+    // The maintained libwebrtc build (canon ADR-1, docs/03 §3.4). Deliberately
+    // `implementation`, never `api`: WebRtcClient is the only org.webrtc
+    // importer in the app, and none of :voice's public signatures may leak an
+    // org.webrtc type (docs/03 §3.4's isolation rule).
+    implementation(libs.webrtc.android)
+
+    implementation(libs.okhttp)
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.serialization.json)
+
     testImplementation(libs.junit)
     testImplementation(libs.turbine)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.okhttp.mockwebserver)
 }
