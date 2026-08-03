@@ -8,7 +8,7 @@ linear16 and fans out to the two consumers docs/06 §1 fixes:
 
 - (a) a contiguous PCM byte stream for STT — `stt_stream()`, shaped for
   `SttProvider.stream(audio=...)` (app/domain/voice.py);
-- (b) exact 30 ms hops for the VAD — `vad_frames()`, `AudioFrame` values
+- (b) exact 32 ms hops for the VAD — `vad_frames()`, `AudioFrame` values
   with an honest media-clock `ts_ms`.
 
 Judgment calls, flagged per house style:
@@ -34,11 +34,11 @@ Judgment calls, flagged per house style:
    *live* audio. Oldest audio is the least valuable during a backlog
    (docs/06 §9 expects only "brief" buffering across an STT reconnect).
    Never silent: every drop logs.
-5. **`ts_ms` derives from the emitted-sample count** (hop_index x 30 ms),
+5. **`ts_ms` derives from the emitted-sample count** (hop_index x 32 ms),
    which includes inserted gap silence — exactly the honest media clock
    docs/06 §7 requires. Frames pushed without a pts are treated as
    contiguous with the previous frame.
-6. **A trailing partial hop (< 30 ms) at close is dropped**, not padded:
+6. **A trailing partial hop (< 32 ms) at close is dropped**, not padded:
    a VAD probability over a zero-padded fraction of a hop is noise, and
    the stream is over anyway. The STT stream got those bytes already.
 7. **One subscriber per fan-out, enforced at call time.** A second
@@ -64,10 +64,11 @@ log = get_logger(__name__)
 STT_SAMPLE_RATE: Final = 16_000
 BYTES_PER_SAMPLE: Final = 2  # linear16 (s16le)
 
-# docs/06 §5: Silero's streaming hop — one decision per 30 ms frame.
-VAD_HOP_MS: Final = 30
-VAD_HOP_SAMPLES: Final = STT_SAMPLE_RATE * VAD_HOP_MS // 1000  # 480
-VAD_HOP_BYTES: Final = VAD_HOP_SAMPLES * BYTES_PER_SAMPLE  # 960
+# docs/06 §5: Silero's native streaming hop — one decision per 32 ms
+# frame (the 64-sample context prepend is internal to SileroVad).
+VAD_HOP_MS: Final = 32
+VAD_HOP_SAMPLES: Final = STT_SAMPLE_RATE * VAD_HOP_MS // 1000  # 512
+VAD_HOP_BYTES: Final = VAD_HOP_SAMPLES * BYTES_PER_SAMPLE  # 1024
 
 # Judgment call 2: pts jumps at/above this are DTX gaps -> inserted silence.
 GAP_INSERT_THRESHOLD_MS: Final = 40
@@ -82,7 +83,7 @@ _MS_PER_S: Final = 1000
 
 class AudioIngress:
     """Push-driven fan-out: PeerSession pushes decoded frames in; the STT
-    byte stream and 30 ms VAD hops flow out as async iterators. Call
+    byte stream and 32 ms VAD hops flow out as async iterators. Call
     `close()` once when the remote track ends."""
 
     def __init__(self) -> None:
@@ -187,7 +188,7 @@ class AudioIngress:
         return self._drain_stt()
 
     def vad_frames(self) -> AsyncIterator[AudioFrame]:
-        """Fan-out (b): exact 30 ms hops (480 samples / 960 bytes at
+        """Fan-out (b): exact 32 ms hops (512 samples / 1024 bytes at
         16 kHz) with honest `ts_ms`. Single subscriber (judgment call 7)."""
         if self._vad_subscribed:
             raise RuntimeError("vad_frames() already has a subscriber")

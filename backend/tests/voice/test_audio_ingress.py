@@ -2,7 +2,7 @@
 and raw PCM through the real PyAV resampler, no network, no real time.
 
 Covers: 48 kHz stereo -> 16 kHz mono resample correctness (length +
-energy), exact 30 ms VAD hops across ragged input framing, DTX gap ->
+energy), exact 32 ms VAD hops across ragged input framing, DTX gap ->
 inserted silence with honest ts_ms bookkeeping, sub-threshold jitter
 absorption, and the seam guards (single subscriber, closed-push,
 validation).
@@ -95,7 +95,7 @@ async def test_resample_48k_stereo_sine_to_16k_mono() -> None:
     assert len(stt) == STT_SAMPLE_RATE * 2
     # Energy: the sine's RMS survives downmix + resample within 2%.
     assert rms(stt) == pytest.approx(SINE_RMS, rel=0.02)
-    # VAD side: 16000 samples -> 33 whole hops, the 160-sample tail dropped.
+    # VAD side: 16000 samples -> 31 whole hops, the 128-sample tail dropped.
     assert len(vad) == STT_SAMPLE_RATE // VAD_HOP_SAMPLES
     assert all(f.samples == VAD_HOP_SAMPLES and len(f.pcm16) == VAD_HOP_BYTES for f in vad)
     assert [f.ts_ms for f in vad] == [i * VAD_HOP_MS for i in range(len(vad))]
@@ -104,8 +104,8 @@ async def test_resample_48k_stereo_sine_to_16k_mono() -> None:
 
 async def test_vad_hops_exact_across_ragged_input_frames() -> None:
     # Ragged 16 kHz mono pushes (raw-PCM seam, no pts -> contiguous):
-    # hop framing must come out exactly 480 samples / 960 bytes each.
-    sample_counts = [100, 333, 480, 947, 293, 480]
+    # hop framing must come out exactly 512 samples / 1024 bytes each.
+    sample_counts = [100, 333, 512, 947, 293, 512]
     ingress = AudioIngress()
     offset = 0
     for count in sample_counts:
@@ -125,23 +125,23 @@ async def test_vad_hops_exact_across_ragged_input_frames() -> None:
 
 
 async def test_dtx_gap_surfaces_as_silence_with_honest_ts() -> None:
-    # 20 ms of speech at t=0, then DTX silence, then 20 ms more at t=520:
-    # docs/06 §7 requires the 500 ms gap to arrive as zero PCM so the
+    # 32 ms of speech at t=0, then DTX silence, then 32 ms more at t=544:
+    # docs/06 §7 requires the 512 ms gap to arrive as zero PCM so the
     # trailing-silence clock sees real time.
-    speech = sine_pcm(STT_SAMPLE_RATE, 320)
+    speech = sine_pcm(STT_SAMPLE_RATE, 512)
     ingress = AudioIngress()
     ingress.push_pcm(speech, sample_rate=STT_SAMPLE_RATE, ts_ms=0)
-    ingress.push_pcm(speech, sample_rate=STT_SAMPLE_RATE, ts_ms=520)
+    ingress.push_pcm(speech, sample_rate=STT_SAMPLE_RATE, ts_ms=544)
     ingress.close()
 
     stt = await collect_stt(ingress)
     vad = await collect_vad(ingress)
 
-    # 320 speech + 8000 gap-silence + 320 speech samples = 540 ms total.
-    assert len(stt) == (320 + 8000 + 320) * 2
+    # 512 speech + 8192 gap-silence + 512 speech samples = 576 ms total.
+    assert len(stt) == (512 + 8192 + 512) * 2
     # The inserted region is exactly zero.
-    assert stt[320 * 2 : 8320 * 2] == b"\x00" * (8000 * 2)
-    # 8640 samples = 18 exact hops with a contiguous media clock.
+    assert stt[512 * 2 : 8704 * 2] == b"\x00" * (8192 * 2)
+    # 9216 samples = 18 exact hops with a contiguous media clock.
     assert len(vad) == 18
     assert [f.ts_ms for f in vad] == [i * VAD_HOP_MS for i in range(18)]
     # Hop 0 carries the first burst, hops 1-16 are pure silence, hop 17
@@ -176,12 +176,12 @@ async def test_each_fanout_allows_exactly_one_subscriber() -> None:
 
 async def test_push_after_close_raises_and_close_is_idempotent() -> None:
     ingress = AudioIngress()
-    ingress.push_pcm(sine_pcm(STT_SAMPLE_RATE, 480), sample_rate=STT_SAMPLE_RATE)
+    ingress.push_pcm(sine_pcm(STT_SAMPLE_RATE, 512), sample_rate=STT_SAMPLE_RATE)
     ingress.close()
     ingress.close()  # idempotent — no double sentinel
 
     with pytest.raises(RuntimeError):
-        ingress.push_pcm(sine_pcm(STT_SAMPLE_RATE, 480), sample_rate=STT_SAMPLE_RATE)
+        ingress.push_pcm(sine_pcm(STT_SAMPLE_RATE, 512), sample_rate=STT_SAMPLE_RATE)
 
     assert len(await collect_vad(ingress)) == 1
 
