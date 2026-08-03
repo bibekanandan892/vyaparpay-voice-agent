@@ -254,6 +254,45 @@ async def test_silence_results_emit_no_events(settings_factory: SettingsFactory)
     assert events == []
 
 
+async def test_empty_speech_final_after_real_segments_emits_the_utterance(
+    settings_factory: SettingsFactory,
+) -> None:
+    """Review regression: an utterance whose closing speech_final carries an
+    EMPTY transcript (endpointing fired on trailing silence) must still emit
+    the accumulated segments as the SttFinal — never lose the utterance."""
+    record: dict = {}
+    script = [
+        _results("paisa kat gaya", is_final=True),
+        _results("", is_final=True, speech_final=True, start=1.0),
+    ]
+    async with ws_server(_replay_handler(record, script)) as url:
+        stt = DeepgramStt(_settings(settings_factory, url))
+        events = await _collect(stt, _audio(b"\x00\x00"))
+
+    assert [type(e) for e in events] == [SttPartial, SttFinal]
+    assert events[0].text == "paisa kat gaya"  # stabilized partial at segment-final
+    assert events[1].text == "paisa kat gaya"  # the utterance survives the empty close
+
+
+async def test_double_speech_final_emits_exactly_one_final(
+    settings_factory: SettingsFactory,
+) -> None:
+    """Review regression: a stray second speech_final right after an
+    utterance closed must not emit a second (empty) SttFinal or resurrect
+    accumulator state."""
+    record: dict = {}
+    script = [
+        _results("bas itna hi", is_final=True, speech_final=True),
+        _results("", is_final=True, speech_final=True, start=1.0),
+    ]
+    async with ws_server(_replay_handler(record, script)) as url:
+        stt = DeepgramStt(_settings(settings_factory, url))
+        events = await _collect(stt, _audio(b"\x00\x00"))
+
+    assert [type(e) for e in events] == [SttFinal]
+    assert events[0].text == "bas itna hi"
+
+
 async def test_unknown_and_out_of_order_message_types_are_tolerated(
     settings_factory: SettingsFactory,
 ) -> None:

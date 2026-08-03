@@ -232,6 +232,13 @@ def _fold_result(
     """Judgment call 1's mapping table, as a pure fold over the finalized-
     segment accumulator (returns the new accumulator; never mutates)."""
     text = text.strip()
+    if speech_final and not is_final:
+        # Deepgram documents speech_final => is_final. If that invariant
+        # ever breaks (vendor bug/protocol change), the message falls
+        # through to the interim branch and the utterance boundary is
+        # dropped — surface it loudly so the live-smoke harness (H1) or
+        # production logs catch it instead of a silently hanging turn.
+        log.warning("deepgram.stream.speech_final_without_is_final", ts_ms=ts_ms)
     if not is_final:
         if not text:
             return [], segments  # silence interim (judgment call 4)

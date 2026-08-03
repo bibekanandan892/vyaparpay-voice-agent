@@ -91,6 +91,13 @@ _tracer = get_tracer(__name__)
 _OUTPUT_FORMAT: Final = "pcm_24000"
 # 24 kHz mono s16 -> 24 samples/ms x 2 bytes/sample.
 _PCM_BYTES_PER_MS: Final = 48
+
+# Alignment sanity bound (judgment call 4): chunk-relative timestamps can
+# legitimately overshoot the chunk's own PCM a little (synthesis lookahead),
+# but a stream-relative vendor reading would blow past this within ~1 s of
+# audio — generous enough to never false-positive, tight enough to catch
+# the wrong reading on any real sentence.
+_ALIGNMENT_SANITY_SLACK_MS: Final = 1_000
 # Vendor-pinned protocol frames (judgment call 2).
 _MSG_BOS: Final = '{"text": " "}'
 _MSG_EOS: Final = '{"text": ""}'
@@ -153,6 +160,7 @@ class ElevenLabsTts:
         safe_set_attribute(span, "sentence_no", sentence_no)
         started = time.perf_counter()
         first_audio_seen = False
+        span_ended = False
         voice_ids = self._voice_ids()
         try:
             for attempt, voice_id in enumerate(voice_ids):
@@ -163,7 +171,15 @@ class ElevenLabsTts:
                             safe_set_attribute(span, "tts_ttfb_ms", ttfb_ms)
                             span.end()
                             first_audio_seen = True
+                            span_ended = True
                         yield chunk
+                    if not span_ended:
+                        # Clean zero-audio completion (an alignment-only
+                        # stream, which _to_chunk explicitly supports): no
+                        # TTFB to record, but nothing failed — end OK so the
+                        # docs/04 §7.3 error-rate panel sees no false ERROR.
+                        span.end()
+                        span_ended = True
                     return
                 except (OSError, WebSocketException, ElevenLabsError) as exc:
                     if first_audio_seen or attempt == len(voice_ids) - 1:
@@ -174,8 +190,9 @@ class ElevenLabsTts:
                         error=str(exc),
                     )
         finally:
-            if not first_audio_seen:
-                # No audio byte ever arrived — the TTFB never happened.
+            if not span_ended:
+                # Exception (or consumer close) before any audio byte —
+                # the TTFB genuinely never happened.
                 span.set_status(Status(StatusCode.ERROR))
                 span.end()
 
@@ -209,6 +226,31 @@ class ElevenLabsTts:
                 )
                 if chunk is None:
                     continue  # no audio, no alignment: keep-alive/unknown frame, tolerated
+                if chunk.alignment:
+                    # Judgment call 4's chunk-relative reading is unconfirmed
+                    # until a live key exists (H1). If the vendor is actually
+                    # stream-relative, rebasing double-counts and the values
+                    # grow without bound — this ceiling turns that into a
+                    # loud failure instead of silently corrupting the
+                    # docs/06 §6.3 truncation mapping. (No monotonicity
+                    # check: alignment legitimately looks AHEAD of the PCM
+                    # yielded so far — see the rebasing test's fixture.)
+                    bound = (
+                        ms_base
+                        + len(chunk.pcm) // _PCM_BYTES_PER_MS
+                        + _ALIGNMENT_SANITY_SLACK_MS
+                    )
+                    last_ms = chunk.alignment[-1][1]
+                    if last_ms > bound:
+                        log.error(
+                            "elevenlabs.synthesize.alignment_sanity_failed",
+                            last_ms=last_ms,
+                            bound_ms=bound,
+                        )
+                        raise ElevenLabsError(
+                            "alignment timestamps exceed the chunk-relative bound "
+                            f"(last={last_ms}, bound={bound}) - see judgment call 4"
+                        )
                 yield chunk
                 char_base += len(chunk.alignment)
                 ms_base += len(chunk.pcm) // _PCM_BYTES_PER_MS
