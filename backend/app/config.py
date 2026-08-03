@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     signaling_token_ttl_s: int = 300
     turn_credential_ttl_s: int = 600
     session_grace_s: int = 30
+    # Where the voice-worker's /v1/signal WebSocket listens (app/voice/run.py).
+    # 0.0.0.0 because a real phone must reach it (docker-compose.yml publishes
+    # 8080:8080 — keep the port in lockstep with that mapping).
+    signaling_bind_host: str = "0.0.0.0"
+    signaling_bind_port: int = 8080
 
     # VAD / endpointing (docs/06 §5-§6) — config, never constants in
     # VadEndpointer/barge-in logic (canon §5), so a demo-day tune is an
