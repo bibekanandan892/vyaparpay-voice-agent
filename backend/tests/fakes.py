@@ -20,11 +20,14 @@ pure in-process ones).
 
 from __future__ import annotations
 
+import asyncio
+import math
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from app.domain.types import LLMEvent
+from app.domain.voice import SttEvent, TtsChunk
 
 
 @dataclass(frozen=True)
@@ -120,4 +123,172 @@ class FakeVad:
         return self._probs.pop(0)
 
 
-__all__ = ["FakeLLM", "FakeLLMCall", "FakeVad"]
+class FakeStt:
+    """Scriptable `app.domain.voice.SttProvider` double, push-driven: the
+    test controls WHEN each event lands (worker turn tests sequence
+    partials/finals against VAD frames explicitly), unlike `FakeLLM`'s
+    replay-a-script model. One `stream()` call is one 'socket': `push()`
+    feeds the currently open stream, `fail()` kills it (the docs/06 §9
+    reconnect trigger), and the stream self-ends when the caller's audio
+    iterator ends — mirroring DeepgramStt's CloseStream teardown so a
+    closed AudioIngress winds a worker down cleanly. `streams_opened`
+    counts reconnects; consumed audio accumulates on `.audio`."""
+
+    def __init__(self) -> None:
+        self.streams_opened = 0
+        self.audio: list[bytes] = []
+        self._active: asyncio.Queue[SttEvent | BaseException | None] | None = None
+
+    def push(self, event: SttEvent) -> None:
+        """Emit one event from the currently open stream."""
+        if self._active is None:
+            raise AssertionError(
+                "FakeStt.push() with no open stream — wait for streams_opened "
+                "to advance before pushing events."
+            )
+        self._active.put_nowait(event)
+
+    def fail(self, exc: BaseException) -> None:
+        """Kill the currently open stream with `exc` (a mid-stream death)."""
+        if self._active is None:
+            raise AssertionError("FakeStt.fail() with no open stream")
+        self._active.put_nowait(exc)
+
+    async def stream(
+        self, audio: AsyncIterator[bytes], *, sample_rate: int
+    ) -> AsyncIterator[SttEvent]:
+        self.streams_opened += 1
+        queue: asyncio.Queue[SttEvent | BaseException | None] = asyncio.Queue()
+        self._active = queue
+
+        async def drain() -> None:
+            try:
+                async for chunk in audio:
+                    self.audio.append(chunk)
+            finally:
+                # Audio over -> stream over (the CloseStream analogue).
+                queue.put_nowait(None)
+
+        drain_task = asyncio.create_task(drain())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+
+
+# TtsChunk.pcm is 24 kHz mono s16 (app/domain/voice.py) -> 24 samples/ms.
+_TTS_SAMPLES_PER_MS = 24
+# FakeTts default synthesis pace: 10 ms of audio per character.
+FAKE_TTS_MS_PER_CHAR = 10
+
+
+def _square_wave_pcm(duration_ms: int, *, amplitude: int = 12_000) -> bytes:
+    """Loud deterministic s16le audio (600 Hz square) — survives Opus in
+    the fake-peer E2E, unlike silence."""
+    total = duration_ms * _TTS_SAMPLES_PER_MS
+    out = bytearray()
+    for i in range(total):
+        value = amplitude if math.sin(2 * math.pi * 600 * i / 24_000) >= 0 else -amplitude
+        out += value.to_bytes(2, "little", signed=True)
+    return bytes(out)
+
+
+def fake_tts_chunk(text: str, *, sentence_no: int = 0) -> TtsChunk:
+    """The default FakeTts synthesis for one sentence: 10 ms per char,
+    per-char alignment `(i, 10*i)` — deterministic input for the docs/06
+    §6.3 truncation math."""
+    duration_ms = FAKE_TTS_MS_PER_CHAR * len(text)
+    return TtsChunk(
+        pcm=_square_wave_pcm(duration_ms),
+        alignment=tuple((i, FAKE_TTS_MS_PER_CHAR * i) for i in range(len(text))),
+        sentence_no=sentence_no,
+    )
+
+
+@dataclass
+class _TtsScript:
+    chunks: tuple[TtsChunk, ...]
+    fail_after: int | None  # raise after yielding this many chunks
+    error: BaseException | None
+    hold: asyncio.Event | None  # await before ending the stream
+
+
+class FakeTts:
+    """Scriptable `app.domain.voice.TtsProvider` double. Unscripted text
+    synthesizes one deterministic `fake_tts_chunk`; `script()` pins exact
+    chunks per sentence text, an optional mid-stream failure point
+    (docs/06 §9's skip-and-continue trigger), and an optional `hold`
+    event that keeps the stream in-flight so barge-in tests can cancel a
+    genuinely live synthesis. Calls are recorded as (text, sentence_no)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+        self._scripts: dict[str, _TtsScript] = {}
+
+    def script(
+        self,
+        text: str,
+        *chunks: TtsChunk,
+        fail_after: int | None = None,
+        error: BaseException | None = None,
+        hold: asyncio.Event | None = None,
+    ) -> None:
+        self._scripts[text] = _TtsScript(
+            chunks=chunks, fail_after=fail_after, error=error, hold=hold
+        )
+
+    async def synthesize(self, text: str, *, sentence_no: int) -> AsyncIterator[TtsChunk]:
+        self.calls.append((text, sentence_no))
+        script = self._scripts.get(text)
+        if script is None:
+            yield fake_tts_chunk(text, sentence_no=sentence_no)
+            return
+        for i, chunk in enumerate(script.chunks):
+            if script.fail_after is not None and i == script.fail_after:
+                raise script.error or RuntimeError(f"FakeTts scripted failure on {text!r}")
+            yield chunk.model_copy(update={"sentence_no": sentence_no})
+        if script.fail_after is not None and script.fail_after >= len(script.chunks):
+            raise script.error or RuntimeError(f"FakeTts scripted failure on {text!r}")
+        if script.hold is not None:
+            await script.hold.wait()
+
+
+class FakeBrain:
+    """Scriptable `app.voice.worker.Brain` double — one reply per
+    expected `on_stt_final()` call, FIFO, same run-dry discipline as
+    `FakeLLM`/`FakeVad`. Utterances received are recorded on `.calls`."""
+
+    def __init__(self) -> None:
+        self._replies: list[str] = []
+        self.calls: list[str] = []
+
+    def script(self, *replies: str) -> None:
+        self._replies.extend(replies)
+
+    async def on_stt_final(self, text: str) -> str:
+        self.calls.append(text)
+        if not self._replies:
+            raise AssertionError(
+                "FakeBrain.on_stt_final() called with no scripted reply left — "
+                "script one reply per expected turn."
+            )
+        return self._replies.pop(0)
+
+
+__all__ = [
+    "FAKE_TTS_MS_PER_CHAR",
+    "FakeBrain",
+    "FakeLLM",
+    "FakeLLMCall",
+    "FakeStt",
+    "FakeTts",
+    "FakeVad",
+    "fake_tts_chunk",
+]
