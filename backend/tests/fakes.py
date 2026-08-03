@@ -85,4 +85,39 @@ class FakeLLM:
             yield event
 
 
-__all__ = ["FakeLLM", "FakeLLMCall"]
+class FakeVad:
+    """Scriptable `app.domain.voice.VadModel` double — one scripted speech
+    probability per expected `prob()` call, in call order, so endpoint-
+    policy tests (tests/voice/test_vad_endpointer.py) drive the §5.3
+    decision table deterministically with no onnxruntime in the loop —
+    exactly the split `VadModel`'s docstring promises.
+
+    Same discipline as `FakeLLM`: script via `.script(...)` (or the
+    constructor), one prob is consumed per `prob()` call, and running dry
+    is a test-authoring bug that raises loudly rather than silently
+    returning a default that would masquerade as silence. Frames passed
+    in are recorded on `.calls` for the rare test that asserts what audio
+    actually reached the model.
+    """
+
+    def __init__(self, probs: Sequence[float] = ()) -> None:
+        self._probs: list[float] = list(probs)
+        self.calls: list[bytes] = []
+
+    def script(self, *probs: float) -> None:
+        """Append probabilities to the script, consumed FIFO — one per
+        upcoming `prob()` call."""
+        self._probs.extend(probs)
+
+    def prob(self, frame_30ms: bytes) -> float:
+        self.calls.append(frame_30ms)
+        if not self._probs:
+            raise AssertionError(
+                "FakeVad.prob() called with no scripted probability left — call "
+                ".script(...) with one probability per frame the code under test "
+                "will process."
+            )
+        return self._probs.pop(0)
+
+
+__all__ = ["FakeLLM", "FakeLLMCall", "FakeVad"]

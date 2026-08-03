@@ -17,7 +17,7 @@ flowchart LR
     OENC --> NET["SRTP: P2P or coturn relay"]
     NET --> PS["aiortc PeerSession"]
     PS --> ING["AudioIngress: Opus decode + resample to 16 kHz mono PCM"]
-    ING --> VAD["VadEndpointer (Silero, 30 ms frames)"]
+    ING --> VAD["VadEndpointer (Silero, 32 ms frames)"]
     ING --> DG["Deepgram Nova-3 stream (partials + finals)"]
     VAD -->|"endpoint"| BRAIN["Agent brain (docs/05): context, LLM, tools, safety"]
     DG --> BRAIN
@@ -43,7 +43,7 @@ aiortc is a protocol library, not a voice framework — it implements SDP, ICE, 
 |---|---|---|
 | SDP / ICE / DTLS-SRTP machinery | `RTCPeerConnection` state machines | `SignalingServer` + `PeerSession` drive them: answer, trickle ICE, teardown (§2) |
 | Opus decode/encode + RTP + inbound jitter buffer | Built in | `AudioIngress` drains the remote track; `AudioEgress` feeds the outbound one, paced (§7) |
-| Voice activity + endpointing | — | `VadEndpointer`: Silero via onnxruntime, 30 ms frames, endpoint policy (§5) |
+| Voice activity + endpointing | — | `VadEndpointer`: Silero via onnxruntime, 512-sample / 32 ms frames, endpoint policy (§5) |
 | Barge-in | — | Duck-then-commit cancellation tree, transcript truncation, `[interrupted]` marker (§6) |
 | STT transport | — | `DeepgramStt` behind `SttProvider` (canon §3) |
 | TTS transport | — | `ElevenLabsTts` behind `TtsProvider`; the sentence chunker that feeds it |
@@ -162,7 +162,7 @@ The turn is the unit: **user stops speaking → agent audio starts.** Targets ar
 
 | Stage | p50 (ms) | p95 (ms) |
 |---|---|---|
-| VAD endpoint detection (Silero, 30 ms frames) | 250 | 400 |
+| VAD endpoint detection (Silero, 32 ms frames) | 250 | 400 |
 | Deepgram STT finalization after endpoint | 80 | 150 |
 | Context assembly + prompt build (Redis reads) | 15 | 40 |
 | LLM time-to-first-token via OpenRouter (cached prefix) | 450 | 900 |
@@ -177,7 +177,7 @@ Every stage below the VAD line maps to a named OTel span under the per-turn `tur
 
 | Stage | How the number is achieved | OTel span / instrument |
 |---|---|---|
-| VAD endpoint (250/400) | `VadEndpointer` runs Silero on 30 ms frames and endpoints at ≥ 250 ms of trailing silence, held open by the completeness check (§5) so we endpoint on a real turn boundary, not the first gap. This is the largest single line and it is a **deliberate** cost — it is the price of not cutting the caller off mid-sentence | The endpoint decision is what *opens* the `turn` span, so it is recorded as an `endpoint_ms` attribute on it, not a child span |
+| VAD endpoint (250/400) | `VadEndpointer` runs Silero on 32 ms frames and endpoints at ≥ 250 ms of trailing silence, held open by the completeness check (§5) so we endpoint on a real turn boundary, not the first gap. This is the largest single line and it is a **deliberate** cost — it is the price of not cutting the caller off mid-sentence | The endpoint decision is what *opens* the `turn` span, so it is recorded as an `endpoint_ms` attribute on it, not a child span |
 | STT finalization (80/150) | Deepgram streams partials throughout the utterance; on endpoint only the *tail* needs finalizing, not the whole utterance — the partials already arrived | `stt.final` span |
 | Context + prompt (15/40) | Three pipelined Redis reads (`session:{id}`, `ctx:{session_id}`, rolling summary); no LLM, no network beyond Redis; assembly is mechanical ([docs/08](08-context-and-events.md)) | `context.build` span |
 | LLM TTFT (450/900) | The dominant model cost, held down by **prompt prefix caching** — the stable slots (system, persona, business rules) are ordered first so the provider serves them from cache (canon §8, [docs/11](11-prompt-engineering.md)); a cold prefix roughly doubles this line | `llm.ttft` span; `cache_hit` attribute |
@@ -223,7 +223,7 @@ Endpointing is the hardest human-factors problem in the pipeline and the biggest
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| Frame size | 30 ms | Silero's streaming hop — a speech-probability decision every 30 ms (canon §3) |
+| Frame size | 512 samples / 32 ms | Silero's native streaming hop at 16 kHz — a speech-probability decision every 32 ms (canon §3). The model additionally consumes a 64-sample rolling context from the previous hop, prepended internally by the `SileroVad` wrapper — invisible to the endpointer |
 | VAD activation threshold | ~0.5 speech probability | Silero default, workable after client-side NS has cleaned the shop background |
 | min-speech-duration | 200 ms | Reject coughs, door slams, single-syllable counter noise — nothing under 200 ms opens a turn or fires a barge-in (§6) |
 | min-silence-duration (endpoint) | ≥ 250 ms | Trailing silence before the turn is *considered* over |
@@ -364,7 +364,7 @@ The stored turn now reflects that Asha stated the *limit* but never voiced the *
 
 Owning both peers means owning both buffering problems: absorbing the network's timing noise on the way in, and imposing real-time discipline on audio that arrives faster than real time on the way out.
 
-**Inbound: aiortc's jitter buffer, our clean frames.** aiortc reorders and de-jitters incoming RTP before decoding, and Opus PLC conceals what loss FEC could not recover — so by the time `AudioIngress` sees PCM, moderate network misbehavior is already hidden. `AudioIngress` slices that stream into the two shapes its consumers need: contiguous PCM for the Deepgram socket, and exact 30 ms hops for Silero. DTX gaps (the client sending nothing during silence) are surfaced to `VadEndpointer` as silence frames rather than skipped time, so the trailing-silence clock keeps honest time even when no packets arrive.
+**Inbound: aiortc's jitter buffer, our clean frames.** aiortc reorders and de-jitters incoming RTP before decoding, and Opus PLC conceals what loss FEC could not recover — so by the time `AudioIngress` sees PCM, moderate network misbehavior is already hidden. `AudioIngress` slices that stream into the two shapes its consumers need: contiguous PCM for the Deepgram socket, and exact 512-sample (32 ms) hops for Silero. DTX gaps (the client sending nothing during silence) are surfaced to `VadEndpointer` as silence frames rather than skipped time, so the trailing-silence clock keeps honest time even when no packets arrive.
 
 **Outbound: pacing is ours, and it is load-bearing.** aiortc pulls one 20 ms frame from the outbound `AudioStreamTrack` every 20 ms of wall-clock time — but ElevenLabs synthesizes faster than real time and delivers in bursts. `AudioEgress` sits between them as a paced queue: TTS audio lands in the queue as fast as it streams in, and frames leave at exactly the 20 ms cadence the track demands. Two properties of that queue matter beyond smoothness:
 
@@ -474,7 +474,7 @@ The honest headline: the §4 budget was measured on a LAN — where ICE lands on
 | Call-setup budget | WS + SDP + trickle ICE to first media ≤ 1.5 s p50; TURN-relayed worst case ≤ 3 s | [docs/02](02-system-architecture.md), [docs/13](13-api-contracts.md) |
 | Wire audio format | Opus VoIP, 48 kHz mono, 20 ms frames, ~24 kbps, FEC + DTX on, over DTLS-SRTP | [docs/02](02-system-architecture.md) |
 | Client APM requirement | AEC (mandatory — prevents self-barge-in) + NS + AGC + HPF via `JavaAudioDeviceModule` / `VOICE_COMMUNICATION` | Android `:voice` module |
-| Endpointing policy | Silero on 30 ms frames; 200 ms min-speech; ≥ 250 ms trailing-silence endpoint + completeness hold; 2 s cap; filler suppression | [docs/05](05-agent-architecture.md) |
+| Endpointing policy | Silero on 512-sample / 32 ms frames; 200 ms min-speech; ≥ 250 ms trailing-silence endpoint + completeness hold; 2 s cap; filler suppression | [docs/05](05-agent-architecture.md) |
 | Barge-in mechanism | Duck-first then commit at 200 ms; ≤ 250 ms perceived stop; character-timing transcript truncation + `[interrupted]` marker | [docs/05](05-agent-architecture.md), [docs/09](09-memory-architecture.md) |
 | Filler policy | ≤ once per turn; on 1.5 s TTFT deadline or >1 s tool round-trip; *"Let me check that for you…"* | [docs/05](05-agent-architecture.md) |
 | Outbound pacing | 20 ms cadence from a single paced queue; bounded synthesis lead; silence on underrun | `app/voice/` (`AudioEgress`), §6 flush semantics |
