@@ -1,4 +1,12 @@
-# docker-compose.yml — local Phase-2 stack (postgres + redis + agent-api).
+# docker-compose.yml — local stack.
+#
+# Default `docker compose up`: postgres + redis + coturn + agent-api +
+# voice-worker. `docker compose --profile obs up` adds tempo + grafana so
+# the Phase-3 per-turn spans have somewhere to land (see the `obs` block at
+# the bottom).
+#
+# Setup, per-service purpose, and the "this only works on localhost" caveats
+# are in infra/README.md. Read that before pointing a real phone at this.
 #
 # `version:` is intentionally omitted — obsolete in current Compose Spec.
 #
@@ -9,7 +17,8 @@
 # matter what host segment backend/.env has for those two vars under this
 # stack. backend/.env.example ships `localhost` values because that file
 # also doubles as the template for running the backend directly on the
-# host (outside Docker), where the override above doesn't apply.
+# host (outside Docker), where the override above doesn't apply. The same
+# override applies to voice-worker, for the same reason.
 
 services:
   postgres:
@@ -42,8 +51,107 @@ services:
       timeout: 5s
       retries: 10
 
+  coturn:
+    # STUN + TURN (ADR-006). Config and the full "why" per directive live in
+    # infra/docker/coturn/turnserver.conf; the TLS cert it needs comes from
+    # infra/docker/coturn/gen-cert.sh, which must be run once before `up`.
+    image: coturn/coturn:4.16
+    env_file:
+      # coturn only actually needs TURN_SECRET (and optionally
+      # TURN_EXTERNAL_IP), but it reads the whole file because backend/.env
+      # is this stack's single secrets file and TURN_SECRET has to be the
+      # *same* value agent-api HMACs credentials with (docs/13 §7) — one
+      # file is the cheapest way to guarantee that. The cost is that the
+      # LLM/STT/TTS keys are also in this container's environment; a
+      # production compose would pass the one variable it needs.
+      - backend/.env
+    entrypoint:
+      # coturn's config parser has no environment-variable interpolation
+      # (upstream feature request, not a feature), so the secret cannot
+      # live in turnserver.conf without being hardcoded there — which canon
+      # forbids. Instead: render the tracked config plus the env-derived
+      # lines into a 0600 temp file at start, and run against that. Passing
+      # --static-auth-secret on the command line would work too, and would
+      # put the secret in the container's process table; this doesn't.
+      #
+      # `$$` is an escaped `$`: Compose interpolates single-`$` itself, so
+      # `$$TURN_SECRET` is what reaches the shell inside the container.
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ -z "$${TURN_SECRET:-}" ]; then
+          echo "coturn: TURN_SECRET is unset or empty in backend/.env." >&2
+          echo "coturn: it is the use-auth-secret shared secret agent-api HMACs" >&2
+          echo "coturn: ice_servers credentials with (docs/13 section 7) - both" >&2
+          echo "coturn: sides must read the same value. See backend/.env.example." >&2
+          exit 1
+        fi
+        case "$$TURN_SECRET" in *'#'*)
+          echo "coturn: TURN_SECRET contains '#', which coturn's conf parser" >&2
+          echo "coturn: treats as a comment start - the secret would be silently" >&2
+          echo "coturn: truncated and every TURN allocation would fail against" >&2
+          echo "coturn: agent-api's HMAC. Use a '#'-free value (see .env.example)." >&2
+          exit 1
+        ;; esac
+        if [ "$$(printf '%s' "$$TURN_SECRET" | wc -l)" -ne 0 ]; then
+          echo "coturn: TURN_SECRET contains an embedded newline - it would" >&2
+          echo "coturn: split into extra conf lines and desync from agent-api's" >&2
+          echo "coturn: HMAC. Single-line values only." >&2
+          exit 1
+        fi
+        if [ ! -r /etc/coturn/certs/turn_server_cert.pem ] \
+        || [ ! -r /etc/coturn/certs/turn_server_pkey.pem ]; then
+          echo "coturn: TLS cert/key missing or unreadable under /etc/coturn/certs." >&2
+          echo "coturn: run ./infra/docker/coturn/gen-cert.sh on the host, then" >&2
+          echo "coturn: 'docker compose up -d coturn' again. The turns: listener on" >&2
+          echo "coturn: 5349 cannot start without them." >&2
+          exit 1
+        fi
+        umask 077
+        cp /etc/coturn/turnserver.conf /tmp/turnserver.conf
+        printf 'static-auth-secret=%s\n' "$$TURN_SECRET" >> /tmp/turnserver.conf
+        if [ -n "$${TURN_EXTERNAL_IP:-}" ]; then
+          printf 'external-ip=%s\n' "$$TURN_EXTERNAL_IP" >> /tmp/turnserver.conf
+        fi
+        exec turnserver -c /tmp/turnserver.conf
+    volumes:
+      - ./infra/docker/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./infra/docker/coturn/certs:/etc/coturn/certs:ro
+    ports:
+      # Bound on 0.0.0.0, unlike postgres/redis above, and that is the
+      # point: media does not tunnel, so the phone reaches coturn directly
+      # on the host's LAN IP (docs/04 §9). What keeps an externally
+      # reachable relay from being an *open* relay is `use-auth-secret` —
+      # every allocation needs an unexpired HMAC credential.
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/tcp"
+      - "5349:5349/udp"
+      # The relay port range, and it must stay identical to min-port /
+      # max-port in turnserver.conf — an allocation handed a port the host
+      # never forwarded fails in a way that looks like a NAT problem.
+      # 41 ports because each one costs a docker-proxy process at `up` and
+      # the demo is 1:1 calls.
+      - "49160-49200:49160-49200/udp"
+    # docs/06 §9 names the compose restart policy as the coturn-outage
+    # mitigation: TURN credentials are stateless HMAC, so a restarted
+    # coturn honours already-minted credentials with no re-mint. The
+    # trade-off is that a missing TURN_SECRET or cert restart-loops instead
+    # of exiting once — Docker's exponential backoff keeps that cheap, and
+    # the entrypoint's message is in `docker compose logs coturn` either way.
+    restart: unless-stopped
+    # No healthcheck on purpose. coturn ships no auth-free liveness probe
+    # that reliably exits non-zero when the server is wedged, and nothing
+    # here depends_on it — a healthcheck that cannot fail is worse than an
+    # absent one. ICE failure on the client is the real signal.
+
   agent-api:
     build: ./backend
+    # Shared tag with voice-worker below: docs/04 §1 is "one image, built
+    # once, started two ways", and naming it makes that literally true —
+    # the two services differ only in `command:`, and `up` builds once.
+    image: vyapar-backend:dev
     env_file:
       - backend/.env
     environment:
@@ -64,5 +172,119 @@ services:
     ports:
       - "8000:8000"
 
+  voice-worker:
+    # THIS SERVICE CANNOT START YET — `backend/app/voice/run.py` does not
+    # exist. It lands in a later Phase-3 task that owns backend/app/voice/;
+    # until then `docker compose up` brings the rest of the stack up and
+    # this one container exits with "No module named app.voice.run". Use
+    # `docker compose up postgres redis coturn agent-api` in the meantime.
+    #
+    # It is wired ahead of the code deliberately: the infrastructure shape
+    # (image, command, ports, env, dependencies) is reviewable now, and the
+    # task that adds run.py then adds only run.py.
+    #
+    # Same build context and same image tag as agent-api — the second of
+    # the two entrypoints in docs/04 §1. Only `command:` differs.
+    build: ./backend
+    image: vyapar-backend:dev
+    # Overrides the Dockerfile CMD, which is agent-api's (alembic upgrade
+    # + uvicorn). Migrations stay agent-api's job: two containers racing
+    # `alembic upgrade head` against one database is a lock-contention bug
+    # waiting for a demo audience.
+    command: python -m app.voice.run
+    env_file:
+      # Carries the whole Phase-3 voice set: DEEPGRAM_API_KEY,
+      # ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID, TURN_SECRET, COTURN_HOST,
+      # SIGNALING_PUBLIC_URL, and the VAD/endpointing tuning knobs
+      # (backend/.env.example documents each). The worker fail-fasts at its
+      # own startup on the subset it requires.
+      - backend/.env
+    environment:
+      # Same compose-hostname override as agent-api, same reason.
+      DATABASE_URL: postgresql+asyncpg://vyapar:vyapar@postgres:5432/vyapar
+      REDIS_URL: redis://redis:6379/0
+      # The one var that genuinely differs between the two entrypoints:
+      # spans and logs from this process must be attributable to the
+      # worker, not to agent-api (docs/04 §7).
+      OTEL_SERVICE_NAME: voice-worker
+    depends_on:
+      # Same gate as agent-api: the worker reads session state from Redis
+      # (the one-time signaling token it burns at WS accept) and writes
+      # post-call rows to Postgres.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      # The /v1/signal WebSocket (docs/13 §6). Bound on 0.0.0.0, like
+      # agent-api's 8000 and for the same reason: a real phone has to reach
+      # it, and SIGNALING_PUBLIC_URL in backend/.env must name a host that
+      # resolves *from the phone*, not from the host machine.
+      #
+      # Media (SRTP) is NOT published here. aiortc allocates ephemeral UDP
+      # ports there is no way to pin in compose, and on the bridge network
+      # this container's host candidates are 172.x addresses no phone can
+      # route to — which is why a real-device call goes through the coturn
+      # relay. infra/README.md, "Before this is a real deployment", covers
+      # the `network_mode: host` alternative and its OS caveat.
+      - "8080:8080"
+
+  # --- obs profile ------------------------------------------------------
+  # `docker compose --profile obs up -d` adds a trace sink so the per-turn
+  # spans are inspectable while the voice pipeline is under construction.
+  # Not started by a plain `up`: it is two more containers for something
+  # only useful when you are actually looking at latency.
+  #
+  # One thing still has to be switched on by hand — OTEL_EXPORTER_OTLP_ENDPOINT
+  # ships empty in backend/.env.example (empty disables export). Set it to
+  # http://tempo:4317 and restart agent-api / voice-worker, or nothing
+  # arrives and Tempo looks broken when it is merely idle.
+  #
+  # This is NOT the docs/04 §7 observability stack — no Loki, no
+  # trace-to-logs correlation, no provisioned dashboard. Those are Phase 5.
+  tempo:
+    profiles: ["obs"]
+    image: grafana/tempo:2.9.4
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    # Tempo's image runs as uid 10001, and a fresh named volume is created
+    # root-owned — so the ingester cannot write its WAL and the container
+    # crash-loops. Upstream's own example solves this with an init
+    # container that chowns the mount; for a profile-gated local trace sink,
+    # running as root is one line instead of a whole extra service. Do not
+    # copy this into anything that leaves a laptop.
+    user: "0:0"
+    volumes:
+      - ./infra/docker/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      # Loopback-only: a dev trace store with no auth at all.
+      # 3200 = Tempo's query API (what Grafana's datasource talks to).
+      # 4317 = OTLP/gRPC ingest, published so a backend run directly on the
+      # host (the other supported workflow, see backend/.env.example) can
+      # export to it too. Containers reach it as tempo:4317 regardless.
+      - "127.0.0.1:3200:3200"
+      - "127.0.0.1:4317:4317"
+
+  grafana:
+    profiles: ["obs"]
+    image: grafana/grafana:13.1
+    environment:
+      # Anonymous admin, no login form: this is a single-user local UI
+      # bound to loopback, and a password prompt in front of a dev trace
+      # viewer is friction with no threat model behind it.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      # Datasource provisioning only (Tempo pre-wired). No persistent
+      # volume on purpose — nothing here is worth keeping across a
+      # `compose down`, and provisioning makes the container disposable.
+      - ./infra/docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - tempo
+
 volumes:
   postgres_data:
+  tempo_data:

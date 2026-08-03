@@ -1,0 +1,11 @@
+# Marker so the directory exists in a fresh clone.
+#
+# gen-cert.sh writes turn_server_cert.pem / turn_server_pkey.pem here and
+# docker-compose.yml bind-mounts this directory read-only into coturn at
+# /etc/coturn/certs. The directory has to exist before `docker compose up`
+# or Docker creates it root-owned, and gen-cert.sh (which runs as you) then
+# cannot write into it.
+#
+# The .pem files themselves are gitignored (`*.pem` in the root
+# .gitignore) — same ignore-the-contents-keep-the-marker shape as
+# backend/app/voice/models/.

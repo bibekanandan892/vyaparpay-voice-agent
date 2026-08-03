@@ -1,0 +1,58 @@
+# infra/docker/tempo/tempo.yaml — minimal single-binary Tempo for the
+# `obs` compose profile (ADR-005; docs/04 §7).
+#
+# Scope check: this file exists so the Phase-3 per-turn spans
+# (`turn` → `stt.final` → `context.build` → `llm.ttft` → `tool.exec.<name>`
+# → `tts.first_byte`) have somewhere to land while the voice pipeline is
+# being built. It is NOT the observability stack docs/04 §7 specifies —
+# there is no Loki, no trace-to-logs correlation, and no provisioned
+# dashboard here. Those are Phase-5 work; this is the trace sink that keeps
+# a latency question answerable in the meantime.
+#
+# To use it: `docker compose --profile obs up -d`, then set
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317 in backend/.env (it ships
+# empty, which disables export entirely) and restart agent-api /
+# voice-worker.
+
+server:
+  # Tempo's own HTTP API — Grafana's Tempo datasource queries this.
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        # 4317 is OTLP/gRPC, which is what the backend's
+        # opentelemetry-exporter-otlp-proto-grpc dependency speaks.
+        # The endpoint is written out explicitly rather than left to
+        # default: the upstream OTLP receiver default binds localhost,
+        # which inside a container means "nothing else can reach me".
+        grpc:
+          endpoint: 0.0.0.0:4317
+        # 4318 is OTLP/HTTP — not used by this stack, but it costs one
+        # line and saves the next person debugging why curl'ing a span in
+        # by hand does not work.
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # Cut a block every 5 minutes instead of the default 30, so a trace
+  # emitted during a demo call is queryable within the demo rather than
+  # after it.
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    # Local dev traces are worthless after an hour and the volume is a
+    # laptop disk. Anything longer is hoarding.
+    block_retention: 1h
+
+storage:
+  trace:
+    # `local` = blocks on a container volume. Single binary, no object
+    # store, no dependencies — the whole point of the minimal profile.
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks

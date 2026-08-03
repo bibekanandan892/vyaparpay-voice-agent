@@ -64,6 +64,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The only job with a Docker CLI, so it is the cheapest place to
+      # catch a compose syntax/interpolation error before someone hits it
+      # on `docker compose up`. `working-directory` overrides the job-wide
+      # `backend` default — the compose file is at the repo root.
+      # backend/.env is gitignored, and `env_file:` entries must resolve
+      # for `config` to succeed, so it is synthesized from the template and
+      # removed again (trap, so a failing validation still cleans up) —
+      # otherwise Settings' `env_file=".env"` would silently pick it up in
+      # the pytest step below.
+      - name: Validate compose file
+        working-directory: .
+        run: |
+          cp backend/.env.example backend/.env
+          trap 'rm -f backend/.env' EXIT
+          docker compose config -q
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"

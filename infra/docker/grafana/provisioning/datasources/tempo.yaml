@@ -1,0 +1,25 @@
+# Grafana datasource provisioning for the `obs` compose profile.
+#
+# Without this file Grafana starts empty and the first thing anyone does is
+# click through the Add-datasource wizard to type `http://tempo:3200` —
+# every time the container is recreated, because the demo runs Grafana with
+# no persistent volume. Ten lines here make `docker compose --profile obs
+# up` land on a Grafana that can already see traces.
+#
+# Deliberately just the datasource: no dashboards. The six-panel board in
+# docs/04 §7.3 needs Loki (cost/token/error panels come from LogQL over the
+# structlog stream) and is Phase-5 work, and a half-wired dashboard is
+# worse than an honest absence.
+
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    # `proxy` = Grafana's backend does the querying, so the URL resolves on
+    # the compose network (`tempo`), not in the operator's browser.
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    editable: true

@@ -1,0 +1,13 @@
+# Line endings for files that are executed or bind-mounted inside Linux
+# containers.
+#
+# This repo has no .gitattributes history and `core.autocrlf=true` is the
+# Windows default, so without these rules a Windows checkout hands coturn a
+# turnserver.conf whose every value ends in a stray \r, and gen-cert.sh a
+# shebang line that reads `#!/usr/bin/env sh\r` — both fail in ways that
+# look like anything except a line-ending problem. Scoped by file type
+# rather than by path so a new mounted config inherits it automatically.
+*.sh   text eol=lf
+*.conf text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
