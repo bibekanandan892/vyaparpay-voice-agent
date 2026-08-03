@@ -194,4 +194,8 @@ async def test_push_pcm_validates_its_inputs() -> None:
         ingress.push_pcm(b"", sample_rate=STT_SAMPLE_RATE)  # empty
     with pytest.raises(ValueError):
         ingress.push_pcm(b"\x00\x00", sample_rate=STT_SAMPLE_RATE, channels=3)
+    with pytest.raises(ValueError):
+        ingress.push_pcm(b"\x00\x00", sample_rate=0)  # not ZeroDivisionError
+    with pytest.raises(ValueError):
+        ingress.push_pcm(b"\x00\x00", sample_rate=-16_000)
     ingress.close()

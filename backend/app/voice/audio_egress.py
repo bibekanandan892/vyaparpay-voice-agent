@@ -27,7 +27,12 @@ Judgment calls, flagged per house style:
 5. **`flush()` rebuilds the resampler.** PyAV's AudioResampler is
    single-use once flushed (probed on av 17.1: EOFError on reuse), so
    dropping the object is both correct and exactly flush semantics — the
-   ~1 ms tail it holds belongs to the audio being dropped.
+   ~1 ms tail it holds belongs to the audio being dropped. Unlike
+   `drain()`, `flush()` never calls `resample(None)`, so that held tail
+   is discarded *uncounted* — it appears in neither `dropped_ms` nor
+   `dropped_sentences`, and is the second contributor (besides per-chunk
+   boundary attribution) to the ~0.7 ms accounting slop documented on
+   `FlushResult`.
 6. **`drain()` exists because the resampler withholds a small tail**
    (~32 samples at 48 kHz, ~0.7 ms, filter delay). End-of-turn callers
    drain it so a reply's last millisecond actually plays; the tail is

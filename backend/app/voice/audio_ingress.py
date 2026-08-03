@@ -134,6 +134,8 @@ class AudioIngress:
         """Raw-PCM input seam (judgment call 1): interleaved s16le at
         `sample_rate`. `ts_ms` positions the chunk on the media clock;
         omit it for contiguous-with-previous."""
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         if channels not in (1, 2):
             raise ValueError(f"channels must be 1 or 2, got {channels}")
         frame_size = BYTES_PER_SAMPLE * channels
