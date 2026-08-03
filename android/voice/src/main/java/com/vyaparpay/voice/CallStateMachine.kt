@@ -82,6 +82,15 @@ public class CallStateMachine {
             is CallEvent.Failed ->
                 // ICE failed / DTLS timeout — the media plane never came up.
                 CallState.Ended(EndReason.SETUP_FAILED) to listOf(CallEffect.ReleaseCall)
+            CallEvent.TransportLost ->
+                // libwebrtc reports an initial-connect ICE/DTLS failure as
+                // PeerConnectionState.FAILED, which reaches the reducer as
+                // the same TransportLost used for post-connect losses. Here
+                // there is no call to salvage — a grace timer would leave a
+                // stuck Connecting call holding a live mic (docs/03 §2.2's
+                // "a leaked PeerConnection is a live mic"), so it is a setup
+                // failure, the docs/03 §3.2 Connecting → Ended row.
+                CallState.Ended(EndReason.SETUP_FAILED) to listOf(CallEffect.ReleaseCall)
             CallEvent.SignalingClosed ->
                 CallState.Ended(EndReason.SETUP_FAILED) to listOf(CallEffect.ReleaseCall)
             is CallEvent.RemoteBye ->

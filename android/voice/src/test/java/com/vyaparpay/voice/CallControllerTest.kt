@@ -221,6 +221,28 @@ class CallControllerTest {
     }
 
     @Test
+    fun `ice failure during connecting ends the call and releases the mic`() = runTest {
+        // Review regression (HIGH): the REAL WebRtcClient impl folds an
+        // initial-connect PeerConnectionState.FAILED into RtcEvent
+        // .TransportLost - the same event as a post-connect loss. Driven
+        // end-to-end through the controller, Connecting must terminate
+        // (release the peer = release the mic), never sit in Connecting.
+        val controller = controller()
+        controller.startCall(request)
+        runCurrent()
+        signaling.frames.emit(SignalFrame.Answer("v=0-answer"))
+        runCurrent()
+        check(controller.state.value == CallState.Connecting)
+
+        webRtc.events.emit(RtcEvent.TransportLost)
+        runCurrent()
+
+        assertEquals(CallState.Ended(EndReason.SETUP_FAILED), controller.state.value)
+        assertEquals(1, webRtc.closeCount)
+        assertEquals(1, signaling.closeCount)
+    }
+
+    @Test
     fun `an answer that never comes times out into a setup failure`() = runTest {
         val controller = controller()
         controller.startCall(request)

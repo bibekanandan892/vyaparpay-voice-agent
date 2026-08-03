@@ -52,7 +52,10 @@ public enum class EndReason {
 }
 
 /**
- * Whether a live `PeerConnection` should exist for this state.
+ * Whether this state represents an established call worth restoring —
+ * the docs/03 §7 process-death question, not "does a `PeerConnection`
+ * object exist" (one is created as early as `Signaling`, but a call that
+ * never reached media is redialed from scratch, never resumed).
  *
  * The system's rule, translated to the client: end the call honestly, never
  * fake a live one. The overlay must never show a listening indicator over a

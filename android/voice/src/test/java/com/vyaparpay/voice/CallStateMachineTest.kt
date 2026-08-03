@@ -121,6 +121,21 @@ class CallStateMachineTest {
     }
 
     @Test
+    fun `transport lost while connecting ends the call - never a stuck live mic`() {
+        // Review regression (HIGH): libwebrtc reports an initial-connect
+        // ICE/DTLS failure as PeerConnectionState.FAILED, which arrives here
+        // as TransportLost - the SAME event as a post-connect loss. In
+        // Connecting there is no call to salvage: it must end and release,
+        // not fall through to stay() holding a live mic forever.
+        driveTo(CallState.Connecting)
+
+        val effects = machine.dispatch(CallEvent.TransportLost)
+
+        assertEquals(listOf(CallEffect.ReleaseCall), effects)
+        assertEquals(CallState.Ended(EndReason.SETUP_FAILED), machine.state.value)
+    }
+
+    @Test
     fun `hanging up before the bundle arrives cancels the attempt`() {
         driveTo(CallState.Requesting)
 
