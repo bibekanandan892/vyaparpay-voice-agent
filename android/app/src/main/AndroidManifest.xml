@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The scaffold declares no runtime permissions of its own. RECORD_AUDIO,
+  FOREGROUND_SERVICE_MICROPHONE and POST_NOTIFICATIONS arrive in :voice's
+  manifest together with VoiceCallService (docs/03 §3.3) — a fintech app that
+  ships a mic permission before it ships anything that records is a Play-review
+  question with no good answer. INTERNET is merged in from :core:network.
+
+  There is deliberately no android:icon yet: a launcher icon needs a raster
+  fallback below API 26 and this scaffold carries no binary assets, so the
+  system default stands in. Android Lint reports MissingApplicationIcon as a
+  warning, which is the honest severity for it.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:name=".VyaparApp"
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.VyaparPay">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.VyaparPay"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The module that owns the sockets owns the permission. Nothing else in the
+  scaffold declares a permission yet: RECORD_AUDIO, FOREGROUND_SERVICE and
+  POST_NOTIFICATIONS arrive in :voice's manifest together with the service that
+  needs them (docs/03 §3.3), not ahead of it.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+</manifest>

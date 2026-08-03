@@ -1,0 +1,8 @@
+# The Gradle wrapper is authored on Windows and executed on a Linux CI runner.
+# Without this, a checkout with core.autocrlf=true can hand `gradlew` CRLF line
+# endings, and `#!/bin/sh\r` fails with a "bad interpreter" error that reads like
+# a missing file. Pinning the jar as binary keeps any text filter away from it.
+* text=auto eol=lf
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+*.jar binary

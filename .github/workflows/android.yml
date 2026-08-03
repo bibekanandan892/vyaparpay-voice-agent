@@ -1,0 +1,100 @@
+# Android CI — the first thing that ever compiles android/**.
+#
+# This workflow is not a regression net over a build someone already ran: the
+# scaffold was authored on a machine with no Android SDK and no local Gradle, so
+# this job IS the build. That shapes two decisions below:
+#
+# - The module dependency rule (docs/03 §1) runs as its own first step rather
+#   than only as a side effect of `check`, so a graph violation reads as a
+#   graph violation instead of a compile failure three steps later.
+# - The debug APK is uploaded as an artifact. Nobody on this project can produce
+#   an installable build locally, so a downloadable app-debug.apk is the only
+#   route from a green tick to a phone.
+#
+# `protocol/**` is in the path filter because the Android golden tests consume
+# protocol/fixtures — a fixture change has to re-run this suite even when no
+# Kotlin moved. Nothing wires those fixtures in yet; the trigger is here so the
+# day they land, the coupling is already honest.
+name: Android
+
+on:
+  pull_request:
+    paths:
+      - "android/**"
+      - "protocol/**"
+      - ".github/workflows/android.yml"
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "protocol/**"
+      - ".github/workflows/android.yml"
+
+# Least-privilege, matching ci.yml: no step here consumes the ambient token
+# beyond checkout, so nothing else is granted.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: android
+
+jobs:
+  build:
+    name: rules + assemble + unit tests + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # AGP 8.13 requires JDK 17 and rejects anything older.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Validates the committed gradle-wrapper.jar against Gradle's published
+      # checksums by default, which is the safety net that makes committing the
+      # jar the right call rather than a liability.
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          build-root-directory: android
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      # The runner image pre-accepts these; re-accepting is a no-op that costs a
+      # second and removes a confusing failure mode when AGP auto-downloads the
+      # compileSdk 36 platform.
+      - name: Accept Android SDK licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Module dependency rules (docs/03 §1)
+        run: ./gradlew checkModuleDependencyRules
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug
+
+      - name: Unit tests (all modules)
+        run: ./gradlew testDebugUnitTest
+
+      - name: Android Lint
+        run: ./gradlew lint
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # Without a local SDK, a red build is otherwise a wall of Gradle stack
+      # trace; the HTML reports are what make it diagnosable.
+      - name: Upload test and lint reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-reports
+          path: |
+            android/**/build/reports/**
+            android/**/build/test-results/**
+          if-no-files-found: ignore
+          retention-days: 7
