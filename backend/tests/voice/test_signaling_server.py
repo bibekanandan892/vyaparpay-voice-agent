@@ -25,6 +25,7 @@ from app.domain.voice import (
     SIG_TYPE_PONG,
     SignalMessage,
 )
+from app.voice import signaling as signaling_module
 from app.voice.signaling import (
     CODE_AUTH_INVALID_TOKEN,
     CODE_AUTH_MISSING_TOKEN,
@@ -256,6 +257,38 @@ async def test_peer_factory_failure_sends_internal_and_unregisters(redis_client)
     assert sig_server.active_sessions == ()
 
 
+async def test_peer_factory_failure_reported_even_when_logging_itself_fails(
+    redis_client, monkeypatch
+):
+    """Regression for a real repro: structlog's default console renderer
+    crashed with UnicodeEncodeError rendering a traceback on Windows' cp1252
+    codepage, and `log.exception()` running directly in the recovery path
+    let that abort the handler before it could send the client-facing
+    error envelope. `_log_exception()` must guarantee the envelope still
+    goes out — and must not itself raise — even when logging is broken."""
+
+    def exploding_log(*_args: object, **_kw: object) -> None:
+        raise RuntimeError("logging pipeline is broken")
+
+    monkeypatch.setattr(signaling_module.log, "exception", exploding_log)
+
+    def exploding_factory(session_id: str, send_signal: Any) -> FakePeer:
+        raise RuntimeError("boom")
+
+    sig_server = SignalingServer(redis=redis_client, peer_factory=exploding_factory)
+    token = await _mint_and_store(redis_client)
+    transport = FakeTransport()
+
+    task = await _connect(sig_server, transport, token=token)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert transport.error_codes() == [CODE_INTERNAL], (
+        "the error envelope must still reach the client despite log.exception() failing"
+    )
+    assert transport.closed
+    assert sig_server.active_sessions == ()
+
+
 # ---------------------------------------------------------------------------
 # Envelope routing (docs/13 §6, §9)
 # ---------------------------------------------------------------------------
@@ -287,6 +320,31 @@ async def test_ice_routed_to_peer(server, redis_client):
 
     assert created[0].ice == [payload]
     assert transport.error_codes() == []
+    await _finish(transport, task)
+
+
+async def test_ice_shape_violations_map_to_validation_schema_not_internal(
+    server, redis_client
+):
+    """docs/13 §1.1 draws VALIDATION_SCHEMA vs INTERNAL deliberately —
+    a malformed client payload must never surface as a server fault."""
+    sig_server, created = server
+    transport = FakeTransport()
+    task = await _connect(sig_server, transport, token=await _mint_and_store(redis_client))
+
+    # Real candidate but neither sdpMid nor sdpMLineIndex.
+    transport.feed(
+        _frame("ice", {"candidate": "candidate:1 1 udp 1 10.0.0.1 4000 typ host"})
+    )
+    # Non-string, non-null candidate.
+    transport.feed(_frame("ice", {"candidate": 42, "sdpMid": "0"}))
+    # Empty-string candidate.
+    transport.feed(_frame("ice", {"candidate": "", "sdpMid": "0"}))
+    await _settle()
+
+    assert transport.error_codes() == [CODE_VALIDATION_SCHEMA] * 3
+    assert created[0].ice == [], "no malformed payload ever reached the peer"
+    assert not transport.closed, "shape violations never kill the connection"
     await _finish(transport, task)
 
 

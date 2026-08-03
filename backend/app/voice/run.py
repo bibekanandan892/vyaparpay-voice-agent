@@ -92,10 +92,16 @@ class PlaceholderCallSession:
             send_signal=send_signal,
             ice_servers=ice_servers,
         )
-        self._tasks = (
-            asyncio.create_task(
-                self._egress.run(self._peer.outbound_sink), name=f"egress-run:{session_id}"
-            ),
+        self._session_id = session_id
+        # Started lazily from handle_offer() (review HIGH finding): starting
+        # it here would run AudioEgress's self-driven 20 ms cadence for
+        # however long the client takes to even SEND its offer, well before
+        # anything pulls from _EgressTrack's queue — on any real client
+        # setup delay, that reliably fills the ~1 s/50-frame cap and spams
+        # peer_session.outbound_backlog_dropped, contradicting the "never
+        # hit in normal operation" invariant that cap exists to keep true.
+        self._egress_task: asyncio.Task[None] | None = None
+        self._drain_tasks = (
             asyncio.create_task(
                 _drain(self._ingress.stt_stream()), name=f"stt-drain:{session_id}"
             ),
@@ -106,6 +112,10 @@ class PlaceholderCallSession:
 
     async def handle_offer(self, sdp: str) -> None:
         await self._peer.handle_offer(sdp)
+        if self._egress_task is None:  # not a re-offer (ICE restart) — start once
+            self._egress_task = asyncio.create_task(
+                self._egress.run(self._peer.outbound_sink), name=f"egress-run:{self._session_id}"
+            )
 
     async def handle_remote_ice(self, payload: object) -> None:
         await self._peer.handle_remote_ice(payload)  # type: ignore[arg-type]
@@ -114,10 +124,15 @@ class PlaceholderCallSession:
         """Teardown without leaks: peer first (ends the uplink drain and
         closes ingress, which ends the fan-out drains), then stop the paced
         egress loop; anything still pending after the timeout is cancelled
-        loudly rather than leaked silently."""
+        loudly rather than leaked silently. `_egress_task` may be `None`
+        if the connection closed before any offer ever arrived."""
         await self._peer.close()
         self._egress.stop()
-        done, pending = await asyncio.wait(self._tasks, timeout=_CLOSE_TIMEOUT_S)
+        tasks = self._drain_tasks if self._egress_task is None else (
+            *self._drain_tasks,
+            self._egress_task,
+        )
+        done, pending = await asyncio.wait(tasks, timeout=_CLOSE_TIMEOUT_S)
         for task in pending:
             log.warning("voice_worker.call_task_cancelled", task=task.get_name())
             task.cancel()

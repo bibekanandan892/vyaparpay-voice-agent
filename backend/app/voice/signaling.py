@@ -99,7 +99,10 @@ def _log_exception(event: str, **kw: object) -> None:
     try:
         log.exception(event, **kw)
     except Exception:
-        log.error(f"{event}.log_failed", **kw)
+        try:
+            log.error(f"{event}.log_failed", **kw)
+        except Exception:
+            pass  # the fallback itself must never be able to raise
 
 
 # docs/13 §6: the one /v1 route that terminates on the voice-worker.
@@ -373,6 +376,28 @@ class SignalingServer:
         if "candidate" not in payload:
             await self._send_error(
                 transport, CODE_VALIDATION_SCHEMA, "Ice payload requires 'candidate'."
+            )
+            return
+        # Shape-only checks duplicated from PeerSession.handle_remote_ice()
+        # on purpose (same reasoning as the SendSignal alias above): these
+        # are schema violations the client controls, not internal faults,
+        # and CODE_VALIDATION_SCHEMA vs CODE_INTERNAL is a real distinction
+        # docs/13 §1.1 draws for client-side error handling.
+        candidate = payload["candidate"]
+        if candidate is not None and (not isinstance(candidate, str) or not candidate):
+            await self._send_error(
+                transport,
+                CODE_VALIDATION_SCHEMA,
+                "Ice payload 'candidate' must be a non-empty string or null.",
+            )
+            return
+        if candidate is not None and payload.get("sdpMid") is None and (
+            payload.get("sdpMLineIndex") is None
+        ):
+            await self._send_error(
+                transport,
+                CODE_VALIDATION_SCHEMA,
+                "Ice payload needs 'sdpMid' or 'sdpMLineIndex'.",
             )
             return
         try:

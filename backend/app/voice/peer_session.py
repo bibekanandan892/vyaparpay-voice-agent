@@ -25,12 +25,18 @@ Judgment calls, flagged per house style:
    the queue's steady-state depth is 0–1 frames, so the synthesis lead
    stays inside AudioEgress where the barge-in flush can drop it (§6.4) —
    buffering ahead here would smear the flush target across two layers.
-2. **The outbound queue is capped (~1 s, drop-oldest, warn).** If the
-   sender stalls (teardown race, pathological encoder hiccup) the paced
-   sink keeps producing 50 frames/s; blocking is impossible (the sink is
-   synchronous by egress contract) and unbounded growth is a leak. Oldest
-   audio is the least valuable during a stall — same reasoning as
-   AudioIngress judgment call 4. In normal operation the cap is never hit.
+2. **The outbound queue is capped (~1 s, drop-oldest, warn once per
+   stall episode).** If the sender stalls (teardown race, pathological
+   encoder hiccup) the paced sink keeps producing 50 frames/s; blocking
+   is impossible (the sink is synchronous by egress contract) and
+   unbounded growth is a leak. Oldest audio is the least valuable during
+   a stall — same reasoning as AudioIngress judgment call 4. The cap IS
+   reachable in one normal window: between the caller starting
+   `AudioEgress.run()` (run.py starts it on offer arrival) and the
+   RTCRtpSender actually pulling once ICE/DTLS complete — everything
+   dropped there is pre-connect pacing silence, which is exactly why
+   drop-oldest is harmless and why the warning is per-episode, not
+   per-frame (a sub-second setup window must not emit 50 log lines).
 3. **Server-side "trickle" is answer-embedded.** aiortc gathers ICE during
    `setLocalDescription()` (it has no trickle emitter), so the answer SDP
    already carries every server candidate; after sending the answer this
@@ -129,6 +135,7 @@ class _EgressTrack(MediaStreamTrack):
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._pts = 0
         self._push_after_end_logged = False
+        self._backlog_dropped_frames = 0
 
     def push(self, frame: bytes) -> None:
         if self.readyState != "live":
@@ -142,7 +149,10 @@ class _EgressTrack(MediaStreamTrack):
             if dropped is None:  # never drop the end sentinel
                 self._queue.put_nowait(None)
                 break
-            log.warning("peer_session.outbound_backlog_dropped", queued=self._queue.qsize())
+            # Judgment call 2: one warning per stall episode, not per frame.
+            if self._backlog_dropped_frames == 0:
+                log.warning("peer_session.outbound_backlog_stall_started")
+            self._backlog_dropped_frames += 1
 
     def end(self) -> None:
         """Sentinel first (unblocks a recv() already awaiting the queue),
@@ -156,6 +166,13 @@ class _EgressTrack(MediaStreamTrack):
         item = await self._queue.get()
         if item is None:
             raise MediaStreamError
+        if self._backlog_dropped_frames:
+            # The sender is pulling again: the stall episode is over.
+            log.info(
+                "peer_session.outbound_backlog_stall_ended",
+                dropped_frames=self._backlog_dropped_frames,
+            )
+            self._backlog_dropped_frames = 0
         frame = av.AudioFrame(format="s16", layout="mono", samples=FRAME_SAMPLES)
         frame.sample_rate = WIRE_SAMPLE_RATE
         frame.time_base = Fraction(1, WIRE_SAMPLE_RATE)

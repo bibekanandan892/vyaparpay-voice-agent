@@ -318,3 +318,46 @@ async def test_send_data_channel_before_open_raises():
             )
     finally:
         await peer.close()
+
+
+async def test_egress_track_drop_oldest_keeps_newest_and_never_drops_sentinel():
+    """Judgment call 2 in isolation: pushing past the cap with nothing
+    draining drops the OLDEST frames (newest audio survives), and the end
+    sentinel survives any amount of overflow after end()."""
+    from app.voice.audio_egress import FRAME_BYTES
+    from app.voice.peer_session import OUTBOUND_MAX_BUFFERED_FRAMES, _EgressTrack
+
+    track = _EgressTrack()
+    total = OUTBOUND_MAX_BUFFERED_FRAMES + 20
+    for i in range(total):
+        track.push(i.to_bytes(2, "little") * (FRAME_BYTES // 2))
+    assert track._queue.qsize() == OUTBOUND_MAX_BUFFERED_FRAMES
+
+    # The oldest 20 were dropped: the head is frame #20, not #0.
+    head = await asyncio.wait_for(track.recv(), timeout=1)
+    head_payload = _frame_payload(head)
+    assert head_payload[:2] == (20).to_bytes(2, "little")
+
+    # end() while overflowing: the sentinel must survive drop-oldest.
+    track.end()
+    for _ in range(OUTBOUND_MAX_BUFFERED_FRAMES - 1):
+        track._queue.get_nowait()
+    assert track._queue.get_nowait() is None, "end sentinel was dropped by overflow"
+
+
+async def test_egress_track_stall_episode_counter_resets_on_drain():
+    """The pre-connect window is a normal ~sub-second occurrence — the
+    warning is per stall episode (counter tracks the episode; one log line
+    when it opens, an info summary with the count when it drains), never
+    per dropped frame."""
+    from app.voice.audio_egress import FRAME_BYTES
+    from app.voice.peer_session import OUTBOUND_MAX_BUFFERED_FRAMES, _EgressTrack
+
+    track = _EgressTrack()
+    for _ in range(OUTBOUND_MAX_BUFFERED_FRAMES + 40):
+        track.push(b"\x00" * FRAME_BYTES)
+    assert track._backlog_dropped_frames == 40
+    # Draining one frame ends the episode and resets the counter.
+    await asyncio.wait_for(track.recv(), timeout=1)
+    assert track._backlog_dropped_frames == 0
+    track.end()
