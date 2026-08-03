@@ -9,4 +9,12 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+      docs/14 mandates TLS everywhere (HTTPS + WSS). Android only denies
+      cleartext by default from API 28; minSdk is 24, so the module that
+      owns the sockets also owns the opt-out — merged into the app
+      manifest before any real base URL is wired in.
+    -->
+    <application android:usesCleartextTraffic="false" />
+
 </manifest>
