@@ -51,8 +51,8 @@ from app.domain.voice import (
 
 # docs/06 §3.2: the STT ingest format is 16 kHz linear16 mono.
 STT_SAMPLE_RATE_HZ = 16_000
-# One 30 ms Silero hop at 16 kHz (docs/06 §5) = 480 samples of int16.
-SILERO_FRAME_SAMPLES = 480
+# One 32 ms Silero hop at 16 kHz (docs/06 §5, native 512-sample window).
+SILERO_FRAME_SAMPLES = 512
 
 
 # --------------------------------------------------------------------------
