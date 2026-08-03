@@ -11,6 +11,10 @@ android/.cxx/
 *.aab
 *.ap_
 *.dex
+# Kotlin 2.x per-project session/build dir (android/.kotlin, android/*/.kotlin).
+.kotlin/
+# The Gradle wrapper jar is deliberately committed — see android/README.md.
+!android/gradle/wrapper/gradle-wrapper.jar
 
 # --- Python ---
 __pycache__/

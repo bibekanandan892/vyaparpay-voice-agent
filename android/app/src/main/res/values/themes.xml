@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The app is Compose end to end and MainActivity is a plain ComponentActivity,
+  so the XML theme only has to cover the window before the first frame. It
+  inherits from the framework theme rather than an AppCompat or Material
+  Components one, which keeps a whole dependency out of the graph for a style
+  that draws a background and nothing else. The real palette is VyaparTheme.
+-->
+<resources>
+    <style name="Theme.VyaparPay" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
