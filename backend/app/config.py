@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     elevenlabs_voice_id: str = ""
     elevenlabs_fallback_voice_id: str = ""
     elevenlabs_url: str = "https://api.elevenlabs.io"
+    # Streaming synthesis model (docs/06 §1/§4.1: Flash v2.5, the lowest-
+    # latency tier). A model id is config, never a constant (canon §5) —
+    # same rule as openrouter_dialogue_model above. Added by T4.1.
+    elevenlabs_model_id: str = "eleven_flash_v2_5"
 
     # WebRTC / signaling (docs/06 §2): agent-api mints short-lived
     # signaling tokens and HMAC TURN credentials (docs/04 §3);
