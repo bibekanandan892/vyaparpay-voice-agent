@@ -1,7 +1,8 @@
 """VadEndpointer — the endpoint-policy state machine (docs/06 §5).
 
-Consumes 30 ms `AudioFrame` hops, asks the injected `VadModel` for a
-speech probability per hop, and is fed the latest live STT partial by the
+Consumes 32 ms `AudioFrame` hops (512 samples @ 16 kHz — Silero's native
+streaming hop, docs/06 §5), asks the injected `VadModel` for a speech
+probability per hop, and is fed the latest live STT partial by the
 caller as it arrives. Emits exactly two event kinds:
 
 - `SpeechStart` — activation threshold sustained for `min_speech_ms`.
@@ -35,7 +36,7 @@ Judgment calls, numbered so review argues with the reasoning:
    active, any single frame at/above threshold resets the
    trailing-silence clock without re-qualifying — §5.1's resumed speech
    ("…pay a vendor") continues the same utterance seamlessly. The cost
-   (a lone 30 ms blip extends the turn) is accepted at demo scale.
+   (a lone 32 ms blip extends the turn) is accepted at demo scale.
 4. Sustained activation means a *contiguous* run of at/above-threshold
    frames: a sub-threshold frame before confirmation discards the
    candidate run entirely (§6.1's cough → resume case; §5.3 "the 200 ms
@@ -184,7 +185,7 @@ def _frame_end_ms(frame: AudioFrame) -> int:
 
 
 class VadEndpointer:
-    """The §5 endpoint policy machine. Feed every 30 ms uplink hop to
+    """The §5 endpoint policy machine. Feed every 32 ms uplink hop to
     `on_frame()` (in media-clock order) and every live STT partial to
     `on_partial()` as it arrives; consume the returned events."""
 

@@ -120,8 +120,8 @@ class AudioFrame(BaseModel):
     """One hop of decoded uplink audio as AudioIngress hands it out —
     16 kHz mono linear16 PCM (docs/06 §3.2), already resampled from the
     48 kHz Opus wire format. `samples` is the frame length in samples
-    (a 30 ms Silero hop at 16 kHz is 480); `ts_ms` is the worker
-    media-clock position of the frame's start."""
+    (Silero's native 32 ms streaming hop at 16 kHz is 512); `ts_ms` is
+    the worker media-clock position of the frame's start."""
 
     model_config = _FROZEN
 
@@ -365,10 +365,13 @@ class TtsProvider(Protocol):
 
 
 class VadModel(Protocol):
-    """The Silero seam (docs/06 §5): one speech probability per 30 ms
-    frame. Split from VadEndpointer on purpose so endpoint-policy tests
-    script probability sequences against the §5.3 decision table with
-    no onnxruntime in the loop."""
+    """The Silero seam (docs/06 §5): one speech probability per 32 ms
+    frame (512 samples @ 16 kHz — Silero's native streaming hop; the
+    `frame_30ms` parameter name predates that correction and stays,
+    because renaming a Protocol parameter is a signature change to this
+    frozen contract). Split from VadEndpointer on purpose so
+    endpoint-policy tests script probability sequences against the §5.3
+    decision table with no onnxruntime in the loop."""
 
     def prob(self, frame_30ms: bytes) -> float: ...
 

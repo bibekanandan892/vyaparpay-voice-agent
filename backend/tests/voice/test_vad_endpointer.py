@@ -16,10 +16,11 @@ filler-only suppression), min-speech/endpoint/force-cap exactly-at-
 threshold boundaries, endpoint_ms honesty, and full state reset between
 utterances.
 
-Timeline convention: 30 ms frames (480 samples @ 16 kHz), media clock
-starting at 0 unless a test says otherwise. With the default Settings
-(min_speech_ms=200) activation lands on the 7th consecutive speech frame
-(ends at 210 ms — the first frame end >= 200).
+Timeline convention: 32 ms frames (512 samples @ 16 kHz — Silero's
+native streaming hop, docs/06 §5), media clock starting at 0 unless a
+test says otherwise. With the default Settings (min_speech_ms=200)
+activation lands on the 7th consecutive speech frame (ends at 224 ms —
+the first frame end >= 200).
 """
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ from app.voice.vad_endpointer import (
 from tests.conftest import SettingsFactory
 from tests.fakes import FakeVad
 
-FRAME_MS = 30
-FRAME_SAMPLES = 480  # 30 ms @ 16 kHz
+FRAME_SAMPLES = 512  # Silero's native 32 ms hop @ 16 kHz (docs/06 §5)
 SAMPLE_RATE_HZ = 16_000
+FRAME_MS = FRAME_SAMPLES * 1000 // SAMPLE_RATE_HZ  # = 32, derived not hardcoded
 FRAME_PCM = bytes(FRAME_SAMPLES * 2)  # content is irrelevant — FakeVad is scripted
 
 SPEECH = 0.9  # comfortably above the 0.5 default threshold
@@ -62,7 +63,7 @@ def _frame(ts_ms: int) -> AudioFrame:
 @dataclass
 class Driver:
     """Keeps the media clock so tests read as timelines: `frames(SPEECH, 7)`
-    scripts 7 probabilities, feeds 7 consecutive 30 ms frames, and returns
+    scripts 7 probabilities, feeds 7 consecutive 32 ms frames, and returns
     whatever events fired."""
 
     endpointer: VadEndpointer
@@ -108,8 +109,8 @@ def _activate(d: Driver) -> SpeechStart:
 
 def test_speech_start_fires_when_min_speech_sustained(make_driver) -> None:
     d = make_driver()
-    assert d.frames(SPEECH, 6) == []  # 6 frames end at 180 ms < 200
-    assert d.frames(SPEECH, 1) == [SpeechStart(ts_ms=210, onset_ts_ms=0)]
+    assert d.frames(SPEECH, 6) == []  # 6 frames end at 192 ms < 200
+    assert d.frames(SPEECH, 1) == [SpeechStart(ts_ms=224, onset_ts_ms=0)]
 
 
 def test_speech_start_fires_once_per_utterance(make_driver) -> None:
@@ -119,27 +120,27 @@ def test_speech_start_fires_once_per_utterance(make_driver) -> None:
 
 
 def test_min_speech_exactly_at_threshold_fires(make_driver) -> None:
-    # 6 frames span exactly 180 ms — inclusive comparison (>=, not >).
-    d = make_driver(min_speech_ms=180)
+    # 6 frames span exactly 192 ms — inclusive comparison (>=, not >).
+    d = make_driver(min_speech_ms=192)
     assert d.frames(SPEECH, 5) == []
-    assert d.frames(SPEECH, 1) == [SpeechStart(ts_ms=180, onset_ts_ms=0)]
+    assert d.frames(SPEECH, 1) == [SpeechStart(ts_ms=192, onset_ts_ms=0)]
 
 
 def test_prob_exactly_at_vad_threshold_counts_as_speech(make_driver) -> None:
     d = make_driver()  # default vad_threshold = 0.5
     fired = d.frames(0.5, 7)
-    assert fired == [SpeechStart(ts_ms=210, onset_ts_ms=0)]
+    assert fired == [SpeechStart(ts_ms=224, onset_ts_ms=0)]
 
 
 def test_sub_min_speech_transient_never_opens_a_turn(make_driver) -> None:
-    """A 120 ms cough (§6.1) neither opens an utterance nor ever endpoints,
+    """A 128 ms cough (§6.1) neither opens an utterance nor ever endpoints,
     and the broken candidate run does not leak into the next activation."""
     d = make_driver()
-    assert d.frames(SPEECH, 4) == []  # 120 ms < 200 — no activation
+    assert d.frames(SPEECH, 4) == []  # 128 ms < 200 — no activation
     assert d.frames(SILENCE, 20) == []  # no utterance was open — no endpoint either
     # Fresh, contiguous speech activates with the NEW onset, not the cough's.
     fired = d.frames(SPEECH, 7)
-    assert fired == [SpeechStart(ts_ms=930, onset_ts_ms=720)]
+    assert fired == [SpeechStart(ts_ms=992, onset_ts_ms=768)]
 
 
 # --------------------------------------------------------------------------
@@ -153,7 +154,7 @@ def test_row_1_short_silence_keeps_listening(make_driver) -> None:
     d = make_driver()
     _activate(d)
     d.partial(COMPLETE)
-    assert d.frames(SILENCE, 7) == []  # 210 ms < 250
+    assert d.frames(SILENCE, 7) == []  # 224 ms < 250
 
 
 def test_row_2_incomplete_partial_holds_endpoint_open(make_driver) -> None:
@@ -162,18 +163,18 @@ def test_row_2_incomplete_partial_holds_endpoint_open(make_driver) -> None:
     d = make_driver()
     _activate(d)
     d.partial(INCOMPLETE)
-    assert d.frames(SILENCE, 30) == []  # 900 ms of silence, still held
+    assert d.frames(SILENCE, 30) == []  # 960 ms of silence, still held
 
 
 def test_row_3_silence_plus_complete_partial_endpoints(make_driver) -> None:
     """Row 3: both signals agree — endpoint on the first frame at/after
     250 ms of trailing silence, with honest endpoint_ms."""
     d = make_driver()
-    _activate(d)  # speech ends at ts 210
+    _activate(d)  # speech ends at ts 224
     d.partial(COMPLETE)
-    assert d.frames(SILENCE, 8) == []  # 240 ms < 250
-    fired = d.frames(SILENCE, 1)  # 270 ms >= 250
-    assert fired == [Endpoint(ts_ms=480, endpoint_ms=270, forced=False)]
+    assert d.frames(SILENCE, 7) == []  # 224 ms < 250
+    fired = d.frames(SILENCE, 1)  # 256 ms >= 250
+    assert fired == [Endpoint(ts_ms=480, endpoint_ms=256, forced=False)]
 
 
 def test_row_4_force_endpoint_at_max_delay_despite_incomplete(make_driver) -> None:
@@ -182,9 +183,9 @@ def test_row_4_force_endpoint_at_max_delay_despite_incomplete(make_driver) -> No
     d = make_driver()
     _activate(d)
     d.partial(INCOMPLETE)
-    assert d.frames(SILENCE, 66) == []  # 1,980 ms < 2,000
-    fired = d.frames(SILENCE, 1)  # 2,010 ms >= 2,000
-    assert fired == [Endpoint(ts_ms=2220, endpoint_ms=2010, forced=True)]
+    assert d.frames(SILENCE, 62) == []  # 1,984 ms < 2,000
+    fired = d.frames(SILENCE, 1)  # 2,016 ms >= 2,000
+    assert fired == [Endpoint(ts_ms=2240, endpoint_ms=2016, forced=True)]
 
 
 # --------------------------------------------------------------------------
@@ -193,21 +194,21 @@ def test_row_4_force_endpoint_at_max_delay_despite_incomplete(make_driver) -> No
 
 
 def test_endpoint_exactly_at_silence_threshold(make_driver) -> None:
-    d = make_driver(endpoint_silence_ms=240)  # divisible by the 30 ms hop
+    d = make_driver(endpoint_silence_ms=224)  # divisible by the 32 ms hop
     _activate(d)
     d.partial(COMPLETE)
-    assert d.frames(SILENCE, 7) == []  # 210 ms < 240
-    fired = d.frames(SILENCE, 1)  # exactly 240 — inclusive
-    assert fired == [Endpoint(ts_ms=450, endpoint_ms=240, forced=False)]
+    assert d.frames(SILENCE, 6) == []  # 192 ms < 224
+    fired = d.frames(SILENCE, 1)  # exactly 224 — inclusive
+    assert fired == [Endpoint(ts_ms=448, endpoint_ms=224, forced=False)]
 
 
 def test_force_cap_exactly_at_threshold(make_driver) -> None:
-    d = make_driver(max_endpoint_delay_ms=300)
+    d = make_driver(max_endpoint_delay_ms=320)  # divisible by the 32 ms hop
     _activate(d)
     d.partial(INCOMPLETE)
-    assert d.frames(SILENCE, 9) == []  # 270 ms: >= 250 but incomplete, < 300
-    fired = d.frames(SILENCE, 1)  # exactly 300 — inclusive
-    assert fired == [Endpoint(ts_ms=510, endpoint_ms=300, forced=True)]
+    assert d.frames(SILENCE, 9) == []  # 288 ms: >= 250 but incomplete, < 320
+    fired = d.frames(SILENCE, 1)  # exactly 320 — inclusive
+    assert fired == [Endpoint(ts_ms=544, endpoint_ms=320, forced=True)]
 
 
 # --------------------------------------------------------------------------
@@ -223,11 +224,11 @@ def test_mid_utterance_pause_holds_then_endpoints_when_thought_completes(make_dr
     d = make_driver()
     _activate(d)
     d.partial(INCOMPLETE)
-    assert d.frames(SILENCE, 13) == []  # 390 ms pause — held by row 2
+    assert d.frames(SILENCE, 13) == []  # 416 ms pause — held by row 2
     assert d.frames(SPEECH, 5) == []  # "…pay a vendor" resumes — no new SpeechStart
     d.partial(COMPLETE)
-    fired = d.frames(SILENCE, 9)  # 270 ms >= 250, now complete
-    assert fired == [Endpoint(ts_ms=1020, endpoint_ms=270, forced=False)]
+    fired = d.frames(SILENCE, 8)  # 256 ms >= 250, now complete
+    assert fired == [Endpoint(ts_ms=1056, endpoint_ms=256, forced=False)]
     assert [type(e) for e in d.events] == [SpeechStart, Endpoint]
 
 
@@ -242,7 +243,7 @@ def test_filler_partial_is_non_terminal_and_holds(make_driver) -> None:
     d = make_driver()
     _activate(d)
     d.partial("Hmm.")
-    assert d.frames(SILENCE, 20) == []  # 600 ms, still held
+    assert d.frames(SILENCE, 20) == []  # 640 ms, still held
 
 
 def test_filler_only_utterance_suppressed_at_force_cap(make_driver) -> None:
@@ -252,7 +253,7 @@ def test_filler_only_utterance_suppressed_at_force_cap(make_driver) -> None:
     d = make_driver(max_endpoint_delay_ms=300)
     _activate(d)
     d.partial("hmm, uh…")
-    assert d.frames(SILENCE, 10) == []  # 300 ms cap reached — suppressed, no event
+    assert d.frames(SILENCE, 10) == []  # cap crossed at 320 ms — suppressed, no event
     # Machine is back in listening: a real utterance still works end to end.
     assert len(d.frames(SPEECH, 7)) == 1  # fresh SpeechStart
     d.partial("Send five hundred rupees.")
@@ -283,10 +284,10 @@ def test_endpoint_ms_reports_actual_silence_waited_for_late_partial(make_driver)
     d = make_driver()
     _activate(d)
     d.partial(INCOMPLETE)
-    assert d.frames(SILENCE, 12) == []  # 360 ms held as incomplete
+    assert d.frames(SILENCE, 12) == []  # 384 ms held as incomplete
     d.partial(COMPLETE)  # the finishing partial arrives now
-    fired = d.frames(SILENCE, 1)  # 390 ms of real trailing silence
-    assert fired == [Endpoint(ts_ms=600, endpoint_ms=390, forced=False)]
+    fired = d.frames(SILENCE, 1)  # 416 ms of real trailing silence
+    assert fired == [Endpoint(ts_ms=640, endpoint_ms=416, forced=False)]
 
 
 def test_state_resets_after_endpoint_for_next_utterance(make_driver) -> None:
@@ -303,13 +304,13 @@ def test_state_resets_after_endpoint_for_next_utterance(make_driver) -> None:
     assert len(fired) == 1
     second_start = fired[0]
     assert isinstance(second_start, SpeechStart)
-    assert second_start.onset_ts_ms == 480  # the new run's onset, not the old one
-    # 270 ms of silence with NO new partial: the old "Check my balance."
+    assert second_start.onset_ts_ms == 512  # the new run's onset, not the old one
+    # 288 ms of silence with NO new partial: the old "Check my balance."
     # must not leak through the completeness check.
     assert d.frames(SILENCE, 9) == []
     d.partial("Pay the vendor.")
     fired = d.frames(SILENCE, 1)
-    assert fired == [Endpoint(ts_ms=990, endpoint_ms=300, forced=False)]
+    assert fired == [Endpoint(ts_ms=1056, endpoint_ms=320, forced=False)]
 
 
 # --------------------------------------------------------------------------
