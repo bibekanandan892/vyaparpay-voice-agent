@@ -89,6 +89,8 @@ from app.agent.safety_layer import SafetyLayer
 from app.agent.session_manager import SessionManager
 from app.agent.tool_executor import ToolExecutor
 from app.config import Settings, get_settings
+from app.context.context_compressor import ContextCompressor
+from app.context.event_log import EventLog
 from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.domain.types import EndReason, Session
@@ -144,7 +146,12 @@ def _build_collaborators(
 
     session_manager = SessionManager(sessionmaker, redis_client)
     session_memory = SessionMemory(redis_client)
-    context_builder = ContextBuilder(sessionmaker, session_memory)
+    # Phase-4 T3: ContextBuilder's slot-4/5 deps — same shared redis_client,
+    # ContextCompressor is stateless (its own docstring: "one instance is
+    # safely shared across sessions/requests").
+    context_builder = ContextBuilder(
+        sessionmaker, session_memory, redis_client, EventLog(redis_client), ContextCompressor()
+    )
     prompt_builder = PromptBuilder()
     # The trailing type: ignore[arg-type] is the pre-existing Protocol
     # wart llm_router.py's own module docstring documents —

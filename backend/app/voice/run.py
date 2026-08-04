@@ -71,6 +71,8 @@ from app.agent.safety_layer import SafetyLayer
 from app.agent.session_manager import SessionManager
 from app.agent.tool_executor import ToolExecutor
 from app.config import Settings, get_settings
+from app.context.context_compressor import ContextCompressor
+from app.context.event_log import EventLog
 from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.domain.voice import IceServer
@@ -131,7 +133,12 @@ def _build_brain_stack(
     configure_tools(sessionmaker)
     session_manager = SessionManager(sessionmaker, redis)
     session_memory = SessionMemory(redis)
-    context_builder = ContextBuilder(sessionmaker, session_memory)
+    # Phase-4 T3: ContextBuilder's slot-4/5 deps — EventLog wraps the same
+    # `redis` singleton, ContextCompressor is stateless (its own docstring:
+    # "one instance is safely shared across sessions/requests").
+    context_builder = ContextBuilder(
+        sessionmaker, session_memory, redis, EventLog(redis), ContextCompressor()
+    )
     safety_layer = SafetyLayer(registry)
     tool_executor = ToolExecutor(
         registry=registry, safety=safety_layer, redis=redis, sessionmaker=sessionmaker

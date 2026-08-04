@@ -157,6 +157,8 @@ from app.agent.safety_layer import SafetyLayer
 from app.agent.session_manager import SessionManager
 from app.agent.tool_executor import ToolExecutor
 from app.config import Settings
+from app.context.context_compressor import ContextCompressor
+from app.context.event_log import EventLog
 from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.domain.interfaces import LLMProvider, LLMRouterProto
@@ -494,7 +496,9 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         fake_redis = FakeRedis()
         redis_client = RedisClient(fake_redis, session_ttl_seconds=settings.session_ttl_seconds)  # type: ignore[arg-type]
         session_memory = SessionMemory(redis_client)
-        context_builder = ContextBuilder(sessionmaker, session_memory)
+        context_builder = ContextBuilder(
+            sessionmaker, session_memory, redis_client, EventLog(redis_client), ContextCompressor()
+        )
         prompt_builder = PromptBuilder()
         fake_llm = FakeLLM()
         # mypy reads LLMProvider.stream's `async def ... -> AsyncIterator`
