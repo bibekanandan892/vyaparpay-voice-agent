@@ -1,0 +1,266 @@
+{
+  "name": "screen_context.v1",
+  "description": "The screen_context/v1 semantic IR (docs/07 §3): the ≤300-token, ≤20-component distillation of the live Compose semantics tree that SemanticSnapshotBuilder produces on-device. This is the SAME shape in three places that must never drift apart: the session_create_request.v1.json 'screen_context' field (docs/13 §2.1), the ctx.snapshot data-channel payload (docs/07 §6, docs/13 §4), and this file — this file is the one all three defer to. The tree's nesting, bounds, and geometry are deliberately absent (docs/07 §3 'Values over structure' — bounds were a rejected micro-alternative, ~40% of raw serialized bulk for zero agent value); the only structural fact kept is list/list_item containment, preserved positionally in the flat 'components' array (a list_item entry is one that immediately follows its list entry in reading order — docs/07 does not define a separate parent-id field, and none is invented here). additionalProperties is deliberately left unset throughout (docs/13 §9: new fields are additive within v1, same forward-compatibility posture as data_channel_envelope.v1.json and session_create_response.v1.json) — this is context telemetry the client produces, not a server-validated request body in the protocol/tools/*.json sense, so it does not take that file family's additionalProperties:false stance.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": "screen_context/v1",
+      "description": "IR schema version marker. An unknown version is rejected by SnapshotIngestor with 400 VALIDATION_UNSUPPORTED_VERSION, not schema validation (docs/13 §1.1, backend/app/api/routes/sessions.py)."
+    },
+    "screen": {
+      "type": "string",
+      "description": "Screen identifier matching docs/01 §5's product-surface names (e.g. 'PaymentScreen'). Not a closed enum here: docs/01 owns the current five screens as a product fact, not a protocol constant, and new screens must not require a schema version bump (docs/13 §9)."
+    },
+    "flow": {
+      "type": "string",
+      "description": "Nav-graph route group from NavigationTracker (docs/07 rule 7), e.g. 'vendor_payment'. May be empty '' for screens with no flow grouping (e.g. DashboardScreen) — the app-side AppContextState.kt default is flow = \"\", so the field is always present as a string, never absent or null."
+    },
+    "components": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "$ref": "#/$defs/component" },
+      "description": "Rank-and-capped component list, deterministic order (docs/07 rule 5): dialog/error_banner, then snackbar, then the focused field, then primary_cta/secondary_cta, then value-bearing fields/displays, then everything else in traversal order. Hard cap of 20 (docs/07 §3, §7) — the drop ladder (docs/07 §7) is what keeps a busy screen under this cap before the message is ever sent, so this is a true wire invariant, not just guidance."
+    },
+    "last_action": {
+      "$ref": "#/$defs/last_action",
+      "type": ["object", "null"],
+      "description": "Most recent EventTracker ring-buffer entry at capture time (docs/07 rule 7), or null before any action has occurred on this screen (e.g. the very first capture after a cold navigation). Always present as a key in a full snapshot — unlike a ctx.delta, which omits this key entirely when it did not change (docs/07 §6)."
+    },
+    "last_api": {
+      "$ref": "#/$defs/last_api",
+      "type": ["object", "null"],
+      "description": "Most recent non-2xx response for this screen, from the core:network interceptor (docs/07 rule 7) — 'the single highest-value field in the IR'. null when no error has occurred on this screen. Always present as a key in a full snapshot, same rationale as last_action."
+    },
+    "dirty_fields": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "testTag/label identifiers of editable fields with uncommitted edits (docs/07 rule 4) — 'the user typed a new amount but hasn't paid yet'. Empty array, never absent, when nothing is dirty (docs/07 §3 canonical example: 'dirty_fields': [])."
+    },
+    "loading": {
+      "type": "boolean",
+      "description": "Set when any visible progress indicator survives pruning (docs/07 rule 4)."
+    }
+  },
+  "required": ["v", "screen", "flow", "components", "last_action", "last_api", "dirty_fields", "loading"],
+  "$defs": {
+    "amount_field_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag 'amount_input' / suffix '_amount', else editable text matching a currency pattern.",
+      "properties": {
+        "role": { "const": "amount_field" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "e.g. '₹245'; '[REDACTED]' for sensitive field classes even though amount fields are not normally sensitive (docs/07 §5 rule 6)."
+        },
+        "focused": {
+          "type": "boolean",
+          "description": "Carried only when true — the default (false) is omitted to save tokens (docs/07 §4 header note)."
+        }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "recipient_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag prefix 'recipient_'/'vendor_', else a contact-shaped row adjacent to an amount field.",
+      "properties": {
+        "role": { "const": "recipient" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "primary_cta_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag suffix '_cta', else the single filled Role.Button in the bottom action area. enabled is always carried explicitly (true or false) — unlike toggle's enabled, this is the headline fact for a CTA (docs/07 §3 canonical example carries 'enabled': true).",
+      "properties": {
+        "role": { "const": "primary_cta" },
+        "label": { "type": "string", "maxLength": 120 },
+        "enabled": { "type": "boolean" }
+      },
+      "required": ["role", "label", "enabled"]
+    },
+    "secondary_cta_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag suffix '_secondary', else outlined/text buttons adjacent to a primary_cta.",
+      "properties": {
+        "role": { "const": "secondary_cta" },
+        "label": { "type": "string", "maxLength": 120 },
+        "enabled": { "type": "boolean" }
+      },
+      "required": ["role", "label", "enabled"]
+    },
+    "text_field_component": {
+      "type": "object",
+      "description": "docs/07 §4: SetText semantics with no more specific rule matching.",
+      "properties": {
+        "role": { "const": "text_field" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "'[REDACTED]' for sensitive field classes: card number, CVV, PIN, Aadhaar, PAN (docs/07 §5 rule 6)."
+        },
+        "focused": {
+          "type": "boolean",
+          "description": "Carried only when true (docs/07 §4 header note)."
+        }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "list_component": {
+      "type": "object",
+      "description": "docs/07 §4: CollectionInfo semantics (LazyColumn/LazyRow). visible_count/total_count keep truncation honest when list_items are capped (docs/07 §7 rung 1, §8 'Long dynamic lists' failure row) — e.g. '3 of 47 settlement batches are visible'.",
+      "properties": {
+        "role": { "const": "list" },
+        "label": { "type": "string", "maxLength": 120 },
+        "visible_count": { "type": "integer", "minimum": 0 },
+        "total_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["role", "label", "visible_count", "total_count"]
+    },
+    "list_item_component": {
+      "type": "object",
+      "description": "docs/07 §4: CollectionItemInfo child of a list; capped at 3 per list (docs/07 §4, §7 rung 1). The cap is a per-list count the builder enforces before transmission, not something this flat-array schema can structurally verify across a 'preceding list' boundary — enforced by the drop ladder and exercised by the dense fixture/tests, not the schema itself.",
+      "properties": {
+        "role": { "const": "list_item" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "dialog_component": {
+      "type": "object",
+      "description": "docs/07 §4: IsDialog / dialog window root; label from PaneTitle or first text run. visible is always carried (docs/07 §4 header note: transient roles carry visible even at its true default, because visibility is the headline fact) — the canonical fixture's 'Daily Limit Exceeded' dialog is this role.",
+      "properties": {
+        "role": { "const": "dialog" },
+        "label": { "type": "string", "maxLength": 120 },
+        "visible": { "type": "boolean" }
+      },
+      "required": ["role", "label", "visible"]
+    },
+    "snackbar_component": {
+      "type": "object",
+      "description": "docs/07 §4: LiveRegion node inside a SnackbarHost; testTag suffix '_snackbar'.",
+      "properties": {
+        "role": { "const": "snackbar" },
+        "label": { "type": "string", "maxLength": 120 },
+        "visible": { "type": "boolean" }
+      },
+      "required": ["role", "label", "visible"]
+    },
+    "tab_component": {
+      "type": "object",
+      "description": "docs/07 §4: Role.Tab semantics.",
+      "properties": {
+        "role": { "const": "tab" },
+        "label": { "type": "string", "maxLength": 120 },
+        "selected": { "type": "boolean" }
+      },
+      "required": ["role", "label", "selected"]
+    },
+    "toggle_component": {
+      "type": "object",
+      "description": "docs/07 §4: ToggleableState semantics. value is the literal string 'on'/'off' (docs/07 §4 Carries column), not a boolean. enabled follows the general omit-at-default-true rule (docs/07 §4 header note) since a toggle's enabled state is not the headline fact the way a CTA's is.",
+      "properties": {
+        "role": { "const": "toggle" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": { "enum": ["on", "off"] },
+        "enabled": { "type": "boolean" }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "balance_display_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag suffix '_balance', else non-editable currency text outside a field.",
+      "properties": {
+        "role": { "const": "balance_display" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "status_badge_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag suffix '_status', else chip-shaped node with enum-like text (SETTLED, PENDING, ...). value is free text here, not a closed enum — the doc gives examples, not a closed vocabulary, and per-business-domain status strings are exactly the kind of extension this schema must not freeze shut.",
+      "properties": {
+        "role": { "const": "status_badge" },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["role", "label", "value"]
+    },
+    "error_banner_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag suffix '_error', else assertive LiveRegion outside a SnackbarHost. Ranked with dialog as the highest-priority interruption (docs/07 rule 5, tier 1).",
+      "properties": {
+        "role": { "const": "error_banner" },
+        "label": { "type": "string", "maxLength": 120 },
+        "visible": { "type": "boolean" }
+      },
+      "required": ["role", "label", "visible"]
+    },
+    "alert_banner_component": {
+      "type": "object",
+      "description": "docs/07 §4: testTag suffix '_alert' — dashboard notices; informational, not error.",
+      "properties": {
+        "role": { "const": "alert_banner" },
+        "label": { "type": "string", "maxLength": 120 },
+        "visible": { "type": "boolean" }
+      },
+      "required": ["role", "label", "visible"]
+    },
+    "image_component": {
+      "type": "object",
+      "description": "docs/07 §4: icon/graphic WITH a ContentDescription and an OnClick (otherwise pruned per rule 1) — carries only label, no value/enabled/visible.",
+      "properties": {
+        "role": { "const": "image" },
+        "label": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["role", "label"]
+    },
+    "component": {
+      "description": "The docs/07 §4 role vocabulary — sixteen core roles, discriminated by 'role'. Deliberately closed to exactly these sixteen for the v1 freeze: docs/07 §4's 'Extension roles' paragraph describes per-app domain roles (collection_total, settlement_eta, batch_row, shortfall_flag, tracker_state, ...) registered declaratively 'in the same enum', but none of those extension names are pinned anywhere as a stable wire vocabulary (docs/01 §5's per-screen table is explicitly shorthand/non-authoritative per docs/07 §4). Widening this oneOf with additional per-role $defs is an additive, non-breaking change within v1 (docs/13 §9) when those extension roles are actually frozen by a future task — inventing wire names for them now would be guessing, not freezing.",
+      "oneOf": [
+        { "$ref": "#/$defs/amount_field_component" },
+        { "$ref": "#/$defs/recipient_component" },
+        { "$ref": "#/$defs/primary_cta_component" },
+        { "$ref": "#/$defs/secondary_cta_component" },
+        { "$ref": "#/$defs/text_field_component" },
+        { "$ref": "#/$defs/list_component" },
+        { "$ref": "#/$defs/list_item_component" },
+        { "$ref": "#/$defs/dialog_component" },
+        { "$ref": "#/$defs/snackbar_component" },
+        { "$ref": "#/$defs/tab_component" },
+        { "$ref": "#/$defs/toggle_component" },
+        { "$ref": "#/$defs/balance_display_component" },
+        { "$ref": "#/$defs/status_badge_component" },
+        { "$ref": "#/$defs/error_banner_component" },
+        { "$ref": "#/$defs/alert_banner_component" },
+        { "$ref": "#/$defs/image_component" }
+      ]
+    },
+    "last_action": {
+      "type": "object",
+      "description": "docs/07 rule 7 / §6 shape, e.g. {\"type\": \"tap\", \"target\": \"Pay Now\", \"ts\": 1784536440000}.",
+      "properties": {
+        "type": { "type": "string" },
+        "target": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["type", "target", "ts"]
+    },
+    "last_api": {
+      "type": "object",
+      "description": "docs/07 rule 7 shape: the most recent non-2xx response for this screen. error_code is the docs/13 §1.1 vocabulary, deliberately typed as a plain string rather than an enum here for the same reason signaling_message.v1.json's error payload does not enum 'code' — new codes may be added within a class without a version bump (docs/13 §1.1, §9).",
+      "properties": {
+        "method": { "type": "string" },
+        "path": { "type": "string" },
+        "status": { "type": "integer" },
+        "error_code": { "type": "string" }
+      },
+      "required": ["method", "path", "status", "error_code"]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "type": "ctx.request_snapshot",
+  "seq": 7,
+  "ts": 1784536455900,
+  "payload": {"last_good_seq": 44}
+}

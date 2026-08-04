@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "type": "ctx.snapshot",
+  "seq": 12,
+  "ts": 1784536441000,
+  "payload": {
+    "v": "screen_context/v1",
+    "screen": "PaymentScreen",
+    "flow": "vendor_payment",
+    "components": [
+      {"role": "amount_field", "label": "Amount", "value": "₹245"},
+      {"role": "recipient", "label": "To", "value": "Amazon Business"},
+      {"role": "primary_cta", "label": "Pay Now", "enabled": true},
+      {"role": "dialog", "label": "Daily Limit Exceeded", "visible": true},
+      {"role": "snackbar", "label": "Payment Failed", "visible": true}
+    ],
+    "last_action": {"type": "tap", "target": "Pay Now", "ts": 1784536440000},
+    "last_api": {"method": "POST", "path": "/payments", "status": 402,
+                 "error_code": "DAILY_LIMIT_EXCEEDED"},
+    "dirty_fields": [],
+    "loading": false
+  }
+}
