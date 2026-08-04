@@ -17,11 +17,16 @@ import com.vyaparpay.core.network.SessionEndDto
 import com.vyaparpay.core.network.SessionSummaryDto
 import com.vyaparpay.core.network.VyaparApi
 import com.vyaparpay.core.network.VyaparApiFactory
+import com.vyaparpay.core.screencontext.ScreenContextPublisher
 import com.vyaparpay.voice.CallController
 import com.vyaparpay.voice.audio.AndroidCallAudioSession
+import com.vyaparpay.voice.context.ScreenContextPublisherBinding
 import com.vyaparpay.voice.notification.AndroidCallNotifier
 import com.vyaparpay.voice.signaling.OkHttpSignalingClient
 import com.vyaparpay.voice.webrtc.WebRtcClientFactory
+import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
+import javax.inject.Provider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -50,7 +55,26 @@ import okhttp3.OkHttpClient
  * `PeerConnectionWebRtcClient` (untested directly) versus `CallController`
  * (extensively tested).
  */
+@AndroidEntryPoint
 public class VoiceCallService : LifecycleService() {
+
+    /**
+     * A `Provider`, not a plain injected instance: one fresh
+     * [ScreenContextPublisher] per call.
+     *
+     * The publisher is unscoped in the graph, so a `Provider.get()` per
+     * [handleStart] hands each call its own `seq` counter starting at
+     * `GENESIS_SEQ + 1` — which is exactly the anchor the backend's
+     * `SnapshotIngestor` seeds per session (see [ScreenContextPublisher]'s own
+     * kdoc). Sharing one publisher across calls would open call two with a
+     * `seq` the server reads as a gap on the very first message, triggering a
+     * `ctx.request_snapshot` round trip before the conversation starts. Its
+     * `AppStateManager` dependency *is* a `@Singleton` and is correctly
+     * shared — the timeline must survive between calls; only the wire-level
+     * counter must not.
+     */
+    @Inject
+    public lateinit var screenContextPublishers: Provider<ScreenContextPublisher>
 
     // A single confined worker, not the raw Default pool: CallController's
     // own event loop, VoiceCallCoordinator's two collectors, and a mute
@@ -163,6 +187,10 @@ public class VoiceCallService : LifecycleService() {
                 signaling = OkHttpSignalingClient(sharedOkHttp, serviceScope),
                 webRtc = WebRtcClientFactory.create(applicationContext),
                 scope = serviceScope,
+                // Bound to the `ctx` channel on the Connecting -> InCall
+                // transition and torn down with the call — see
+                // CallController.bindContextPublisher()'s kdoc.
+                contextPublisher = resolveContextPublisher(),
             )
             newCoordinator = VoiceCallCoordinator(
                 callState = newController.state,
@@ -202,6 +230,32 @@ public class VoiceCallService : LifecycleService() {
         newCoordinator.start()
         newController.startCall(request)
     }
+
+    /**
+     * The capture pipeline, or `null` if the graph cannot produce one.
+     *
+     * Deliberately its own `runCatching` rather than sharing [handleStart]'s
+     * surrounding try/catch, because the two failures deserve opposite
+     * outcomes. A failed `WebRtcClientFactory.create()` means there is no call
+     * to have — the block below ends the service. A failed capture graph
+     * (`Provider.get()` blowing up in a `@Singleton` constructor deep under
+     * `AppStateManager`, or `screenContextPublishers` never injected at all)
+     * means only that the agent will be blind: docs/08 §7's "degrade context,
+     * never conversation" says the merchant still gets to talk to support.
+     * `CallController` takes a nullable publisher for exactly this case, so
+     * this is a supported state, not a swallowed error.
+     *
+     * `Throwable`, matching [handleStart]'s own reasoning: an `@Inject` graph
+     * failure surfaces as an `Error` (`ExceptionInInitializerError`,
+     * `UninitializedPropertyAccessException`) at least as often as an
+     * `Exception`, and neither is worth a dead call.
+     */
+    private fun resolveContextPublisher(): ScreenContextPublisherBinding? =
+        try {
+            ScreenContextPublisherBinding(screenContextPublishers.get())
+        } catch (_: Throwable) {
+            null
+        }
 
     private fun decodeSessionRequest(intent: Intent): SessionCreateRequestDto? {
         val json = intent.getStringExtra(EXTRA_SESSION_REQUEST_JSON) ?: return null

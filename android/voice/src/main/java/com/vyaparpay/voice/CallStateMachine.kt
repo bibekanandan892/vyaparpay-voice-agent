@@ -75,10 +75,15 @@ public class CallStateMachine {
 
         CallState.Connecting -> when (event) {
             CallEvent.PeerConnected ->
-                // Media up, `ctx` open. Binding the context publisher and
-                // requesting audio focus (docs/03 §3.2) are the service and
-                // capture tasks' effects — nothing to run yet.
-                CallState.InCall to emptyList()
+                // Media up, `ctx` open — bind the capture pipeline to it
+                // (docs/03 §3.2, §3.10). Audio focus is deliberately NOT an
+                // effect here: VoiceCallCoordinator acquires it off the
+                // *state* the moment the service must be in the foreground
+                // (Requesting), strictly before WebRtcClient.start() opens the
+                // mic — see that class's own kdoc. Only the context binding
+                // genuinely belongs on this edge, because it is the edge on
+                // which the `ctx` data channel first becomes usable.
+                CallState.InCall to listOf(CallEffect.BindContextPublisher)
             is CallEvent.Failed ->
                 // ICE failed / DTLS timeout — the media plane never came up.
                 CallState.Ended(EndReason.SETUP_FAILED) to listOf(CallEffect.ReleaseCall)

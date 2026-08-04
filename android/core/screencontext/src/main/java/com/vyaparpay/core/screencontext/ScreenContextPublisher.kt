@@ -109,6 +109,15 @@ public class ScreenContextPublisher internal constructor(
     // but do not advance screen state).
     private var lastScreenStateSeq: Long? = null
 
+    // Retained from [start] purely so [requestFullSnapshot] can answer the
+    // server's recovery request *now* rather than at the next screen change
+    // — see that function's kdoc for why answering immediately is the
+    // difference between a working recovery loop and a stalled one.
+    // @Volatile, not lock-guarded: [start] runs on the caller's binding
+    // thread while the read happens inside `publishLock` on a collector
+    // coroutine, so visibility (not mutual exclusion) is the actual hazard.
+    @Volatile private var boundChannel: ContextChannel? = null
+
     /**
      * Begins publishing. Two independent collectors on [scope], matching
      * docs/03 §5's split precisely: the screen-state side is conflated (a
@@ -128,6 +137,8 @@ public class ScreenContextPublisher internal constructor(
      * satisfied by [screenState]'s own type.
      */
     public fun start(channel: ContextChannel, scope: CoroutineScope) {
+        boundChannel = channel
+
         screenState
             .onEach { state -> publishScreenState(state, channel) }
             .launchIn(scope)
@@ -135,6 +146,54 @@ public class ScreenContextPublisher internal constructor(
         events
             .onEach { event -> publishEvent(event, channel) }
             .launchIn(scope)
+    }
+
+    /**
+     * The client half of the gap-recovery loop (docs/08 §3.3, docs/13 §4):
+     * the server detected a `seq` gap, discarded the gapped message, and sent
+     * `ctx.request_snapshot` asking for **a fresh capture, not a replay**
+     * (docs/08 §3.2). The caller is the `:voice` downlink pump; this class
+     * never reads the data channel itself (that would put transport back
+     * inside the capture module, the exact inversion [ContextChannel] exists
+     * to prevent).
+     *
+     * **Judgment call — this publishes immediately, it does not merely arm a
+     * flag for "the next screen-state publish".** Arming a flag is the
+     * smaller change and was the first shape considered, but it does not
+     * actually close the loop: [screenState] is a `StateFlow`, so it re-emits
+     * only when the value *changes*, and the overwhelmingly common gap case
+     * is a reconnect on a screen the merchant is sitting still on (docs/06
+     * §6's 30 s grace, whose whole premise is that the user has not gone
+     * anywhere). A flag-only implementation would leave the server holding a
+     * discarded-state `ctx:{session_id}` until the merchant happened to
+     * navigate — the agent blind for an unbounded stretch of the very
+     * conversation the recovery exists to protect. Sending the current
+     * [AppContextState.screen] straight away is what "fresh capture" means
+     * on this side of the wire, and it costs exactly one snapshot.
+     *
+     * Reusing [sendSnapshot] (rather than open-coding a send) is what keeps
+     * recovery consistent with every other snapshot: the docs/07 §7 drop
+     * ladder still runs, `seq` still comes from the one shared counter, and
+     * `lastScreenStateSeq` is re-anchored so the *next* delta's `base_seq`
+     * points at this recovery snapshot instead of the pre-gap message the
+     * server threw away.
+     *
+     * The two degenerate cases both fall back to arming rather than sending:
+     * before [start] there is no channel, and before the first capture there
+     * is no screen. Clearing [lastPublishedScreen] in that case makes the
+     * first subsequent emission take the "new screen" branch — a full
+     * snapshot, never a delta against a base the server no longer holds.
+     */
+    public suspend fun requestFullSnapshot() {
+        publishLock.withLock {
+            val channel = boundChannel
+            val current = screenState.value.screen
+            if (channel == null || current == null) {
+                lastPublishedScreen = null
+                return@withLock
+            }
+            sendSnapshot(current, channel)
+        }
     }
 
     private suspend fun publishScreenState(state: AppContextState, channel: ContextChannel) {

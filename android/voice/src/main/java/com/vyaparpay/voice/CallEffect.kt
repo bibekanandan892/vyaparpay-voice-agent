@@ -25,6 +25,21 @@ public sealed interface CallEffect {
      */
     public data class OpenTransport(val bundle: ConnectBundleDto) : CallEffect
 
+    /**
+     * Media is up and the `ctx` channel is open: attach the screen-context
+     * capture pipeline to it for the rest of the call (docs/03 §3.2's
+     * `Connecting → InCall` row, docs/03 §3.10).
+     *
+     * There is deliberately no matching `UnbindContextPublisher`. [ReleaseCall]
+     * already is the one teardown effect every terminal path converges on, and
+     * splitting the publisher's teardown into a second effect would create a
+     * way to reach `Ended` with the capture collectors still alive — a
+     * privacy failure (the merchant's screen still being shipped after
+     * hang-up), not merely a leak. Same "every teardown path converges" rule
+     * the peer and the socket already rely on.
+     */
+    public data object BindContextPublisher : CallEffect
+
     /** Send `bye {reason}` on the still-open signaling socket (docs/13 §6). */
     public data class SendBye(val reason: String) : CallEffect
 

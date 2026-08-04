@@ -5,6 +5,9 @@ import com.vyaparpay.core.network.ApiResult
 import com.vyaparpay.core.network.ConnectBundleDto
 import com.vyaparpay.core.network.SessionCreateRequestDto
 import com.vyaparpay.core.network.VyaparApi
+import com.vyaparpay.voice.context.CallContextPublisher
+import com.vyaparpay.voice.context.ContextDownlink
+import com.vyaparpay.voice.context.ContextDownlinkFrame
 import com.vyaparpay.voice.signaling.OutboundSignal
 import com.vyaparpay.voice.signaling.SignalFrame
 import com.vyaparpay.voice.signaling.SignalingClient
@@ -13,9 +16,13 @@ import com.vyaparpay.voice.webrtc.RemoteIceCandidate
 import com.vyaparpay.voice.webrtc.RtcEvent
 import com.vyaparpay.voice.webrtc.Sdp
 import com.vyaparpay.voice.webrtc.WebRtcClient
+import com.vyaparpay.voice.webrtc.WebRtcContextChannel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -40,14 +47,25 @@ import kotlinx.coroutines.launch
  * Sequence owned here (docs/03 §3.2, docs/13 §6.1): mint session → connect
  * WS → start peer (mic + `ctx` channel) → send offer → trickle local ICE out
  * / apply remote ICE in (tolerating the server's answer-embedded candidates
- * and its `candidate: null` marker) → apply answer → media connects → in
- * call → bye/teardown.
+ * and its `candidate: null` marker) → apply answer → media connects → bind the
+ * screen-context publisher to the now-open `ctx` channel (docs/03 §3.10) →
+ * in call → bye/teardown.
  */
 public class CallController(
     private val api: VyaparApi,
     private val signaling: SignalingClient,
     private val webRtc: WebRtcClient,
     private val scope: CoroutineScope,
+    /**
+     * The screen-context capture pipeline, bound to the `ctx` channel for the
+     * life of the call (docs/03 §3.10). Nullable *by design*, not for
+     * convenience: docs/08 §7's rule is "degrade context, never conversation",
+     * and a null here is that rule expressed in the type — a call with no
+     * capture pipeline is a working call with a blind agent, never a failed
+     * one. `VoiceCallService` always supplies one; the tests that do not care
+     * about context leave it out.
+     */
+    private val contextPublisher: CallContextPublisher? = null,
     private val answerTimeoutMillis: Long = ANSWER_TIMEOUT_MILLIS,
     private val reconnectGraceMillis: Long = RECONNECT_GRACE_MILLIS,
 ) {
@@ -64,6 +82,9 @@ public class CallController(
     private var transportJob: Job? = null
     private var answerTimeoutJob: Job? = null
     private var graceJob: Job? = null
+
+    /** Non-null between [bindContextPublisher] and [releaseCall]; cancelling it *is* the publisher's `stop()`. */
+    private var contextScope: CoroutineScope? = null
 
     init {
         scope.launch {
@@ -107,6 +128,7 @@ public class CallController(
         when (effect) {
             CallEffect.MintSession -> mintSession()
             is CallEffect.OpenTransport -> openTransport(effect.bundle)
+            CallEffect.BindContextPublisher -> bindContextPublisher()
             is CallEffect.SendBye -> signaling.send(OutboundSignal.Bye(effect.reason))
             CallEffect.StartReconnectGrace -> startGraceTimer()
             CallEffect.CancelReconnectGrace -> {
@@ -155,6 +177,108 @@ public class CallController(
                 // failure). The cause was a transport/native error, not a
                 // wire code, so there is nothing better than UNKNOWN to map.
                 dispatch(CallEvent.Failed(ApiError.UNKNOWN))
+            }
+        }
+    }
+
+    /**
+     * `CallEffect.BindContextPublisher`: attach the capture pipeline to the
+     * now-open `ctx` channel, and start pumping the downlink for
+     * `ctx.request_snapshot` (docs/03 §3.10, docs/08 §3.3).
+     *
+     * **Judgment call 1 — an effect handled here, not a `CallState` observer
+     * in `VoiceCallCoordinator`.** The reducer's own comment on the
+     * `Connecting → PeerConnected` row already framed this as an effect
+     * ("binding the context publisher ... are the service and capture tasks'
+     * effects"), and this class is where effects execute. It is also the only
+     * place that holds all three things the binding needs at once: the
+     * [WebRtcClient] the channel adapts, the call scope, and
+     * `CallEffect.ReleaseCall` — the single point every terminal path
+     * converges on, which is what makes teardown a structural guarantee
+     * rather than a second observer that has to be kept in sync. A
+     * `VoiceCallCoordinator` observer would have had none of them (it sees
+     * `CallState`, `CallAudioSession` and `CallNotifier` only) and would have
+     * needed the peer plumbed through it purely to reach `sendContext`. The
+     * cost — `CallStateMachine`/`CallEffect` are merged, reviewed files — is
+     * one additive effect and the assertions in `CallStateMachineTest` that
+     * name it.
+     *
+     * **Judgment call 2 — a fresh child scope, never [scope] itself, and
+     * never the app-scoped `CoroutineScope` `ScreenContextModule` provides.**
+     * `ScreenContextPublisher.start` has no `stop()`; cancelling the supplied
+     * scope is the *only* teardown mechanism, so the scope's lifetime is the
+     * publisher's lifetime. `ScreenContextModule`'s `@Singleton` scope is
+     * app-lifetime by design (it belongs to `UiTreeCollector`/
+     * `AppStateManager`, which must survive between calls); handing it to the
+     * publisher would leave the screen-state collector running after hang-up,
+     * still shipping the merchant's screen contents into a dead channel — or,
+     * worse, into whatever the *next* call binds. That is a privacy failure,
+     * not a leak, and it is the same class of hazard as docs/03 §3.3's "a
+     * leaked `PeerConnection` is a live mic". The child scope below is parented
+     * to [scope] (so `VoiceCallService.onDestroy`'s `serviceScope.cancel()`
+     * still reaches it) but is independently cancellable, so [releaseCall] can
+     * end the publisher without ending the dispatch loop that is running
+     * [releaseCall].
+     *
+     * `SupervisorJob` + a swallowing [CoroutineExceptionHandler]: with a plain
+     * `Job`, one failing collector would cancel the other *and* propagate up
+     * to [scope], taking the call down with it. [WebRtcContextChannel] already
+     * absorbs send failures, which is where they overwhelmingly come from —
+     * this is the structural backstop that makes "degrade context, never
+     * conversation" hold even for a failure mode nobody anticipated, rather
+     * than relying on every future collector being individually careful.
+     *
+     * Idempotent by the `contextScope != null` guard. The reducer only emits
+     * this effect on `Connecting → InCall`, and a mid-call
+     * `Reconnecting → InCall` resume emits `CancelReconnectGrace` instead —
+     * so a double bind is not reachable today. The guard is here because the
+     * consequence if it ever became reachable is two publishers racing one
+     * `seq` counter over one channel, which the server reads as a permanent
+     * gap storm; a one-line invariant is cheaper than that failure.
+     */
+    private fun bindContextPublisher() {
+        val publisher = contextPublisher ?: return
+        if (contextScope != null) return
+
+        val publisherScope = CoroutineScope(
+            scope.coroutineContext +
+                SupervisorJob(scope.coroutineContext[Job]) +
+                CONTEXT_FAILURE_HANDLER,
+        )
+        contextScope = publisherScope
+
+        publisher.start(WebRtcContextChannel(webRtc), publisherScope)
+        publisherScope.launch { pumpContextDownlink(publisher) }
+    }
+
+    /**
+     * The server → client half of the gap-recovery loop (docs/08 §3.3):
+     * `ctx.request_snapshot` in, a fresh full snapshot out. Without this the
+     * loop is one-way — the server discards a gapped delta and asks for a
+     * re-sync that never arrives.
+     *
+     * `transcript.partial`/`transcript.final`/`agent.state` share this
+     * channel and are *not* handled here; they belong to the overlay task
+     * (docs/03 §3.12) — see [ContextDownlinkFrame.IGNORED]'s kdoc for why that
+     * is a deliberate seam rather than a gap. [WebRtcClient.incoming] is a
+     * `SharedFlow`, so that task adds a second collector without disturbing
+     * this one.
+     *
+     * The per-message `try` keeps one bad frame from ending the pump, the
+     * same containment `ContextDispatcher` applies on the other end of the
+     * wire ("one malformed message degrades context for that message only").
+     */
+    private suspend fun pumpContextDownlink(publisher: CallContextPublisher) {
+        webRtc.incoming.collect { frame ->
+            if (ContextDownlink.classify(frame) != ContextDownlinkFrame.REQUEST_SNAPSHOT) return@collect
+            try {
+                publisher.requestFullSnapshot()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // A failed recovery snapshot costs one round trip of
+                // staleness: the next gapped client message re-triggers
+                // `ctx.request_snapshot` (docs/08 §3.2). Never the call.
             }
         }
     }
@@ -236,6 +360,14 @@ public class CallController(
     }
 
     private fun releaseCall() {
+        // First, and before webRtc.close() below: the capture collectors must
+        // stop producing before the channel they produce into is disposed,
+        // and — the part that actually matters — the merchant's screen must
+        // stop leaving the device the moment the call is over, not whenever
+        // the coroutine machinery gets around to it. See
+        // bindContextPublisher()'s judgment call 2.
+        contextScope?.cancel()
+        contextScope = null
         answerTimeoutJob?.cancel()
         answerTimeoutJob = null
         graceJob?.cancel()
@@ -265,5 +397,14 @@ public class CallController(
 
         /** docs/06 §6: the 30 s reconnect grace. */
         public const val RECONNECT_GRACE_MILLIS: Long = 30_000L
+
+        /**
+         * docs/08 §7, structurally: nothing thrown inside the context
+         * pipeline may reach the call's scope. Handled by dropping — there is
+         * no logger in `:voice`, and `WebRtcContextChannel.droppedFrameCount`
+         * already carries the observable half of the story for the failure
+         * mode that actually happens (a closed data channel).
+         */
+        private val CONTEXT_FAILURE_HANDLER = CoroutineExceptionHandler { _, _ -> }
     }
 }
