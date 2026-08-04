@@ -276,17 +276,15 @@ class SnapshotIngestor:
     # ------------------------------------------------------------------
 
     async def ingest_snapshot(self, session_id: str, envelope: dict[str, Any]) -> IngestResult:
+        # Review fix: this used to run the sequence check (an unconditional
+        # Redis GET) before the size/schema checks, contradicting both
+        # docs/08 §4.1's cheapest-first order and this module's own opening
+        # docstring claim -- and diverging from ingest_delta below, which
+        # already got the order right. Reordered so a message that's cheaply
+        # rejectable (bad size/shape) never pays the Redis round-trip.
         envelope_error = _check_envelope_shape(envelope, expected_type=_SNAPSHOT_ENVELOPE_TYPE)
         if envelope_error is not None:
             return self._reject_envelope(session_id, envelope_error)
-
-        seq = envelope["seq"]
-        stored_before = await self._read_ctx(session_id)
-        last_seq = stored_before.get("seq") if stored_before is not None else None
-        if last_seq is not None and seq <= last_seq:
-            return self._reject_sequence_gap(
-                session_id, f"snapshot seq {seq} is not newer than last-stored seq {last_seq}"
-            )
 
         payload, dropped_rungs, recompressed = self._enforce_size_cap_snapshot(
             session_id, envelope["payload"]
@@ -295,6 +293,14 @@ class SnapshotIngestor:
         schema_errors = validate(payload, load_schema("screen_context.v1"))
         if schema_errors:
             return self._reject_schema(session_id, schema_errors)
+
+        seq = envelope["seq"]
+        stored_before = await self._read_ctx(session_id)
+        last_seq = stored_before.get("seq") if stored_before is not None else None
+        if last_seq is not None and seq <= last_seq:
+            return self._reject_sequence_gap(
+                session_id, f"snapshot seq {seq} is not newer than last-stored seq {last_seq}"
+            )
 
         stored = {**payload, "seq": seq, "received_ts": envelope["ts"]}
         await self._write_ctx(session_id, stored)
@@ -419,9 +425,20 @@ class SnapshotIngestor:
         *,
         outcome: IngestOutcome = IngestOutcome.REJECTED_SEQUENCE_GAP,
     ) -> IngestResult:
-        log.warning(
-            "context.snapshot_ingestor.sequence_gap", session_id=session_id, reason=reason
+        # Review fix: the log event name used to be hardcoded to
+        # "sequence_gap" regardless of `outcome`, so a REJECTED_OVERSIZE_DELTA
+        # rejection (judgment call 5's "one drop-ladder definition, two
+        # enforcement points" doesn't apply here -- deltas skip the ladder
+        # entirely) was logged under the wrong aggregable event name,
+        # defeating judgment call 5's point of using structured log events as
+        # the metrics stand-in for exactly the failure mode docs/08 §7 calls
+        # out as worth tracking separately ("a client bug by contract").
+        event = (
+            "context.snapshot_ingestor.oversize_delta_rejected"
+            if outcome is IngestOutcome.REJECTED_OVERSIZE_DELTA
+            else "context.snapshot_ingestor.sequence_gap"
         )
+        log.warning(event, session_id=session_id, reason=reason)
         return IngestResult(
             session_id=session_id,
             outcome=outcome,
