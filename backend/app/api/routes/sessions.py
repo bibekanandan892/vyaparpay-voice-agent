@@ -84,7 +84,6 @@ from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
-from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.session_manager import SessionManager
@@ -356,8 +355,8 @@ async def _ingest_initial_screen_context(
     propagated uncaught through this route into `ErrorEnvelopeMiddleware`,
     turning an already-successful session creation (the `conversations`
     row is already committed by this point) into a client-visible 500.
-    `RedisError` is now caught here, matching `ContextBuilder`'s own
-    established convention for exactly this exception surface.
+    That Redis failure is caught here (originally as `RedisError`; see the
+    audit-fix note below for why the guard is now broader).
     `SnapshotIngestor` already logs every REJECTION path at WARNING
     internally (its `_reject_*` helpers, each carrying `session_id` and a
     `reason`) with a stable, dedicated event name per check — logging
@@ -366,12 +365,34 @@ async def _ingest_initial_screen_context(
     WARNING only for the genuine-infrastructure-failure case this fix
     adds, and a single INFO line on acceptance, mirroring this route's
     existing `session_created` log.
+
+    Audit fix (2026-08-04): the guard above was `except RedisError`, which
+    covered only the `_write_ctx` failure mode it was written for and left
+    a second, non-Redis crash path wide open. `ingest_initial_snapshot`
+    runs its size cap BEFORE schema validation, and the oversize branch
+    hands the payload to `ContextCompressor`'s drop ladder, whose rungs
+    call `component.get("role")` on each entry of `components`. A payload
+    that is both over the 8 KiB cap AND structurally malformed (e.g.
+    `components` holding strings rather than objects — a buggy or
+    outdated client build, not a crafted attack) therefore raised
+    `AttributeError` straight through this guard and turned an
+    already-committed session creation into a client-visible 500 —
+    precisely the failure this function exists to prevent, reached by a
+    different door. Reproduced against the real ASGI stack before fixing.
+    The guard is now `except Exception`: for THIS function the exception
+    type is genuinely irrelevant — docs/08 §7's rule is absolute ("the
+    pipeline degrades context, never conversation"), and there is no
+    failure mode of context ingestion that should be allowed to fail a
+    call the merchant is trying to start. `exc_info=True` keeps the real
+    traceback in the logs, so a broadened catch here hides nothing from
+    operators; the in-call data-channel path (`ContextDispatcher.run`)
+    already made exactly this call for exactly this reason.
     """
     try:
         result = await snapshot_ingestor.ingest_initial_snapshot(
             session_id, screen_context, received_at_ms=_now_ms()
         )
-    except RedisError:
+    except Exception:
         log.warning("session_screen_context_ingest_failed", session_id=session_id, exc_info=True)
         return
     if result.accepted:

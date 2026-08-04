@@ -21,8 +21,22 @@ WORKDIR /app
 # and simplicity; revisit only if build times become a real problem.
 COPY . .
 
+# The `[voice]` extra is NOT optional here, despite only one of the two
+# services needing it. docs/04 §1 is "one image, built once, started two
+# ways" and docker-compose.yml builds exactly one image (`vyapar-backend:dev`)
+# for both `agent-api` and `voice-worker`, which differ only in `command:`.
+# `voice-worker` runs `python -m app.voice.run`, whose import graph reaches
+# aiortc/deepgram/elevenlabs — all declared in the `voice` extra, none in the
+# base install. Audit fix (2026-08-04): this was a plain `pip install .`, so
+# the voice-worker container could not import its own entrypoint at all — it
+# would have died on `ModuleNotFoundError` the first time anyone ran the
+# stack with a real worker. Installing the extra into the shared image costs
+# agent-api a slightly larger layer and buys a worker that actually starts;
+# splitting into two images (or a multi-stage target) is the alternative, and
+# is the right move only if that layer size ever becomes a real problem —
+# it would trade away the single-build property compose relies on today.
 RUN pip install --upgrade pip \
-    && pip install .
+    && pip install ".[voice]"
 
 # Run as a non-root user.
 RUN useradd --create-home --shell /usr/sbin/nologin agent \

@@ -110,6 +110,81 @@ class AppStateManagerTest {
     }
 
     // ------------------------------------------------------------------
+    // Stale-tree guard (audit fix, 2026-08-04)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `a route change with no new capture never relabels the old screen's components as the new route`() =
+        runTest {
+            val tree = MutableStateFlow(payNowCtaTree())
+            val eventTracker = FakeEventTracker()
+            val navigationTracker = NavigationTracker(eventTracker)
+            val manager = AppStateManager(tree, navigationTracker, eventTracker, backgroundScope)
+
+            navigationTracker.onDestinationChanged("PaymentScreen")
+            runCurrent()
+            assertEquals("PaymentScreen", requireNotNull(manager.state.value.screen).screen)
+
+            // Navigate WITHOUT a new capture -- exactly what a real
+            // NavController does: `route` flips synchronously inside
+            // onDestinationChanged, while `tree` still holds PaymentScreen's
+            // capture until UiTreeCollector's debounce fires.
+            navigationTracker.onDestinationChanged("SettlementsScreen")
+            runCurrent()
+
+            val midNav = manager.state.value
+            // route/flow track the live nav position...
+            assertEquals("SettlementsScreen", midNav.route)
+            // ...but the IR must still be the last one actually captured. Before
+            // the fix this read "SettlementsScreen" while carrying PaymentScreen's
+            // pay_now_cta -- a screen the merchant was never on, which
+            // ScreenContextPublisher then shipped as a full ctx.snapshot.
+            val retained = requireNotNull(midNav.screen)
+            assertEquals("PaymentScreen", retained.screen)
+            assertEquals("vendor_payment", retained.flow)
+
+            // The real capture lands -> now, and only now, the IR advances.
+            tree.value = emptyTree()
+            runCurrent()
+
+            val settled = requireNotNull(manager.state.value.screen)
+            assertEquals("SettlementsScreen", settled.screen)
+            assertTrue(settled.components.isEmpty())
+        }
+
+    @Test
+    fun `leaving an excluded route does not build the new route's IR out of the excluded screen's capture`() =
+        runTest {
+            val tree = MutableStateFlow(payNowCtaTree())
+            val eventTracker = FakeEventTracker()
+            val navigationTracker = NavigationTracker(eventTracker)
+            val manager = AppStateManager(tree, navigationTracker, eventTracker, backgroundScope)
+
+            navigationTracker.onDestinationChanged("PaymentScreen")
+            runCurrent()
+
+            // On HelpScreen a capture DOES arrive; it is excluded from being
+            // built, but it must still be marked as seen.
+            navigationTracker.onDestinationChanged("HelpScreen")
+            runCurrent()
+            tree.value = emptyTree() // HelpScreen's own capture
+            runCurrent()
+
+            // Leaving Help for an operational route, still on Help's capture.
+            // Tracking `lastSeenTree` only on builds would make Help's tree look
+            // "new" here and yield a DashboardScreen IR built from HelpScreen's
+            // components -- the excluded screen's content leaking out under an
+            // operational label, the one thing capture exclusion exists to stop.
+            navigationTracker.onDestinationChanged("DashboardScreen")
+            runCurrent()
+
+            val retained = requireNotNull(manager.state.value.screen)
+            assertEquals("DashboardScreen", manager.state.value.route)
+            assertEquals("PaymentScreen", retained.screen)
+            assertEquals(1, retained.components.size)
+        }
+
+    // ------------------------------------------------------------------
     // Capture exclusion (docs/07 §2.1)
     // ------------------------------------------------------------------
 
