@@ -50,7 +50,8 @@ app/
 └── config.py       # Settings (pydantic-settings, fail-fast on missing secrets)
 scripts/
 ├── seed.py         # Idempotent demo fixture seeder (Rajesh/Kumar General Store/...)
-└── demo_cli.py     # Text REPL harness — stands in for the Phase-3 voice transport
+├── demo_cli.py     # Text REPL harness — stands in for the Phase-3 voice transport
+└── smoke_providers/ # Live Deepgram/ElevenLabs smoke harness (operator-run, real APIs — see below)
 tests/
 ├── agent/, api/, data/, memory/, models/, obs/, providers/, scripts/, tools/  # unit tests
 └── e2e/            # test_canonical_conversation.py — the full 9-turn replay
@@ -107,3 +108,37 @@ All settings are environment variables read by `app/config.py`
 the full list with comments. Three fields have no default and the
 process fails fast at startup if they're unset: `JWT_SECRET`,
 `DATABASE_URL`, `OPENROUTER_API_KEY`.
+
+## Live-provider smoke harness
+
+`app/providers/deepgram.py` and `app/providers/elevenlabs.py` are wire-
+tested only against in-process fake WebSocket servers
+(`tests/providers/`) — no live API keys exist in CI or the default dev
+environment, so every vendor-pinned behavior those modules document
+(`PINNED(vendor)` in the tests, the numbered judgment calls in the
+provider docstrings) has never been checked against the real endpoints.
+`scripts/smoke_providers/` is the operator-run harness that closes that
+gap: it talks to the real Deepgram and ElevenLabs APIs and prints a
+PASS/FAIL/UNKNOWN verdict per assumption, cross-referenced to the
+judgment-call number it validates.
+
+**This is not a test.** It is not in `tests/`, it is never run by CI or
+`pytest`, and running it costs real (small) vendor usage charges. Needs
+`DEEPGRAM_API_KEY` and/or `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`
+set (`.env.example` has the fields; the harness refuses to run and names
+whichever env var is missing otherwise) and the `[voice]` extra
+installed (`pip install -e ".[dev,voice]"`).
+
+```bash
+python -m scripts.smoke_providers                    # both legs, zero-asset synthetic audio
+python -m scripts.smoke_providers --wav sample.wav    # both legs, real speech (needed for the
+                                                       # transcript-dependent Deepgram checks)
+python -m scripts.smoke_providers --deepgram-only
+python -m scripts.smoke_providers --elevenlabs-only
+python -m scripts.smoke_providers --help              # full flag list, incl. --skip-keepalive
+```
+
+It prints the estimated usage before making any request, never prints or
+logs an API key, and exits non-zero only if a pinned vendor assumption
+was actively contradicted (`UNKNOWN` — "the run never exercised this" —
+never fails the run; only `FAIL` does).
