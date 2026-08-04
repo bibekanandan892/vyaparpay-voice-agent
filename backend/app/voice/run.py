@@ -1,154 +1,221 @@
 """voice-worker entrypoint — `python -m app.voice.run`, exactly as
 docker-compose.yml's voice-worker service invokes it (docs/04 §1's second
 entrypoint): config, logging/tracing init, the `/v1/signal` signaling
-server on the configured port, graceful shutdown on SIGTERM.
-
-PLACEHOLDER SCOPE — read before extending. T3.1 ends at "media and
-messages flow between a client and the worker's ingress/egress + data
-channel" (docs/06 §1's transport layer). The conversation brain —
-VoiceAgentWorker's turn machine, STT/TTS/LLM in the loop — is a LATER
-task, so `PlaceholderCallSession` below terminates media honestly but
-speaks only paced silence: uplink audio is decoded, resampled, and fanned
-out by AudioIngress (its consumers drained by no-op tasks until the real
-worker subscribes them), the downlink AudioStreamTrack is fed by a running
-AudioEgress with nothing enqueued, and the `ctx` data channel opens and
-ignores unknown types per docs/13 §9. Every piece of per-call wiring here
-is exactly what VoiceAgentWorker will take over; only the drains and the
-empty egress are placeholder.
+server on the configured port, graceful shutdown on SIGTERM — and, since
+T5.1, the REAL per-call wiring: every accepted call gets a `CallSession`
+(app/voice/call_session.py) running `VoiceAgentWorker` over DeepgramStt /
+ElevenLabsTts / SileroVad and a per-call `ConversationManager` brain.
 
 Judgment calls, flagged per house style:
 
-1. **No per-turn spans are opened here.** docs/04 §7.2's frozen span table
-   is turn-scoped (`turn`, `stt.final`, ...), and no turn exists until the
-   brain lands — `setup_observability` is initialized so the later task
-   inherits a working provider, and structlog carries the connection
-   lifecycle meanwhile.
-2. **The worker's own ICE config is STUN-only via `COTURN_HOST`** (srflx,
+1. **Voice providers are constructed lazily, on the first call, never at
+   startup.** config.py's optional-key design (its own module docstring:
+   "the voice worker fail-fasts on the subset it needs") meets the test
+   requirement that this process boots with no voice env at all: startup
+   only needs the Phase-2 required settings, and a call arriving without
+   DEEPGRAM/ELEVENLABS keys fails that call's peer setup loudly
+   (signaling answers `INTERNAL`, the provider constructors' own
+   fail-fast messages land in the log) while the process keeps serving.
+   The built `CallDeps` is cached — the providers are process-long by
+   their own contracts; only SileroVad is per-call (call_session
+   judgment call 2).
+2. **The brain factory attaches, then builds.** Per call it awaits
+   `SessionManager.attach(session_id)` — the session row was created by
+   agent-api's `POST /v1/sessions`, so attach is a load-and-return (the
+   Phase-2 stub is sufficient: the worker needs the `Session` domain
+   object for `ConversationManager`, and no state transition is required
+   for the turn machine to run) — then builds a per-call
+   `ConversationManager` + `CostTracker` over the process-long
+   collaborator stack (mirroring scripts/demo_cli.py's composition, the
+   one other real composition root).
+3. **`PlaceholderCallSession` survives as a deps-less shim.**
+   tests/voice/test_run.py (frozen: existing tests are not modified in
+   T5.1) pins its constructor shape and lazy-egress contract; the class
+   is now one `super().__init__(..., deps=None)` over `CallSession`, so
+   the pinned behavior keeps covering the real shared wiring. `main()`
+   no longer constructs it. Flagged for deletion whenever that test
+   file is allowed to move to `CallSession` directly.
+4. **The worker's own ICE config is STUN-only via `COTURN_HOST`** (srflx,
    docs/06 §2's candidate table), empty → host-only. The worker never
    allocates TURN relay for itself: the client holds the HMAC relay
    credentials (docs/13 §7) and one relayed side is sufficient for the
-   pair to connect — a worker-side allocation would need a second minted
-   credential for zero additional connectivity in the compose topology.
-3. **SIGTERM/SIGINT via loop signal handlers**, with a `signal.signal`
+   pair to connect.
+5. **SIGTERM/SIGINT via loop signal handlers**, with a `signal.signal`
    fallback where the loop API is unavailable (Windows dev hosts); the
-   container path (compose → Linux) always takes the loop route. Shutdown
-   order: stop accepting, `close_all()` (bye + peer teardown per session),
-   then close Redis.
+   container path (compose → Linux) always takes the loop route.
+   Shutdown order: stop accepting, `close_all()` (bye + peer teardown
+   per session), then close http/engine/redis.
+6. **Per-turn spans are the worker's** (docs/04 §7.2's Phase-3 rows —
+   `turn` with `endpoint_ms`, `stt.final`); this module only initializes
+   the provider via `setup_observability`, as before.
 """
 
 from __future__ import annotations
 
 import asyncio
 import signal
-from collections.abc import AsyncIterator
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from websockets.asyncio.server import serve
 
+import app.tools  # noqa: F401 -- import side effect: registers the Phase-2 tools
+from app.agent.context_builder import ContextBuilder
+from app.agent.conversation_manager import ConversationManager
+from app.agent.cost_tracker import CostTracker
+from app.agent.llm_router import LLMRouter
+from app.agent.prompt_builder import PromptBuilder
+from app.agent.safety_layer import SafetyLayer
+from app.agent.session_manager import SessionManager
+from app.agent.tool_executor import ToolExecutor
 from app.config import Settings, get_settings
+from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.domain.voice import IceServer
+from app.memory.session_memory import SessionMemory
 from app.obs.logging import configure_logging, get_logger
 from app.obs.tracing import setup_observability
-from app.voice.audio_egress import AudioEgress
-from app.voice.audio_ingress import AudioIngress
-from app.voice.peer_session import PeerSession, SendSignal
+from app.providers.deepgram import DeepgramStt
+from app.providers.elevenlabs import ElevenLabsTts
+from app.providers.openrouter import OpenRouterLLM
+from app.tools.registry import configure as configure_tools
+from app.tools.registry import registry
+from app.voice.call_session import CallDeps, CallSession
+from app.voice.peer_session import SendSignal
 from app.voice.signaling import SIGNALING_PATH, SignalingServer
+from app.voice.silero import SileroVad
+from app.voice.worker import Brain
 
 log = get_logger(__name__)
 
-_CLOSE_TIMEOUT_S = 5.0
 
-
-async def _drain(stream: AsyncIterator[object]) -> None:
-    """No-op consumer for an ingress fan-out until VoiceAgentWorker (a
-    later task) subscribes the real STT/VAD pipelines — without it the
-    bounded queues would fill to their 30 s caps and warn-log on every
-    frame (audio_ingress judgment call 4)."""
-    async for _ in stream:
-        pass
-
-
-class PlaceholderCallSession:
-    """Per-call wiring for T3.1: PeerSession + ingress/egress + tasks.
-
-    Satisfies signaling's PeerSessionLike. VoiceAgentWorker replaces this
-    class wholesale; see the module docstring for what is placeholder.
-    """
+class PlaceholderCallSession(CallSession):
+    """T3.1's transport-only per-call wiring, now a deps-less
+    `CallSession` (judgment call 3): media is terminated honestly, the
+    fan-outs are drained by no-ops, and the downlink speaks paced
+    silence. Kept solely because tests/voice/test_run.py pins this
+    name and constructor shape; `main()` wires `CallSession` with real
+    `CallDeps` instead."""
 
     def __init__(
         self, session_id: str, send_signal: SendSignal, *, ice_servers: tuple[IceServer, ...]
     ) -> None:
-        self._ingress = AudioIngress()
-        # AudioEgress contract carried forward for the task that lands the
-        # turn machine (review sharp edge): `flush()` deliberately does NOT
-        # `resume()` — duck (pause) and commit (flush) are separate signals
-        # (audio_egress judgment call 9, docs/06 §6.1), so VoiceAgentWorker
-        # MUST call `resume()` after every committed flush before the next
-        # reply's audio can play. Nothing here may hide or work around that.
-        self._egress = AudioEgress()
-        self._peer = PeerSession(
-            session_id,
-            ingress=self._ingress,
-            send_signal=send_signal,
-            ice_servers=ice_servers,
-        )
-        self._session_id = session_id
-        # Started lazily from handle_offer() (review HIGH finding): starting
-        # it here would run AudioEgress's self-driven 20 ms cadence for
-        # however long the client takes to even SEND its offer, well before
-        # anything pulls from _EgressTrack's queue — on any real client
-        # setup delay, that reliably fills the ~1 s/50-frame cap and spams
-        # peer_session.outbound_backlog_dropped, contradicting the "never
-        # hit in normal operation" invariant that cap exists to keep true.
-        self._egress_task: asyncio.Task[None] | None = None
-        self._drain_tasks = (
-            asyncio.create_task(
-                _drain(self._ingress.stt_stream()), name=f"stt-drain:{session_id}"
-            ),
-            asyncio.create_task(
-                _drain(self._ingress.vad_frames()), name=f"vad-drain:{session_id}"
-            ),
+        super().__init__(session_id, send_signal, ice_servers=ice_servers, deps=None)
+
+
+@dataclass(frozen=True)
+class _BrainStack:
+    """The process-long brain collaborators (judgment call 2) —
+    everything per-call construction composes from."""
+
+    session_manager: SessionManager
+    session_memory: SessionMemory
+    context_builder: ContextBuilder
+    prompt_builder: PromptBuilder
+    tool_executor: ToolExecutor
+    safety_layer: SafetyLayer
+    llm_router: LLMRouter
+
+
+def _build_brain_stack(
+    settings: Settings,
+    http: httpx.AsyncClient,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    redis: RedisClient,
+) -> _BrainStack:
+    """Mirrors scripts/demo_cli.py's `_build_collaborators` — the same
+    singleton stack, wired for the voice worker process."""
+    llm_provider = OpenRouterLLM(http, settings)
+    configure_tools(sessionmaker)
+    session_manager = SessionManager(sessionmaker, redis)
+    session_memory = SessionMemory(redis)
+    context_builder = ContextBuilder(sessionmaker, session_memory)
+    safety_layer = SafetyLayer(registry)
+    tool_executor = ToolExecutor(
+        registry=registry, safety=safety_layer, redis=redis, sessionmaker=sessionmaker
+    )
+    # The documented interfaces.py Protocol wart (async-generator vs
+    # coroutine spelling) — same ignore as demo_cli's construction.
+    llm_router = LLMRouter(llm_provider, settings)  # type: ignore[arg-type]
+    return _BrainStack(
+        session_manager=session_manager,
+        session_memory=session_memory,
+        context_builder=context_builder,
+        prompt_builder=PromptBuilder(),
+        tool_executor=tool_executor,
+        safety_layer=safety_layer,
+        llm_router=llm_router,
+    )
+
+
+def _make_brain_factory(
+    settings: Settings,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    redis: RedisClient,
+    stack: _BrainStack,
+) -> Callable[[str], Awaitable[Brain]]:
+    """Judgment call 2: attach, then build the per-call brain."""
+
+    async def build(session_id: str) -> Brain:
+        session = await stack.session_manager.attach(session_id)
+        cost_tracker = CostTracker(settings, session_factory=sessionmaker, redis=redis)
+        return ConversationManager(
+            session=session,
+            context_builder=stack.context_builder,
+            prompt_builder=stack.prompt_builder,
+            # Same documented Protocol wart as _build_brain_stack.
+            llm_router=stack.llm_router,  # type: ignore[arg-type]
+            tool_executor=stack.tool_executor,
+            safety_layer=stack.safety_layer,
+            cost_tracker=cost_tracker,
+            session_memory=stack.session_memory,
+            tool_registry=registry,
         )
 
-    async def handle_offer(self, sdp: str) -> None:
-        await self._peer.handle_offer(sdp)
-        if self._egress_task is None:  # not a re-offer (ICE restart) — start once
-            self._egress_task = asyncio.create_task(
-                self._egress.run(self._peer.outbound_sink), name=f"egress-run:{self._session_id}"
+    return build
+
+
+def _lazy_call_deps(
+    settings: Settings, brain_factory: Callable[[str], Awaitable[Brain]]
+) -> Callable[[], CallDeps]:
+    """Judgment call 1: providers are built on the first call and cached
+    for the process; a missing voice key fails THAT call loudly while
+    the worker keeps serving."""
+    cache: list[CallDeps] = []
+
+    def build() -> CallDeps:
+        if not cache:
+            cache.append(
+                CallDeps(
+                    settings=settings,
+                    # Both ignores are the documented interfaces.py/voice.py
+                    # Protocol wart (`async def ... -> AsyncIterator` reads
+                    # as coroutine-returning while the real implementations
+                    # are async generators) — the same convention as
+                    # demo_cli's LLMRouter construction; the worker handles
+                    # both shapes at runtime (speech/stt_supervisor).
+                    stt=DeepgramStt(settings),  # type: ignore[arg-type]
+                    tts=ElevenLabsTts(settings),  # type: ignore[arg-type]
+                    vad_factory=SileroVad,
+                    brain_factory=brain_factory,
+                )
             )
+        return cache[0]
 
-    async def handle_remote_ice(self, payload: object) -> None:
-        await self._peer.handle_remote_ice(payload)  # type: ignore[arg-type]
-
-    async def close(self) -> None:
-        """Teardown without leaks: peer first (ends the uplink drain and
-        closes ingress, which ends the fan-out drains), then stop the paced
-        egress loop; anything still pending after the timeout is cancelled
-        loudly rather than leaked silently. `_egress_task` may be `None`
-        if the connection closed before any offer ever arrived."""
-        await self._peer.close()
-        self._egress.stop()
-        tasks = self._drain_tasks if self._egress_task is None else (
-            *self._drain_tasks,
-            self._egress_task,
-        )
-        done, pending = await asyncio.wait(tasks, timeout=_CLOSE_TIMEOUT_S)
-        for task in pending:
-            log.warning("voice_worker.call_task_cancelled", task=task.get_name())
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+    return build
 
 
 def _worker_ice_servers(settings: Settings) -> tuple[IceServer, ...]:
-    """Judgment call 2: coturn as STUN for srflx, or host-only."""
+    """Judgment call 4: coturn as STUN for srflx, or host-only."""
     if not settings.coturn_host:
         return ()
     return (IceServer(urls=(f"stun:{settings.coturn_host}:3478",)),)
 
 
 def _install_signal_handlers(stop: asyncio.Event) -> None:
-    """Judgment call 3: graceful-shutdown trigger for SIGTERM (compose
+    """Judgment call 5: graceful-shutdown trigger for SIGTERM (compose
     stop) and SIGINT (local ctrl-C)."""
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -165,10 +232,17 @@ async def main() -> None:
     configure_logging(settings)
     setup_observability(settings)
     redis = RedisClient.from_settings(settings)
+    engine, sessionmaker = create_engine_and_sessionmaker(settings)
+    http = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0))
     ice_servers = _worker_ice_servers(settings)
+    stack = _build_brain_stack(settings, http, sessionmaker, redis)
+    brain_factory = _make_brain_factory(settings, sessionmaker, redis, stack)
+    deps_of = _lazy_call_deps(settings, brain_factory)
 
-    def peer_factory(session_id: str, send_signal: SendSignal) -> PlaceholderCallSession:
-        return PlaceholderCallSession(session_id, send_signal, ice_servers=ice_servers)
+    def peer_factory(session_id: str, send_signal: SendSignal) -> CallSession:
+        return CallSession(
+            session_id, send_signal, ice_servers=ice_servers, deps=deps_of()
+        )
 
     server = SignalingServer(redis=redis, peer_factory=peer_factory)
     stop = asyncio.Event()
@@ -189,6 +263,8 @@ async def main() -> None:
             log.info("voice_worker.shutdown_started")
             await server.close_all(reason="agent_hangup")
     finally:
+        await http.aclose()
+        await engine.dispose()
         await redis.close()
     log.info("voice_worker.stopped")
 
