@@ -25,6 +25,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.vyaparpay.core.analytics.EventTracker
@@ -180,7 +183,12 @@ private fun RecipientRow(recipient: String, modifier: Modifier = Modifier) {
  * `trackedClickable` on top of `Button`'s own built-in click handling would
  * register two independent clickable regions on one node. [enabled] gates
  * whether `trackedClickable` is attached at all, since the helper carries no
- * enabled/disabled concept of its own.
+ * enabled/disabled concept of its own. Both branches attach
+ * [Role.Button] explicitly (review fix, T4.3) — building on `Surface`
+ * instead of `Button` means Compose never infers that role on its own, and
+ * docs/07 §1's canonical raw-tree fixture documents this exact node
+ * (`pay_now_cta`) as carrying `"Role": "Button"` whether or not it is
+ * currently tappable.
  */
 @Composable
 private fun PayNowButton(
@@ -195,10 +203,13 @@ private fun PayNowButton(
             events = events,
             screen = PaymentDestination.ROUTE,
             testTag = PAY_NOW_TEST_TAG,
+            role = Role.Button,
             onClick = onClick,
         )
     } else {
-        Modifier.testTag(PAY_NOW_TEST_TAG)
+        Modifier
+            .testTag(PAY_NOW_TEST_TAG)
+            .semantics { role = Role.Button }
     }
 
     Surface(

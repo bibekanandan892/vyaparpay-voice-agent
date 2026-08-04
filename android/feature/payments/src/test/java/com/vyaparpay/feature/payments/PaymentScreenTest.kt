@@ -2,6 +2,10 @@ package com.vyaparpay.feature.payments
 
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -53,6 +57,46 @@ class PaymentScreenTest {
         composeTestRule.onNodeWithTag("amount_input").assertIsDisplayed()
         composeTestRule.onNodeWithTag("recipient_row").assertIsDisplayed()
         composeTestRule.onNodeWithTag(PAY_NOW_TEST_TAG).assertIsDisplayed()
+    }
+
+    @Test
+    fun `Pay Now carries Role Button semantics while disabled (empty amount)`() {
+        // Review fix (T4.3): Surface + trackedClickable never inferred a
+        // Role on its own, leaving TalkBack announcing a generic clickable
+        // region instead of a button -- diverging from docs/07 §1's own
+        // canonical raw-tree fixture for pay_now_cta ("Role": "Button").
+        // The disabled (empty-amount) branch must carry it too, per the
+        // same fixture, since the node is disabled, not absent.
+        composeTestRule.setContent {
+            PaymentScreen(
+                state = PaymentUiState(), // amountInput = "" -> canSubmit = false
+                events = InMemoryEventTracker(),
+                onAmountChanged = {},
+                onPayNowClicked = {},
+                onDismissDialog = {},
+                onSnackbarShown = {},
+            )
+        }
+
+        composeTestRule.onNodeWithTag(PAY_NOW_TEST_TAG)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+    }
+
+    @Test
+    fun `Pay Now carries Role Button semantics while enabled`() {
+        composeTestRule.setContent {
+            PaymentScreen(
+                state = PaymentUiState(amountInput = "245"), // canSubmit = true
+                events = InMemoryEventTracker(),
+                onAmountChanged = {},
+                onPayNowClicked = {},
+                onDismissDialog = {},
+                onSnackbarShown = {},
+            )
+        }
+
+        composeTestRule.onNodeWithTag(PAY_NOW_TEST_TAG)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
     }
 
     @Test
