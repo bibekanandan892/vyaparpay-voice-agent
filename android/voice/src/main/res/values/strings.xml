@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Strings for the docs/03 §3.3 ongoing call notification. -->
+<resources>
+    <string name="voice_call_channel_name">Support call</string>
+    <string name="voice_call_channel_description">The ongoing status of a live support call with Asha.</string>
+
+    <string name="voice_call_notification_title">Call with Asha</string>
+    <string name="voice_call_status_connecting">Connecting…</string>
+    <string name="voice_call_status_in_call">In call</string>
+    <string name="voice_call_status_reconnecting">Reconnecting…</string>
+
+    <string name="voice_call_action_mute">Mute</string>
+    <string name="voice_call_action_unmute">Unmute</string>
+    <string name="voice_call_action_end">End call</string>
+</resources>

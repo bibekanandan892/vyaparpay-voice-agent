@@ -43,6 +43,15 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
 
+    // VoiceCallService task (docs/03 §3.3): LifecycleService as the doc's own
+    // sketch specifies; core-ktx for NotificationCompat/NotificationChannelCompat/
+    // ServiceCompat.startForeground, the AudioManager-adjacent glue confined to
+    // the audio/ and notification/ packages (docs/03 §3.4's isolation rule,
+    // applied to android.media/android.app.Notification the same way it is
+    // applied to org.webrtc).
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.service)
+
     testImplementation(libs.junit)
     testImplementation(libs.turbine)
     testImplementation(libs.kotlinx.coroutines.test)

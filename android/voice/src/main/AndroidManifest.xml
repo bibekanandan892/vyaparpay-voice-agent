@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  docs/03 §3.3, per :core:network's own manifest comment: "RECORD_AUDIO,
+  FOREGROUND_SERVICE and POST_NOTIFICATIONS arrive in :voice's manifest
+  together with the service that needs them, not ahead of it." VoiceCallService
+  is that service.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Hard requirement (docs/03 §3.6): the call cannot happen without it. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Base grant every foreground service needs since API 28 (normal, no runtime prompt). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!--
+      Android 14 (API 34) companion permission for a "microphone"-typed FGS
+      (docs/03 §3.3): starting a mic-type foreground service without it throws
+      MissingForegroundServiceTypeException on API 34+. Normal permission —
+      granted at install, no runtime prompt.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Soft requirement, API 33+ (docs/03 §3.6): denial degrades to a headless call, never blocks it. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application>
+
+        <service
+            android:name=".service.VoiceCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaPlayback"
+            android:stopWithTask="false" />
+
+    </application>
+
+</manifest>
