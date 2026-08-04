@@ -32,20 +32,30 @@ public data class OrderTrackingUiState(
 )
 
 /**
- * Drives `OrderTrackingScreen` — loads the tracked order once on
- * construction.
+ * Drives `OrderTrackingScreen` — loads every order once on construction, then
+ * tracks whichever one [selectOrder] was called with.
  *
- * `OrderTrackingScreen` carries no nav-arg route today: docs/03 §3.8's route
- * table gives it none, and no `NavType` is declared anywhere in this app yet
- * (`AppNavHost` composes every destination with a bare, argument-free route
- * string). So this screen always tracks the same order this demo's
- * device-orders flow revolves around — the first `IN_TRANSIT` order in
- * [OrdersRepository] (docs/13 §3.4's canonical soundbox) — regardless of
- * which `device_order_row_$index` the user tapped on `OrdersScreen`. Threading
- * a real order id through the nav graph (a `{orderId}` path segment and a
- * matching `NavType`) is a real follow-up once more than one order needs its
- * own tracking view; out of scope for this task's closed file list, which
- * gives `OrderTrackingRoute` an `onBack` callback only.
+ * **Review fix.** The original version had no way to be told which order to
+ * track at all — `AppNavHost` composed `OrderTrackingRoute` with a bare,
+ * argument-free route string, so this always showed the first `IN_TRANSIT`
+ * order regardless of which `device_order_row_$index` the user actually
+ * tapped. A `{orderId}` NavHost path-segment argument was considered and
+ * rejected: `NavigationTracker.ROUTE_TO_FLOW` (`:core:screencontext`, a
+ * separately-owned, already-reviewed-and-merged file) matches
+ * `NavBackStackEntry.destination.route` by exact string against the literal
+ * `"OrderTrackingScreen"` — changing the registered route template to
+ * `"OrderTrackingScreen/{orderId}"` would silently break that lookup
+ * (`ROUTE_TO_FLOW["OrderTrackingScreen/{orderId}"]` doesn't exist), and that
+ * file is out of this task's file-ownership list. Instead, `AppNavHost`
+ * holds the tapped order id as plain Compose state and passes it to
+ * [OrderTrackingRoute] as a parameter (not a nav argument), which calls
+ * [selectOrder] via a `LaunchedEffect` — the route string itself, and
+ * `NavigationTracker`'s matching, are untouched.
+ *
+ * [selectOrder] is safe to call before the initial load resolves: the
+ * requested id is retained and applied once loading finishes if the load
+ * hasn't completed yet, so there is no race between "screen composed" and
+ * "orders loaded" regardless of which happens first.
  */
 public class OrderTrackingViewModel @JvmOverloads constructor(
     private val orders: OrdersRepository = SeededOrdersRepository(),
@@ -55,17 +65,35 @@ public class OrderTrackingViewModel @JvmOverloads constructor(
     private val _state = MutableStateFlow(OrderTrackingUiState())
     public val state: StateFlow<OrderTrackingUiState> = _state.asStateFlow()
 
+    private var loadedOrders: List<DeviceOrder> = emptyList()
+    private var requestedOrderId: String? = null
+
     init {
         viewModelScope.launch {
             when (val result = orders.getOrders(limit = PAGE_LIMIT)) {
-                is ApiResult.Success -> onLoaded(result.data)
+                is ApiResult.Success -> {
+                    loadedOrders = result.data.items
+                    applySelection()
+                }
                 is ApiResult.Failure -> _state.update { it.copy(isLoading = false) }
             }
         }
     }
 
-    private fun onLoaded(page: OrdersPage) {
-        val tracked = page.items.firstOrNull { it.status == DeviceOrderStatus.IN_TRANSIT } ?: page.items.firstOrNull()
+    /**
+     * @param orderId the id of the `device_order_row_$index` (or
+     *   `track_order_cta`'s first-order fallback) the user actually tapped
+     *   on `OrdersScreen` — see [OrderTrackingRoute]'s `LaunchedEffect`.
+     */
+    public fun selectOrder(orderId: String) {
+        requestedOrderId = orderId
+        if (loadedOrders.isNotEmpty()) applySelection()
+    }
+
+    private fun applySelection() {
+        val tracked = loadedOrders.firstOrNull { it.orderId == requestedOrderId }
+            ?: loadedOrders.firstOrNull { it.status == DeviceOrderStatus.IN_TRANSIT }
+            ?: loadedOrders.firstOrNull()
         _state.update {
             it.copy(
                 isLoading = false,
