@@ -2,6 +2,8 @@ plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
 }
 
 android {
@@ -45,11 +47,15 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:screencontext"))
 
-    // PaymentViewModel: StateFlow + viewModelScope, and PaymentRoute's
-    // hiltViewModel()-free viewModel() + collectAsStateWithLifecycle().
+    // Phase-4 T8a: every ViewModel in this module is now @HiltViewModel, and
+    // every Route composable resolves it via hiltViewModel() (androidx-hilt-
+    // navigation-compose) instead of the old DI-free viewModel() factory.
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+    implementation(libs.androidx.hilt.lifecycle.viewmodel.compose)
 
     testImplementation(libs.junit)
 

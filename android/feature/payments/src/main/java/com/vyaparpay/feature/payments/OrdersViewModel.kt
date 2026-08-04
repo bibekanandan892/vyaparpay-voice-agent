@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.network.ApiResult
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -16,14 +18,21 @@ import kotlinx.coroutines.launch
  * identical reason (there is no user-triggered reload path, matching the
  * read-only `GET /v1/orders` this stands in for, docs/13 §3.4).
  *
- * Not a `@HiltViewModel` — see [PaymentViewModel]'s kdoc for why: no Hilt
- * module anywhere in the app provides [OrdersRepository] or [EventTracker]
- * yet.
+ * **Now `@HiltViewModel` (Phase-4 T8a)** — see [PaymentViewModel]'s kdoc for
+ * why: [OrdersRepository] still has no Hilt module (unchanged, out of
+ * scope), but [EventTracker] does now — and for why the `@Inject`
+ * constructor's delegation below spells out [SeededOrdersRepository]
+ * explicitly rather than writing `this(events = events)` (a genuine
+ * self-delegation ambiguity Kotlin rejects at compile time otherwise).
  */
+@HiltViewModel
 public class OrdersViewModel @JvmOverloads constructor(
     private val orders: OrdersRepository = SeededOrdersRepository(),
     public val events: EventTracker = InMemoryEventTracker(),
 ) : ViewModel() {
+
+    @Inject
+    public constructor(events: EventTracker) : this(orders = SeededOrdersRepository(), events = events)
 
     private val _state = MutableStateFlow(OrdersUiState())
     public val state: StateFlow<OrdersUiState> = _state.asStateFlow()

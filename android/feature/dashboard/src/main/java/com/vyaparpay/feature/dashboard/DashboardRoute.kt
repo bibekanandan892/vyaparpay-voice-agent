@@ -3,8 +3,8 @@ package com.vyaparpay.feature.dashboard
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 
 /**
  * Entry point `:app` navigates to. The seeded dashboard content lives in
@@ -16,7 +16,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 @Composable
 public fun DashboardRoute(
     modifier: Modifier = Modifier,
-    viewModel: DashboardViewModel = viewModel(),
+    viewModel: DashboardViewModel = hiltViewModel(),
     onPayVendor: () -> Unit = {},
     onViewSettlements: () -> Unit = {},
     onViewOrders: () -> Unit = {},

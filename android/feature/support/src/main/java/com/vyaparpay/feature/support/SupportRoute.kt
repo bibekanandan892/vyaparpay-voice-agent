@@ -3,8 +3,8 @@ package com.vyaparpay.feature.support
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 
 /**
  * Entry point `:app` navigates to. `HelpScreen`'s FAQ hub and complaint
@@ -18,7 +18,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 @Composable
 public fun SupportRoute(
     modifier: Modifier = Modifier,
-    viewModel: HelpViewModel = viewModel(),
+    viewModel: HelpViewModel = hiltViewModel(),
     onCallSupport: () -> Unit = {},
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()

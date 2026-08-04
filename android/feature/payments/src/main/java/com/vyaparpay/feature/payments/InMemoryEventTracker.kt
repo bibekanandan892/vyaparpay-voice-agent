@@ -4,19 +4,23 @@ import com.vyaparpay.core.analytics.AppEvent
 import com.vyaparpay.core.analytics.EventTracker
 
 /**
- * A correct, minimal [EventTracker] used as [PaymentViewModel]'s default.
+ * A correct, minimal [EventTracker], originally added as [PaymentViewModel]'s
+ * (and this module's other ViewModels') constructor default before a shared
+ * `@Singleton` `EventTracker` existed anywhere in the app.
  *
- * `:core:analytics` ships [EventTracker] as an interface only — its
- * `@Singleton` ring-buffer implementation and Hilt binding are explicitly
- * scoped to land with the context pipeline (see the KDoc on
- * [EventTracker]), and `:app`'s Hilt graph does not provide one yet. Rather
- * than block this screen on that future work, or fabricate a shared
- * `@Singleton` here (which would collide with that work when it lands), this
- * is a screen-local implementation of the full documented contract —
- * fixed-capacity ring buffer, synchronized, defensive copies — so it behaves
- * identically to whatever the eventual shared instance does. Swapping it for
- * the real app-scoped singleton later is a one-line constructor-argument
- * change, not a rewrite.
+ * **Reconciled (Phase-4 T8a).** That gap is closed now: `:core:analytics`'s
+ * `AnalyticsModule` binds the real `RingBufferEventTracker` singleton, and
+ * every `@HiltViewModel` in this module (`PaymentViewModel`,
+ * `SettlementsViewModel`, `OrdersViewModel`, `OrderTrackingViewModel`) now
+ * has an `@Inject` constructor that resolves it from Hilt — production code
+ * (every `XxxRoute` composable, via `hiltViewModel()`) never touches this
+ * class anymore. It remains as those same ViewModels' constructor DEFAULT
+ * (only reachable via direct, non-DI construction) and as an explicit fake in
+ * this module's own tests (`UiTreeCollectorPaymentScreenCanaryTest`,
+ * `SettlementsScreenContextCanaryTest`, and others construct it directly) —
+ * both legitimate, `:core:analytics`-independent uses for a small,
+ * self-contained fake, matching the ring-buffer contract exactly rather than
+ * differing from it.
  */
 public class InMemoryEventTracker : EventTracker {
 

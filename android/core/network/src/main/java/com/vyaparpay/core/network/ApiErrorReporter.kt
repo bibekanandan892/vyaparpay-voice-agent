@@ -17,11 +17,34 @@ import javax.inject.Inject
  * must tolerate that.
  *
  * @param clock defaults to the wall clock; overridable so tests can pin `ts`.
+ *
+ * **Bug found and fixed while wiring Phase-4 T8a's Hilt graph end to end.**
+ * `@Inject` was on the two-arg constructor below with [clock] defaulted —
+ * Dagger/Hilt ignores Kotlin default parameter values entirely (the same
+ * limitation `UiTreeCollector`'s and every `@HiltViewModel`'s own `@Inject`
+ * constructor kdoc documents in `:core:screencontext`/`:feature:*`), so
+ * `:app:assembleDebug`'s Hilt aggregation step (`VyaparApp_HiltComponents`)
+ * demanded a binding for the unqualified `kotlin.jvm.functions.Function0
+ * <Long>` type `() -> Long` erases to — a binding nothing in this graph
+ * provides or should. This was latent, not something this task's own
+ * changes introduced: `:core:network` already applied the Hilt plugin, and
+ * `NetworkModule.provideOkHttpClient` already declared
+ * `ApiErrorReportingInterceptor` as a parameter, so this was broken the
+ * moment `ApiErrorReportingInterceptor`/[ApiErrorReporter] first got their
+ * `@Inject` constructors (Phase-4 T2) — it simply had never been caught by
+ * a completed `:app:assembleDebug` run before now. Fixed the same way every
+ * other instance of this pattern is fixed in this codebase: [clock] moved
+ * off the `@Inject`-annotated constructor entirely, onto a narrower one
+ * below that Dagger can actually satisfy.
  */
-public class ApiErrorReporter @Inject constructor(
+public class ApiErrorReporter(
     private val events: EventTracker,
-    private val clock: () -> Long = System::currentTimeMillis,
+    private val clock: () -> Long,
 ) {
+
+    /** Delegates to [System.currentTimeMillis] -- see this class's own kdoc for why this, not the primary constructor, carries `@Inject`. */
+    @Inject
+    public constructor(events: EventTracker) : this(events, System::currentTimeMillis)
 
     /**
      * Records one failed call.

@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.network.ApiResult
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,15 +23,23 @@ private val MONTH_ABBREVIATIONS = arrayOf(
  * §3.3) and derives the header balance/status/alert fields from whatever the
  * repository returns.
  *
- * Not a `@HiltViewModel`, for the identical reason [PaymentViewModel] gives in
- * its own kdoc: no Hilt module anywhere in the app provides
- * [SettlementsRepository] or [EventTracker] yet. Constructor defaults keep
- * this class usable with zero DI wiring today.
+ * **Now `@HiltViewModel` (Phase-4 T8a)**, for the identical reason
+ * [PaymentViewModel] gives in its own kdoc: [SettlementsRepository] still has
+ * no Hilt module (repository seeding is unchanged, out of scope), but
+ * [EventTracker] does now. See [PaymentViewModel]'s `@Inject` constructor
+ * kdoc for why that constructor takes only [events], not [settlements] — and
+ * for why its delegation below spells out [SeededSettlementsRepository]
+ * explicitly rather than writing `this(events = events)` (a genuine
+ * self-delegation ambiguity Kotlin rejects at compile time otherwise).
  */
+@HiltViewModel
 public class SettlementsViewModel @JvmOverloads constructor(
     private val settlements: SettlementsRepository = SeededSettlementsRepository(),
     public val events: EventTracker = InMemoryEventTracker(),
 ) : ViewModel() {
+
+    @Inject
+    public constructor(events: EventTracker) : this(settlements = SeededSettlementsRepository(), events = events)
 
     private val _state = MutableStateFlow(SettlementsUiState())
     public val state: StateFlow<SettlementsUiState> = _state.asStateFlow()

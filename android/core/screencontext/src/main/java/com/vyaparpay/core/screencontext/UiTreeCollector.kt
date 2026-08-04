@@ -13,6 +13,7 @@ import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.state.ToggleableState
+import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -88,13 +89,52 @@ import kotlinx.coroutines.launch
  * "given a root, walk it," matching `NavigationTracker.bind`'s own
  * discovery-is-the-caller's-job precedent.
  *
+ * **Resolved (Phase-4 T8a): the caller is `MainActivity`.** It walks
+ * `window.decorView`'s `ViewGroup` tree for a `RootForTest` instance -- the
+ * exact `findRootForTest` technique `UiTreeCollectorPaymentScreenCanaryTest`/
+ * `SettlementsScreenContextCanaryTest` (`:feature:payments`) already use
+ * against a test-only Compose tree, now applied to the app's real one --
+ * posted via `window.decorView.post { }` so the walk happens after
+ * `setContent {}`'s Compose tree has actually been created (verified
+ * empirically against a Robolectric-rendered `MainActivity`, not assumed --
+ * see `MainActivityScreenContextTest` in `:app`). See `MainActivity`'s own
+ * kdoc for the full lifecycle wiring (`start`/`stop` against
+ * `onCreate`/`onDestroy`).
+ *
  * @param scope UI-thread-confined; see the threading contract above.
- * @param debounceMillis docs/07 §2.1's 300 ms trailing-edge debounce, overridable for tests.
+ * @param debounceMillis docs/07 §2.1's 300 ms trailing-edge debounce, no longer defaulted -- see the [@Inject] secondary constructor's own kdoc for why.
  */
 public class UiTreeCollector(
     private val scope: CoroutineScope,
-    private val debounceMillis: Long = DEBOUNCE_MILLIS,
+    private val debounceMillis: Long,
 ) {
+
+    /**
+     * **Judgment call (Phase-4 T8a) -- why `@Inject` lands on a SECOND
+     * constructor, not the primary one above.** Dagger/Hilt does not honor
+     * Kotlin default parameter values on an `@Inject`-annotated constructor --
+     * every declared parameter becomes a required binding regardless of any
+     * default (a well-documented Dagger limitation, not an oversight here).
+     * Annotating the primary constructor directly would therefore force
+     * `ScreenContextModule` (`:core:screencontext`'s `di` package) or some
+     * other module to provide an unqualified `Long` -- a binding with no
+     * meaningful owner that would silently collide with any other
+     * unqualified `Long` the graph ever grows.
+     *
+     * The primary constructor above therefore lost `debounceMillis`'s
+     * default (the one behavior-preserving-but-source-breaking change this
+     * task makes to this file), and this `@Inject` constructor -- taking only
+     * [scope], the one dependency `ScreenContextModule` can meaningfully
+     * provide -- supplies docs/07 §2.1's 300 ms constant directly,
+     * reproducing the old default exactly. `UiTreeCollectorPaymentScreenCanaryTest`'s
+     * and `SettlementsScreenContextCanaryTest`'s existing
+     * `UiTreeCollector(scope = CoroutineScope(Dispatchers.Unconfined))` call
+     * sites now resolve to *this* constructor (single named `scope` argument)
+     * instead of the two-arg primary -- same runtime behavior, zero test
+     * changes needed (confirmed by running both canaries unmodified).
+     */
+    @Inject
+    public constructor(scope: CoroutineScope) : this(scope, DEBOUNCE_MILLIS)
 
     private val attachedRoots = mutableListOf<RootForTest>()
     private var observerHandle: ObserverHandle? = null

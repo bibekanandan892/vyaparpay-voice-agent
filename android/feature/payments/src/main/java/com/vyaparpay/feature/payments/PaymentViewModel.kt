@@ -6,6 +6,8 @@ import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.network.ApiError
 import com.vyaparpay.core.network.ApiErrorReporter
 import com.vyaparpay.core.network.ApiResult
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -27,18 +29,52 @@ private const val PAISE_PER_RUPEE = 100L
  * endpoint is a constructor-argument change — the state machine below does
  * not change shape.
  *
- * Not a `@HiltViewModel`: `:feature:payments` carries no Hilt dependency yet,
- * and the only bindings this class would need — [PaymentRepository] and
- * [EventTracker] — have no Hilt module anywhere in the app to provide them
- * (`:app`'s graph binds no `VyaparApi`, and `:core:analytics`'s `EventTracker`
- * singleton is explicitly future work). Constructor defaults keep this class
- * usable with zero DI wiring today; adding `@HiltViewModel` + `@Inject` once
- * real bindings exist is additive, not a rewrite.
+ * **Now `@HiltViewModel` (Phase-4 T8a).** [PaymentRepository] still has no
+ * Hilt module anywhere in the app (`:app`'s graph binds no `VyaparApi` yet) —
+ * repository seeding is unchanged and explicitly out of this task's scope —
+ * but [EventTracker] does now (`AnalyticsModule` binds the real, shared
+ * `RingBufferEventTracker`, `:core:analytics`). [events] is the one
+ * constructor parameter this task wires to real DI; see the `@Inject`
+ * secondary constructor below for why [payments] is deliberately NOT part of
+ * it.
  */
+@HiltViewModel
 public class PaymentViewModel @JvmOverloads constructor(
     private val payments: PaymentRepository = SeededPaymentRepository(),
     public val events: EventTracker = InMemoryEventTracker(),
 ) : ViewModel() {
+
+    /**
+     * **Judgment call — a narrower `@Inject` constructor, not the primary
+     * one above.** Dagger/Hilt ignores Kotlin default parameter values on an
+     * `@Inject`-annotated constructor: annotating the primary constructor
+     * directly would force Hilt to also resolve [PaymentRepository], which
+     * has no Hilt binding anywhere in this app (see this class's own kdoc) —
+     * that would break the build, not just leave [payments] un-DI'd. This
+     * constructor takes only [events] — the one dependency a real Hilt
+     * module ([com.vyaparpay.core.analytics.di.AnalyticsModule]) can
+     * provide. `PaymentRoute`'s `hiltViewModel()` call resolves to *this*
+     * constructor; every existing test that constructs
+     * `PaymentViewModel(payments = ...)` directly still resolves to the
+     * primary constructor unambiguously (different parameter name/type), so
+     * none of them needed to change.
+     *
+     * The delegation below spells out `SeededPaymentRepository()` again
+     * rather than writing `this(events = events)`: the primary constructor
+     * is ALSO callable with just `events` named ([payments] defaulted),
+     * which makes `this(events = events)` genuinely ambiguous between "the
+     * primary, `payments` defaulted" and "this same constructor,
+     * recursively" — Kotlin resolves that ambiguity as self-delegation, a
+     * compile error ("cycle in the delegation calls chain"), reproduced and
+     * confirmed while building this task. Supplying [payments] explicitly
+     * makes the call unambiguously 2-argument, matching only the primary.
+     * [PaymentRepository] wiring is still genuinely unchanged (same seeded
+     * fixture, same default expression) — just written twice, because
+     * Dagger/Hilt cannot call a constructor "with some arguments defaulted"
+     * the way an ordinary Kotlin call site can.
+     */
+    @Inject
+    public constructor(events: EventTracker) : this(payments = SeededPaymentRepository(), events = events)
 
     private val errorReporter = ApiErrorReporter(events)
 

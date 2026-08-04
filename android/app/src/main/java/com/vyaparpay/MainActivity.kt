@@ -1,14 +1,22 @@
 package com.vyaparpay
 
 import android.os.Bundle
+import android.view.View
+import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.node.RootForTest
+import androidx.navigation.compose.rememberNavController
+import com.vyaparpay.core.screencontext.NavigationTracker
+import com.vyaparpay.core.screencontext.UiTreeCollector
 import com.vyaparpay.core.ui.theme.VyaparTheme
 import com.vyaparpay.navigation.AppNavHost
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
 /**
  * The app's single activity. Everything below it is Compose.
@@ -16,18 +24,139 @@ import dagger.hilt.android.AndroidEntryPoint
  * One activity is what makes the context pipeline tractable: `UiTreeCollector`
  * tracks window attach/detach against one host rather than reconciling a stack
  * of activities, and `NavigationTracker` binds once to one `NavController`.
+ *
+ * **Phase-4 T8a — the production wiring judgment call.** Every piece below
+ * ([UiTreeCollector], [NavigationTracker], the `EventTracker`/`CoroutineScope`
+ * Hilt bindings) already existed, unit-tested, but nothing in the running app
+ * called any of it. This class is where that happens:
+ *
+ * 1. **Field injection, not constructor injection.** `ComponentActivity`'s
+ *    constructor is framework-owned; `@AndroidEntryPoint` classes inject via
+ *    `lateinit var` fields populated in `Hilt_MainActivity`'s generated
+ *    `onCreate` (which runs before this class's own `super.onCreate(...)`
+ *    call returns) — the only injection shape available here, and the same
+ *    one every other `@AndroidEntryPoint` Activity in the Android ecosystem
+ *    uses. `internal`, not `private`: [MainActivityScreenContextTest] reads
+ *    both fields directly to assert on the real, injected instances rather
+ *    than re-deriving equivalent ones.
+ *
+ * 2. **`uiTreeCollector.start()` before `setContent { }`, not after.**
+ *    [UiTreeCollector.start] only needs to run once, on the UI thread, before
+ *    the first capture matters — calling it before Compose's first commit
+ *    guarantees the debounced-capture observer is already registered by the
+ *    time there is anything to observe, rather than racing the first frame.
+ *
+ * 3. **The `NavHostController` is hoisted here, not left inside
+ *    `AppNavHost`'s own default.** [NavigationTracker.bind] needs a live
+ *    reference to bind against; `AppNavHost`'s `navController` parameter
+ *    already defaulted to `rememberNavController()` for exactly this kind of
+ *    override (docs/03's own `state`-down/`events`-up convention applied one
+ *    level up: `:app` owns navigation identity, `AppNavHost` just renders
+ *    against whichever controller it's given). `rememberNavController()` is
+ *    called directly inside this `setContent { }` block — composed exactly
+ *    once for the activity's lifetime — and passed down explicitly.
+ *
+ * 4. **`navigationTracker.bind(navController)` runs inside a
+ *    `LaunchedEffect(Unit)`, not directly in the composable body.**
+ *    [NavigationTracker.bind] is not idempotent (it unconditionally calls
+ *    `NavController.addOnDestinationChangedListener`, which stacks a new
+ *    listener — and a duplicate `nav` timeline event per destination change —
+ *    on every call); calling it directly in a `@Composable` body would
+ *    re-bind on every recomposition. `LaunchedEffect(Unit)` keyed to the
+ *    composition's own lifetime is the standard Compose idiom for exactly
+ *    this "run once, not on every recomposition" shape, even though `bind`
+ *    itself is not a suspend function.
+ *
+ * 5. **The `RootForTest` decorView walk is posted, not run inline in
+ *    `onCreate`.** `setContent { }` schedules composition; it does not
+ *    render synchronously before `onCreate` returns, so a `RootForTest`
+ *    walk of `window.decorView` run immediately after `setContent { }` would
+ *    find nothing yet — verified empirically against a Robolectric-rendered
+ *    `MainActivity` in [MainActivityScreenContextTest], not assumed. Posting
+ *    via `window.decorView.post { }` defers the walk until after the view
+ *    hierarchy Compose builds has actually attached, matching the exact
+ *    `findRootForTest` technique `UiTreeCollectorPaymentScreenCanaryTest`/
+ *    `SettlementsScreenContextCanaryTest` (`:feature:payments`) already
+ *    establish against a test-only Compose tree — see [UiTreeCollector]'s own
+ *    kdoc ("Multi-window tracking") for why that technique, not
+ *    `ViewRootForTest.Companion.onViewCreatedCallback`, is the correct one.
+ *
+ * 6. **Lifecycle: `start`/`attachRoot` in `onCreate`, `stop` in `onDestroy`.**
+ *    This is a single-activity app, so `onDestroy` only fires on a real
+ *    process-level teardown or a configuration change recreating the
+ *    activity — either way, a fresh `MainActivity` instance (and, via Hilt,
+ *    a freshly injected `uiTreeCollector`/`navigationTracker` pair scoped to
+ *    the same app-lifetime singletons) runs `onCreate` again, so there is no
+ *    observer leaked across recreation: the old instance's `stop()` tears
+ *    down its `Snapshot.registerApplyObserver` registration before the new
+ *    one's `start()` registers a fresh one. There is deliberately no
+ *    `detachRoot` call here — `UiTreeCollector`'s own kdoc reserves
+ *    `detachRoot` for a window detaching *while the activity is still alive*
+ *    (e.g. a dialog dismissing, tracked at the dialog's own attach point,
+ *    which this task does not add); the main window detaching because the
+ *    activity itself is being destroyed needs no symmetric call — the whole
+ *    collector instance is discarded with it.
  */
 @AndroidEntryPoint
 public class MainActivity : ComponentActivity() {
 
+    @Inject
+    internal lateinit var uiTreeCollector: UiTreeCollector
+
+    @Inject
+    internal lateinit var navigationTracker: NavigationTracker
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        uiTreeCollector.start()
+
         setContent {
+            val navController = rememberNavController()
+            LaunchedEffect(Unit) {
+                navigationTracker.bind(navController)
+            }
             VyaparTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppNavHost()
+                    AppNavHost(navController = navController)
                 }
             }
         }
+
+        window.decorView.post { attachComposeRoot() }
     }
+
+    override fun onDestroy() {
+        uiTreeCollector.stop()
+        super.onDestroy()
+    }
+
+    private fun attachComposeRoot() {
+        findRootForTest(window.decorView)?.let(uiTreeCollector::attachRoot)
+    }
+}
+
+/**
+ * The same decorView-walk `UiTreeCollectorPaymentScreenCanaryTest`/
+ * `SettlementsScreenContextCanaryTest` (`:feature:payments`) each define as a
+ * private test helper — see [UiTreeCollector]'s own kdoc for why this,
+ * rather than `ViewRootForTest.Companion.onViewCreatedCallback`, is the
+ * correct discovery technique in production too. `internal`, not `private`,
+ * so a test in this module could reach it directly if a narrower,
+ * Hilt-free companion to [MainActivityScreenContextTest] is ever worth
+ * adding again — an earlier version of that test tried exactly that against
+ * a bare `ComponentActivity`, but `:app`'s real, restrictive
+ * `AndroidManifest.xml` (only `.MainActivity` is declared) makes a bare
+ * `ComponentActivity` unresolvable to Robolectric's `ActivityScenario`
+ * inside this module, confirmed empirically; [MainActivityScreenContextTest]
+ * proves this function's real call site end to end instead, with higher
+ * fidelity than that narrower test would have.
+ */
+internal fun findRootForTest(view: View): RootForTest? {
+    if (view is RootForTest) return view
+    if (view is ViewGroup) {
+        for (i in 0 until view.childCount) {
+            findRootForTest(view.getChildAt(i))?.let { return it }
+        }
+    }
+    return null
 }
