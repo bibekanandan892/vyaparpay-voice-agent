@@ -43,6 +43,7 @@ flowchart TB
 
     CSC --> CANA
     CSC --> CNET
+    CSC --> CUI
     CUI --> CANA
     CNET --> CANA
 ```
@@ -59,7 +60,7 @@ flowchart TB
 | `:feature:support` | The support entry point and in-call UI | `SupportButton`, `ConversationOverlay`, `CallViewModel` |
 | `:voice` | The call itself — service, transport, signaling, state, focus | `VoiceCallService`, `WebRtcClient`, `SignalingClient`, `CallStateMachine`, the `ContextChannel` adapter |
 
-Two edges are worth defending. `:core:screencontext → :core:analytics` and `:core:screencontext → :core:network` exist because `SemanticSnapshotBuilder` reads the `EventTracker` ring buffer (for `last_action`) and the network interceptor's last non-2xx (`last_api`) — both facts no view-tree walk can produce ([docs/07 §5](07-ui-semantic-context.md) rule 7). `:voice → :core:screencontext` (not the reverse) is what keeps WebRTC out of the capture path: `ScreenContextPublisher` speaks to a `ContextChannel` *interface* declared in `:core:screencontext`, and `:voice` provides the data-channel-backed implementation. The diff/debounce logic stays framework-free and unit-testable; only the byte-shipping adapter imports `org.webrtc` — the same boundary discipline the backend applies to `VoiceAgentWorker` ([docs/05 §1.1](05-agent-architecture.md)).
+Three edges are worth defending. `:core:screencontext → :core:analytics` and `:core:screencontext → :core:network` exist because `SemanticSnapshotBuilder` reads the `EventTracker` ring buffer (for `last_action`) and the network interceptor's last non-2xx (`last_api`) — both facts no view-tree walk can produce ([docs/07 §5](07-ui-semantic-context.md) rule 7). `:core:screencontext → :core:ui` exists because `RoleMapper` (rule 3 tier (a)) resolves testTags through `TestTagRoles.roleFor`, the exact same function `:core:ui`'s own lint check and every screen already use — not a parallel, divergent mapping (`:core:screencontext`'s own `build.gradle.kts` carries the identical rationale inline). `:voice → :core:screencontext` (not the reverse) is what keeps WebRTC out of the capture path: `ScreenContextPublisher` speaks to a `ContextChannel` *interface* declared in `:core:screencontext`, and `:voice` provides the data-channel-backed implementation. The diff/debounce logic stays framework-free and unit-testable; only the byte-shipping adapter imports `org.webrtc` — the same boundary discipline the backend applies to `VoiceAgentWorker` ([docs/05 §1.1](05-agent-architecture.md)).
 
 ---
 
