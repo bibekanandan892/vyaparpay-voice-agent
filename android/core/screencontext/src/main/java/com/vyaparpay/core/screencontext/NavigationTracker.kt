@@ -14,12 +14,13 @@ import kotlinx.coroutines.flow.asStateFlow
  * name for the `screen_context/v1` IR, and emits `nav` events into the
  * timeline (docs/03 §3.8).
  *
- * **DI note.** [Inject] and [Singleton] are present so this class is
- * Hilt-ready, but `:core:screencontext` does not yet apply the Hilt Gradle
- * plugin, and [bind] is not called from `:app`/`MainActivity` — see this
- * task's report for why that wiring is deliberately left for a later
- * integration task (it would touch `:app`'s Hilt graph, which is out of this
- * task's scope).
+ * **DI note (updated Phase-4 T8a).** [Inject] and [Singleton] were originally
+ * added so this class would be Hilt-ready once `:core:screencontext` applied
+ * the Hilt Gradle plugin and `:app`/`MainActivity` called [bind] — both now
+ * true. `:core:screencontext`'s `build.gradle.kts` applies `hilt`/`ksp`
+ * (see that file's own comment), and `MainActivity.onCreate` binds the real
+ * `NavHostController` it hoists out of `AppNavHost` — see `MainActivity`'s
+ * own kdoc for the full lifecycle wiring.
  *
  * On each destination change: (a) update [route]/[flow], (b) fire a `nav`
  * event with `from` = previous route into [EventTracker]. The doc's third
@@ -28,12 +29,27 @@ import kotlinx.coroutines.flow.asStateFlow
  * `SemanticSnapshotBuilder`'s `ScreenContextIr`, which does not exist yet.
  *
  * @param clock defaults to the wall clock; overridable so tests can pin `ts`.
+ *
+ * **Second bug found and fixed alongside `ApiErrorReporter`'s identical one
+ * while completing this task's Hilt wiring.** `@Inject` sat on this
+ * constructor with [clock] defaulted; Dagger/Hilt ignores Kotlin default
+ * parameter values, so `:app:assembleDebug`'s Hilt aggregation demanded an
+ * unqualified `kotlin.jvm.functions.Function0<Long>` binding nothing
+ * provides — the exact same latent defect `ApiErrorReporter.kt`'s own kdoc
+ * now documents, present here since this class's `@Inject`/`@Singleton`
+ * were first added and equally never caught by a completed
+ * `:app:assembleDebug` run before this task. Fixed the same way: [clock]
+ * moved off the `@Inject`-annotated constructor, onto a narrower one below.
  */
 @Singleton
-public class NavigationTracker @Inject constructor(
+public class NavigationTracker(
     private val events: EventTracker,
-    private val clock: () -> Long = System::currentTimeMillis,
+    private val clock: () -> Long,
 ) {
+
+    /** Delegates to [System.currentTimeMillis] -- see this class's own kdoc for why this, not the primary constructor, carries `@Inject`. */
+    @Inject
+    public constructor(events: EventTracker) : this(events, System::currentTimeMillis)
 
     private val _route = MutableStateFlow(UNKNOWN_ROUTE)
 

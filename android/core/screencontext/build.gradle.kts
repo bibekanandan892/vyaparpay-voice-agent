@@ -1,6 +1,8 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
 }
 
 android {
@@ -39,6 +41,13 @@ dependencies {
     // NavigationTracker.route/.flow are StateFlow (docs/03 §3.8); UiTreeCollector's debounce.
     implementation(libs.kotlinx.coroutines.core)
 
+    // ScreenContextModule's app-scoped CoroutineScope is Dispatchers.Main-backed
+    // (see that file's own kdoc for why); the `core` artifact only ships the
+    // Dispatchers.Main *declaration* -- this is the artifact that supplies a
+    // working Android Main-thread dispatcher at runtime instead of throwing
+    // "Module with the Main dispatcher is missing".
+    implementation(libs.kotlinx.coroutines.android)
+
     // NavController itself — the base artifact, not -compose: this module has
     // no Compose UI of its own, only a listener bound to a NavController that
     // :app constructs.
@@ -57,9 +66,15 @@ dependencies {
     // kotlin.serialization compiler plugin is needed, only the runtime types.
     implementation(libs.kotlinx.serialization.json)
 
-    // @Inject/@Singleton on NavigationTracker, without the full Hilt plugin —
-    // see NavigationTracker's kdoc for why the deeper Hilt wiring is deferred.
-    implementation(libs.javax.inject)
+    // Phase-4 T8a: the full Hilt Gradle plugin (above) now processes this
+    // module's @Inject constructors (NavigationTracker, AppStateManager,
+    // ScreenContextPublisher, UiTreeCollector) and ScreenContextModule's
+    // @Provides -- the plain javax.inject-only setup NavigationTracker's own
+    // kdoc originally described is superseded by this; hilt-android already
+    // re-exports javax.inject transitively, so the standalone dependency this
+    // module carried for it is gone rather than duplicated.
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

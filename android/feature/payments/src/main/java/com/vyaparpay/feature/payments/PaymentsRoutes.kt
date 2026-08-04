@@ -4,8 +4,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 
 /**
  * Entry points `:app` navigates to. `PaymentRoute` is the vendor-payment flow
@@ -19,7 +19,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 @Composable
 public fun PaymentRoute(
     modifier: Modifier = Modifier,
-    viewModel: PaymentViewModel = viewModel(),
+    viewModel: PaymentViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     PaymentScreen(
@@ -36,7 +36,7 @@ public fun PaymentRoute(
 @Composable
 public fun SettlementsRoute(
     modifier: Modifier = Modifier,
-    viewModel: SettlementsViewModel = viewModel(),
+    viewModel: SettlementsViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     SettlementsScreen(
@@ -60,7 +60,7 @@ public fun SettlementsRoute(
 public fun OrdersRoute(
     onOrderSelected: (String) -> Unit,
     modifier: Modifier = Modifier,
-    viewModel: OrdersViewModel = viewModel(),
+    viewModel: OrdersViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     OrdersScreen(
@@ -89,7 +89,7 @@ public fun OrderTrackingRoute(
     orderId: String?,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
-    viewModel: OrderTrackingViewModel = viewModel(),
+    viewModel: OrderTrackingViewModel = hiltViewModel(),
 ) {
     LaunchedEffect(orderId) {
         if (orderId != null) viewModel.selectOrder(orderId)

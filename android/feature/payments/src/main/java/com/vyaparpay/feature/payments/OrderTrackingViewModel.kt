@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.network.ApiResult
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -56,11 +58,22 @@ public data class OrderTrackingUiState(
  * requested id is retained and applied once loading finishes if the load
  * hasn't completed yet, so there is no race between "screen composed" and
  * "orders loaded" regardless of which happens first.
+ *
+ * **Now `@HiltViewModel` (Phase-4 T8a)** — see [PaymentViewModel]'s kdoc for
+ * why: [OrdersRepository] still has no Hilt module (unchanged, out of
+ * scope), but [EventTracker] does now — and for why the `@Inject`
+ * constructor's delegation below spells out [SeededOrdersRepository]
+ * explicitly rather than writing `this(events = events)` (a genuine
+ * self-delegation ambiguity Kotlin rejects at compile time otherwise).
  */
+@HiltViewModel
 public class OrderTrackingViewModel @JvmOverloads constructor(
     private val orders: OrdersRepository = SeededOrdersRepository(),
     public val events: EventTracker = InMemoryEventTracker(),
 ) : ViewModel() {
+
+    @Inject
+    public constructor(events: EventTracker) : this(orders = SeededOrdersRepository(), events = events)
 
     private val _state = MutableStateFlow(OrderTrackingUiState())
     public val state: StateFlow<OrderTrackingUiState> = _state.asStateFlow()
