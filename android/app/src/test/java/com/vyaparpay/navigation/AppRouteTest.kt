@@ -7,8 +7,8 @@ import org.junit.Test
 class AppRouteTest {
 
     @Test
-    fun `the five demo screens of docs 03 section 4 are all reachable`() {
-        assertEquals(5, AppRoute.entries.size)
+    fun `the six demo screens (docs 03 section 4 plus OrderTrackingScreen, Phase-4 T5b) are all reachable`() {
+        assertEquals(6, AppRoute.entries.size)
     }
 
     @Test
@@ -22,12 +22,32 @@ class AppRouteTest {
         assertEquals(listOf(AppRoute.SUPPORT), AppRoute.entries.filterNot { it.isCaptured })
     }
 
+    // Rewrite (Phase-4 T5b, part B). The old version of this test required
+    // every captured destination's flow to be distinct -- not actually true
+    // to docs/03 §3.8's own design: `flow` is a nav-graph GROUP, not a
+    // per-screen key, and that section's route table already lists
+    // OrdersScreen and OrderTrackingScreen on one shared `device_orders` row.
+    // `route` (checked above) is what disambiguates individual screens in the
+    // wire IR, not `flow`. The real invariant this test should guard is
+    // narrower: ONLY device_orders is allowed to group more than one captured
+    // destination -- a different flow silently gaining a second screen is
+    // still very likely a bug and should keep failing this test.
     @Test
-    fun `every captured destination has a distinct flow name`() {
-        // The agent distinguishes screens by `flow`; two captured screens sharing
-        // one would make the context ambiguous in exactly the moment it matters.
-        val flows = AppRoute.captured.map { it.flow }
-        assertEquals(flows.size, flows.toSet().size)
+    fun `only the device_orders flow groups more than one captured destination, per docs 03 section 3_8`() {
+        val byFlow = AppRoute.captured.groupBy(AppRoute::flow)
+
+        val flowsWithMultipleDestinations = byFlow.filterValues { it.size > 1 }
+
+        assertEquals(setOf("device_orders"), flowsWithMultipleDestinations.keys)
+        assertEquals(
+            setOf(AppRoute.ORDERS, AppRoute.ORDER_TRACKING),
+            flowsWithMultipleDestinations.getValue("device_orders").toSet(),
+        )
+    }
+
+    @Test
+    fun `order tracking shares the device_orders flow with orders, by design`() {
+        assertEquals(AppRoute.ORDERS.flow, AppRoute.ORDER_TRACKING.flow)
     }
 
     @Test

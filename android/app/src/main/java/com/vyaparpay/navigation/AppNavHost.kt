@@ -1,12 +1,17 @@
 package com.vyaparpay.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.vyaparpay.feature.dashboard.DashboardRoute
+import com.vyaparpay.feature.payments.OrderTrackingRoute
 import com.vyaparpay.feature.payments.OrdersRoute
 import com.vyaparpay.feature.payments.PaymentRoute
 import com.vyaparpay.feature.payments.SettlementsRoute
@@ -25,6 +30,14 @@ public fun AppNavHost(
     modifier: Modifier = Modifier,
     navController: NavHostController = rememberNavController(),
 ) {
+    // Review fix: which order OrdersScreen's tap (row or Track Order CTA)
+    // reported, threaded to OrderTrackingRoute as plain Compose state rather
+    // than a NavHost path argument -- see OrderTrackingRoute's own kdoc for
+    // why (a {orderId} route template would silently break
+    // NavigationTracker.ROUTE_TO_FLOW's exact-string match on
+    // "OrderTrackingScreen", and that file is out of this task's ownership).
+    var selectedOrderId by remember { mutableStateOf<String?>(null) }
+
     NavHost(
         navController = navController,
         startDestination = AppRoute.START.route,
@@ -33,7 +46,20 @@ public fun AppNavHost(
         composable(AppRoute.DASHBOARD.route) { DashboardRoute() }
         composable(AppRoute.PAYMENT.route) { PaymentRoute() }
         composable(AppRoute.SETTLEMENTS.route) { SettlementsRoute() }
-        composable(AppRoute.ORDERS.route) { OrdersRoute() }
+        composable(AppRoute.ORDERS.route) {
+            OrdersRoute(
+                onOrderSelected = { orderId ->
+                    selectedOrderId = orderId
+                    navController.navigate(AppRoute.ORDER_TRACKING.route)
+                },
+            )
+        }
+        composable(AppRoute.ORDER_TRACKING.route) {
+            OrderTrackingRoute(
+                orderId = selectedOrderId,
+                onBack = { navController.popBackStack() },
+            )
+        }
         composable(AppRoute.SUPPORT.route) { SupportRoute() }
     }
 }
