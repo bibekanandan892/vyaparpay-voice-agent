@@ -61,7 +61,13 @@ class CallStateMachineTest {
         assertEquals(emptyList<CallEffect>(), machine.dispatch(CallEvent.AnswerApplied))
         assertEquals(CallState.Connecting, machine.state.value)
 
-        assertEquals(emptyList<CallEffect>(), machine.dispatch(CallEvent.PeerConnected))
+        // Media up, `ctx` open: the one edge that binds the capture pipeline
+        // (docs/03 §3.10). Audio focus is NOT here — VoiceCallCoordinator
+        // takes it off the *state* back at Requesting, before the mic opens.
+        assertEquals(
+            listOf(CallEffect.BindContextPublisher),
+            machine.dispatch(CallEvent.PeerConnected),
+        )
         assertEquals(CallState.InCall, machine.state.value)
 
         assertEquals(

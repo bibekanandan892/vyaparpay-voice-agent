@@ -253,6 +253,102 @@ class ScreenContextPublisherTest {
     }
 
     // ------------------------------------------------------------------
+    // Gap recovery: requestFullSnapshot (docs/08 §3.3, docs/13 §4)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `requestFullSnapshot re-sends the current screen immediately, even though nothing changed`() = runTest {
+        val state = MutableStateFlow(AppContextState())
+        val events = MutableSharedFlow<AppEvent>(extraBufferCapacity = 16)
+        val channel = FakeContextChannel()
+        val publisher = publisherUnderTest(state, events)
+        publisher.start(channel, backgroundScope)
+        runCurrent()
+
+        state.value = AppContextState(route = "PaymentScreen", flow = "vendor_payment", screen = paymentDeclineIr())
+        runCurrent()
+        assertEquals(1, channel.sent.size)
+
+        // The reconnect case docs/06 §6 is built around: the merchant has not
+        // gone anywhere, so the StateFlow will not re-emit on its own. Arming
+        // a flag for "the next publish" would leave the server holding
+        // discarded state indefinitely; recovery has to push.
+        publisher.requestFullSnapshot()
+        runCurrent()
+
+        assertEquals(2, channel.sent.size)
+        val recovery = decode(channel.sent[1])
+        assertEquals("ctx.snapshot", recovery["type"]!!.jsonPrimitive.content)
+        assertEquals(2L, recovery["seq"]!!.jsonPrimitive.long)
+        assertEquals("PaymentScreen", recovery["payload"]!!.jsonObject["screen"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a delta after recovery bases itself on the recovery snapshot, not the pre-gap message`() = runTest {
+        val state = MutableStateFlow(AppContextState())
+        val events = MutableSharedFlow<AppEvent>(extraBufferCapacity = 16)
+        val channel = FakeContextChannel()
+        val publisher = publisherUnderTest(state, events)
+        publisher.start(channel, backgroundScope)
+        runCurrent()
+
+        state.value = AppContextState(route = "PaymentScreen", flow = "vendor_payment", screen = paymentDeclineIr())
+        runCurrent()
+
+        publisher.requestFullSnapshot()
+        runCurrent()
+        val recoverySeq = decode(channel.sent[1])["seq"]!!.jsonPrimitive.long
+
+        state.value = AppContextState(
+            route = "PaymentScreen",
+            flow = "vendor_payment",
+            screen = paymentDeclineIr(dialogVisible = false, lastActionTarget = "Dismiss", lastActionTs = 2L),
+        )
+        runCurrent()
+
+        // The whole point of re-anchoring in sendSnapshot: pointing base_seq
+        // at a message the server discarded would fabricate a screen state
+        // that never existed (docs/08 §3.2).
+        val delta = decode(channel.sent[2])
+        assertEquals("ctx.delta", delta["type"]!!.jsonPrimitive.content)
+        assertEquals(recoverySeq, delta["payload"]!!.jsonObject["base_seq"]!!.jsonPrimitive.long)
+    }
+
+    @Test
+    fun `requestFullSnapshot before any capture sends nothing but forces the first publish to be a snapshot`() = runTest {
+        val state = MutableStateFlow(AppContextState())
+        val events = MutableSharedFlow<AppEvent>(extraBufferCapacity = 16)
+        val channel = FakeContextChannel()
+        val publisher = publisherUnderTest(state, events)
+        publisher.start(channel, backgroundScope)
+        runCurrent()
+
+        publisher.requestFullSnapshot()
+        runCurrent()
+        assertTrue("there is no screen to capture yet", channel.sent.isEmpty())
+
+        state.value = AppContextState(route = "PaymentScreen", flow = "vendor_payment", screen = paymentDeclineIr())
+        runCurrent()
+
+        assertEquals(1, channel.sent.size)
+        assertEquals("ctx.snapshot", decode(channel.sent.single())["type"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `requestFullSnapshot before start is a no-op, not a crash`() = runTest {
+        val state = MutableStateFlow(
+            AppContextState(route = "PaymentScreen", flow = "vendor_payment", screen = paymentDeclineIr()),
+        )
+        val events = MutableSharedFlow<AppEvent>(extraBufferCapacity = 16)
+
+        // A `ctx.request_snapshot` can only arrive on a channel this publisher
+        // was bound to, so this is defensive rather than reachable — but the
+        // rule is "degrade context, never conversation" (docs/08 §7), and an
+        // NPE here would run on the peer's collector.
+        publisherUnderTest(state, events).requestFullSnapshot()
+    }
+
+    // ------------------------------------------------------------------
     // Capture exclusion holds at this layer too (docs/07 §2.1)
     // ------------------------------------------------------------------
 

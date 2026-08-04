@@ -2,6 +2,12 @@ plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
+    // Phase-4 T8b: VoiceCallService is now an @AndroidEntryPoint — it is the
+    // one place a real ScreenContextPublisher can be obtained for a call, and
+    // a Service can only be field-injected through Hilt's generated base
+    // class. Same plugin pair :core:screencontext took on in T8a.
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
 }
 
 android {
@@ -31,7 +37,17 @@ dependencies {
     // the root build script fails the build if that ever stops being true.
     implementation(project(":core:analytics"))
     implementation(project(":core:network"))
-    implementation(project(":core:screencontext"))
+
+    // `api`, not `implementation`, since Phase-4 T8b: :voice's own public
+    // surface now names :core:screencontext types — CallContextPublisher.start
+    // takes a ContextChannel, and WebRtcContextChannel *is* a ContextChannel.
+    // Hiding the supertype of a public class behind `implementation` is the
+    // classic way to hand consumers a type they cannot resolve; the same
+    // reasoning :core:screencontext's own `api(project(":core:analytics"))`
+    // gives ("both appear in AppContextState's public signature, hence
+    // `api`"). The architectural edge is unchanged and still :voice ->
+    // :core:*, which is what checkModuleDependencyRules actually checks.
+    api(project(":core:screencontext"))
 
     // The maintained libwebrtc build (canon ADR-1, docs/03 §3.4). Deliberately
     // `implementation`, never `api`: WebRtcClient is the only org.webrtc
@@ -51,6 +67,13 @@ dependencies {
     // applied to org.webrtc).
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.service)
+
+    // Phase-4 T8b: @AndroidEntryPoint on VoiceCallService + the
+    // Provider<ScreenContextPublisher> it field-injects. Nothing else in
+    // :voice is Hilt-aware — CallController/VoiceCallCoordinator stay
+    // constructor-injected by hand precisely so they remain JVM-testable.
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
 
     testImplementation(libs.junit)
     testImplementation(libs.turbine)
