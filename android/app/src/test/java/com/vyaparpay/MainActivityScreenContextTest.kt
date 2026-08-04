@@ -8,6 +8,7 @@ import dagger.hilt.android.testing.HiltAndroidTest
 import dagger.hilt.android.testing.HiltTestApplication
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -76,7 +77,20 @@ class MainActivityScreenContextTest {
 
         val activity = composeTestRule.activity
 
-        val tree = runBlocking { activity.uiTreeCollector.tree.first() }
+        // `withTimeout`, not a bare `first()` (review fix, MEDIUM). `tree` is a
+        // `filterNotNull`ed StateFlow that simply never emits if the capture
+        // wiring regresses -- so `runBlocking { first() }` blocks forever
+        // rather than failing. The reviewer reproduced exactly that by deleting
+        // MainActivity's `decorView.post { attachComposeRoot() }` line: instead
+        // of a clean assertion failure, the test runner hung past 150s (against
+        // a ~14s baseline) and had to be force-killed. In CI that regression
+        // would surface as an opaque job timeout instead of naming its own
+        // cause. The timeout converts it back into a fast, legible failure;
+        // the generous bound keeps it from ever firing on slow-CI noise, since
+        // the real capture lands in well under a second.
+        val tree = runBlocking {
+            withTimeout(CAPTURE_TIMEOUT_MILLIS) { activity.uiTreeCollector.tree.first() }
+        }
         val testTags = tree.roots.flatMap { allTestTags(it) }
         assertTrue(
             "expected the real DashboardScreen's root testTag in the captured tree, " +
@@ -98,4 +112,9 @@ class MainActivityScreenContextTest {
 
     private fun allTestTags(node: RawSemanticsNode): List<String> =
         listOfNotNull(node.testTag) + node.children.flatMap { allTestTags(it) }
+
+    private companion object {
+        /** Far above the sub-second real capture; see the call site for why it exists at all. */
+        const val CAPTURE_TIMEOUT_MILLIS = 10_000L
+    }
 }
