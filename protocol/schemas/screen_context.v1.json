@@ -5,7 +5,7 @@
   "properties": {
     "v": {
       "const": "screen_context/v1",
-      "description": "IR schema version marker. An unknown version is rejected by SnapshotIngestor with 400 VALIDATION_UNSUPPORTED_VERSION, not schema validation (docs/13 §1.1, backend/app/api/routes/sessions.py)."
+      "description": "IR schema version marker. An unknown version is rejected by SnapshotIngestor's envelope check rather than by schema validation — but 'rejected' means the SNAPSHOT is dropped, not that the request fails: on the POST /v1/sessions path the response is still 201 and only the agent's context slot goes empty (docs/13 §2.1, backend/app/api/routes/sessions.py's _ingest_initial_screen_context). This description previously said '400 VALIDATION_UNSUPPORTED_VERSION'; that status is never produced here. docs/08 §7 has the reasoning — the pipeline degrades context, never conversation, because a merchant on a stale app build must still be able to start their support call."
     },
     "screen": {
       "type": "string",

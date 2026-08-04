@@ -65,11 +65,19 @@ class InsufficientBalanceError(AppError):
 
 
 class ValidationUnsupportedVersionError(AppError):
-    """docs/13 §1.1: a `screen_context` or event payload carrying an
-    unknown schema version. Distinct from `VALIDATION_SCHEMA` on purpose —
-    the body is well-formed, it just speaks a version this server does not
-    know, which is a client-upgrade signal rather than a bug in the
-    request."""
+    """docs/13 §1.1: a wire *envelope* carrying an unknown schema version.
+    Distinct from `VALIDATION_SCHEMA` on purpose — the body is well-formed,
+    it just speaks a version this server does not know, which is a
+    client-upgrade signal rather than a bug in the request.
+
+    Its one live raiser is the docs/13 §6 signaling server
+    (`app/voice/signaling.py`'s `CODE_VALIDATION_UNSUPPORTED_VERSION`, on a
+    frame whose `v` is not the current envelope version). Deliberately NOT
+    raised for `POST /v1/sessions`' `screen_context`, despite the wording
+    §1.1 carried until 2026-08-05: an unsupported version there degrades to
+    a normal `201` with an empty context slot rather than failing the call
+    (`_ingest_initial_screen_context` in `app/api/routes/sessions.py`, and
+    docs/08 §7's "the pipeline degrades context, never conversation")."""
 
     status_code = 400
     code = "VALIDATION_UNSUPPORTED_VERSION"

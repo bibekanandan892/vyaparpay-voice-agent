@@ -1,6 +1,6 @@
 {
   "name": "session_create_request.v1",
-  "description": "POST /v1/sessions request body (docs/13 §2.1): the one endpoint where context beats audio — the full ScreenContext IR and the last ~15 timeline events ride in the request body so the agent is context-complete before the peer connection exists. Phase 3 sends screen_context: null and recent_events: [] — context capture lands in Phase 4. The server validates the snapshot and events against protocol/ schemas and rejects the whole body with 400 VALIDATION_SCHEMA, never a partial ingest (docs/13 §2.1). additionalProperties is false in the house input-schema style (protocol/tools/*.json): new request fields are a server-contract change (docs/13 §9), never a client improvisation.",
+  "description": "POST /v1/sessions request body (docs/13 §2.1): the one endpoint where context beats audio — the full ScreenContext IR and the last ~15 timeline events ride in the request body so the agent is context-complete before the peer connection exists. A Phase-3 client sends screen_context: null and recent_events: []; a Phase-4 capture-enabled client sends the real shapes. What this schema constrains is the ENVELOPE, and the server rejects only envelope failures with 400 VALIDATION_SCHEMA — a bad user_id, or recent_events that is not an array of {type, name, ts} objects. The screen_context payload itself is validated but NOT rejection-gated: an unsupported version, a schema-invalid IR, an unrecoverably oversized one, or a storage failure all still return 201, and degrade only the agent's context slot (docs/13 §2.1's 'a bad screen_context does not fail this call', docs/08 §7's 'the pipeline degrades context, never conversation'). Rejecting would mean a merchant on a stale app build cannot start a support call at the exact moment they need one; the earlier '400, whole body' wording in this description described an intent the implementation deliberately does not have. 'Never a partial ingest' does survive, and is about storage rather than status: a failing snapshot is discarded whole, never merged field-by-field, so garbage cannot reach the prompt. additionalProperties is false in the house input-schema style (protocol/tools/*.json): new request fields are a server-contract change (docs/13 §9), never a client improvisation.",
   "type": "object",
   "properties": {
     "user_id": {
@@ -9,7 +9,7 @@
     },
     "screen_context": {
       "type": ["object", "null"],
-      "description": "Full screen_context/v1 IR — the last operational screen, support surfaces excluded (docs/07 §2.1) — or null when the client has no capture. Phase 3 always sends null; capture is Phase 4. Shape authority is docs/07 and protocol/schemas/screen_context.v1.json when it lands; only the version marker is pinned here. An unknown version is rejected with 400 VALIDATION_UNSUPPORTED_VERSION (docs/13 §1.1).",
+      "description": "Full screen_context/v1 IR — the last operational screen, support surfaces excluded (docs/07 §2.1) — or null when the client has no capture. A Phase-3 client always sends null. Shape authority is docs/07 and protocol/schemas/screen_context.v1.json; only the version marker is pinned here. An unknown version does NOT fail the request: SnapshotIngestor rejects the payload, nothing is written to ctx:{session_id}, and the response is the normal 201 — identical in every observable way to having sent null. (This field's description previously promised 400 VALIDATION_UNSUPPORTED_VERSION; that code exists and is raised, but for the docs/13 §6 signaling envelope, never here. See docs/13 §2.1 for why degrading beats rejecting on this endpoint.)",
       "properties": {
         "v": { "const": "screen_context/v1" }
       },
@@ -17,7 +17,7 @@
     },
     "recent_events": {
       "type": "array",
-      "description": "The last ~15 app_event/v1 timeline entries, oldest first; may be empty (Phase 3 always sends []). Event shape authority is docs/07/08 and protocol/schemas/app_event.v1.json when it lands; only the fields every event variant carries are pinned here.",
+      "description": "The last ~15 app_event/v1 timeline entries, oldest first; may be empty (a Phase-3 client always sends []). Event shape authority is protocol/schemas/app_event.v1.json, which names this array as one of the three places it governs — clients send each variant's full field set (nav.from, tap.screen, input.value where non-sensitive, api_error.status + .code, dialog.visible), and the server stores what it is given. Only the {type, name, ts} canon every variant carries is pinned HERE, so this schema stays a shape check on the envelope rather than a second, drifting copy of that oneOf. Oldest-first is load-bearing, not cosmetic: the server RPUSHes this array into ctx:{session_id}:events in the order given and ContextCompressor.render_timeline_slot takes 'the newest 15' as events[-15:], so a newest-first array would hand the agent the oldest fifteen actions rendered backwards.",
       "items": {
         "type": "object",
         "properties": {
