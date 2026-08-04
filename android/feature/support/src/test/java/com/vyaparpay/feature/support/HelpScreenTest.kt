@@ -1,6 +1,10 @@
 package com.vyaparpay.feature.support
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -61,6 +65,24 @@ class HelpScreenTest {
         composeTestRule.onNodeWithTag(CALL_SUPPORT_TEST_TAG).performClick()
 
         assertTrue(called)
+    }
+
+    @Test
+    fun `both CTAs carry Role Button`() {
+        // Review finding (independent review of 4b22632, MEDIUM): SupportCta
+        // sets Role.Button unconditionally in HelpScreen.kt, matching
+        // PaymentScreen.PayNowButton's established discipline, but nothing
+        // asserted it -- a future refactor could silently drop the role
+        // param with no test catching the regression. Mirrors
+        // DashboardScreenTest's identical assertion pattern.
+        composeTestRule.setContent {
+            HelpScreen(state = loadedState, events = RecordingEventTracker(), onCallSupport = {})
+        }
+
+        composeTestRule.onNodeWithTag(CALL_SUPPORT_TEST_TAG).performScrollTo()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+        composeTestRule.onNodeWithTag(TEXT_CHAT_TEST_TAG).performScrollTo()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
     }
 
     private class RecordingEventTracker : EventTracker {
