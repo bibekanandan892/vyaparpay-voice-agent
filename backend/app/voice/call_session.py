@@ -40,9 +40,29 @@ Judgment calls, flagged per house style:
    everything with a timeout — anything still pending is cancelled
    loudly, never leaked. A worker turn mid-brain-call at hang-up gets
    `_CLOSE_TIMEOUT_S` to finish before the cancel.
+6. **`ContextDispatcher` (Phase-4 T4, `app/voice/context_dispatch.py`)
+   wiring is independent of `deps`.** `snapshot_ingestor`/`event_log` are
+   their own optional constructor pair — ctx.* capture has nothing to do
+   with STT/TTS/brain availability, so even placeholder (deps-less) calls
+   get context ingestion when the process was given a pair. Both-or-
+   neither: supplying exactly one is a caller bug and raises immediately.
+   The dispatcher's `send_data_channel` callback closes over `self._peer`
+   rather than being passed a bound method directly, because `PeerSession`
+   needs `on_data` AT construction (its own frozen seam) while the
+   dispatcher needs `PeerSession.send_data_channel` — a message can only
+   ever reach the dispatcher after `__init__` returns and `self._peer` is
+   set, so the closure is safe despite the apparent forward reference.
+   Its task joins `self._tasks` exactly like the worker/drain tasks, so
+   the bounded-wait-then-cancel loop in `close()` already covers it —
+   PROVIDED `close()` also calls `ContextDispatcher.close()` (its own
+   judgment call 7) right after `self._peer.close()`, since — unlike the
+   ingress-fan-out drains — the dispatcher's queue has no other "no more
+   messages" signal and would otherwise never finish before
+   `_CLOSE_TIMEOUT_S` expires on every single call.
 
 Docs: docs/06 §1.1 (the worker's row), docs/04 §4 (DI split).
 Tests: tests/voice/test_run.py (shared wiring, via the shim),
+tests/voice/test_context_dispatch.py (dispatcher wiring),
 tests/e2e/test_voice_pipeline_e2e.py (full stack with fakes).
 """
 
@@ -55,10 +75,13 @@ from functools import partial
 from typing import Final
 
 from app.config import Settings
-from app.domain.voice import IceServer, SttProvider, TtsProvider, VadModel
+from app.context.event_log import EventLog
+from app.context.snapshot_ingestor import SnapshotIngestor
+from app.domain.voice import DataChannelMessage, IceServer, SttProvider, TtsProvider, VadModel
 from app.obs.logging import get_logger
 from app.voice.audio_egress import AudioEgress
 from app.voice.audio_ingress import AudioIngress
+from app.voice.context_dispatch import ContextDispatcher
 from app.voice.peer_session import PeerSession, SendSignal
 from app.voice.worker import Brain, VoiceAgentWorker
 
@@ -100,26 +123,56 @@ class CallSession:
         *,
         ice_servers: tuple[IceServer, ...],
         deps: CallDeps | None = None,
+        snapshot_ingestor: SnapshotIngestor | None = None,
+        event_log: EventLog | None = None,
     ) -> None:
+        if (snapshot_ingestor is None) != (event_log is None):
+            raise ValueError("snapshot_ingestor and event_log must be provided together")
         self._session_id = session_id
         self._ingress = AudioIngress()
         self._egress = AudioEgress()
+        # Judgment call 6: ContextDispatcher wiring is independent of
+        # `deps` — constructed first so its `send_data_channel` closure can
+        # capture `self._peer` (safe: no message reaches it before
+        # `__init__` returns and `self._peer` is set).
+        self._context_dispatcher: ContextDispatcher | None = None
+        if snapshot_ingestor is not None and event_log is not None:
+            self._context_dispatcher = ContextDispatcher(
+                session_id,
+                snapshot_ingestor=snapshot_ingestor,
+                event_log=event_log,
+                send_data_channel=self._send_context_data_channel,
+            )
         self._peer = PeerSession(
             session_id,
             ingress=self._ingress,
             send_signal=send_signal,
             ice_servers=ice_servers,
+            on_data=(
+                self._context_dispatcher.handle_message
+                if self._context_dispatcher is not None
+                else None
+            ),
         )
         # Judgment call 1: started lazily from handle_offer().
         self._egress_task: asyncio.Task[None] | None = None
+        tasks: list[asyncio.Task[None]] = []
+        if self._context_dispatcher is not None:
+            tasks.append(
+                asyncio.create_task(
+                    self._context_dispatcher.run(), name=f"context-dispatch:{session_id}"
+                )
+            )
         if deps is None:
-            self._tasks: tuple[asyncio.Task[None], ...] = (
+            tasks.append(
                 asyncio.create_task(
                     _drain(self._ingress.stt_stream()), name=f"stt-drain:{session_id}"
-                ),
+                )
+            )
+            tasks.append(
                 asyncio.create_task(
                     _drain(self._ingress.vad_frames()), name=f"vad-drain:{session_id}"
-                ),
+                )
             )
         else:
             worker = VoiceAgentWorker(
@@ -139,7 +192,11 @@ class CallSession:
             # Fail loud the moment the worker dies, not only at close():
             # a dead turn machine would otherwise be a silent no-op call.
             worker_task.add_done_callback(self._log_worker_crash)
-            self._tasks = (worker_task,)
+            tasks.append(worker_task)
+        self._tasks: tuple[asyncio.Task[None], ...] = tuple(tasks)
+
+    def _send_context_data_channel(self, message: DataChannelMessage) -> None:
+        self._peer.send_data_channel(message)
 
     def _log_worker_crash(self, task: asyncio.Task[None]) -> None:
         if task.cancelled() or task.exception() is None:
@@ -168,6 +225,12 @@ class CallSession:
         before any offer arrived."""
         await self._peer.close()
         self._egress.stop()
+        if self._context_dispatcher is not None:
+            # ContextDispatcher judgment call 7: sentinel, not cancellation
+            # — the channel is already shut, so run() drains promptly
+            # instead of the bounded wait below always paying the full
+            # _CLOSE_TIMEOUT_S on a task that never ends on its own.
+            self._context_dispatcher.close()
         tasks = self._tasks if self._egress_task is None else (*self._tasks, self._egress_task)
         done, pending = await asyncio.wait(tasks, timeout=_CLOSE_TIMEOUT_S)
         for task in pending:
