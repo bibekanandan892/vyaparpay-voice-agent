@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HelpScreenTest hosts Compose content in a plain `ComponentActivity` via
+  `createAndroidComposeRule<ComponentActivity>()` (docs/03 §6's Compose-UI-test
+  layer, run under Robolectric so it lands in `testDebugUnitTest`). Robolectric
+  resolves the launch `Intent` against the merged manifest, and `:feature:support`
+  declares no activities of its own — this test-only manifest supplies the one
+  entry Robolectric needs to resolve it (mirrors `:feature:payments`'s own
+  `src/test/AndroidManifest.xml`). It reaches no production code path.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <activity android:name="androidx.activity.ComponentActivity" android:exported="true" />
+    </application>
+
+</manifest>
