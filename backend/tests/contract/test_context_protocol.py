@@ -326,6 +326,24 @@ def test_ctx_delta_role_vocabulary_matches_screen_context_component_roles() -> N
     assert identity_roles == screen_context_roles
 
 
+def test_ctx_delta_last_action_and_last_api_shapes_match_screen_context() -> None:
+    """Review fix (T1 freeze review): ctx_delta.v1.json's own description
+    flags $defs.last_action/$defs.last_api as duplicated locally from
+    screen_context.v1.json because the walker only resolves local $ref --
+    the same drift risk the role-vocabulary test above guards for the
+    role enum, but nothing guarded these two duplicated shapes. Asserts
+    both schemas' properties AND required lists stay byte-identical for
+    each $def, so a future edit to one (e.g. a new last_action field)
+    cannot silently diverge from the other."""
+    screen_context_defs = _load_schema("screen_context.v1")["$defs"]
+    delta_defs = _load_schema("ctx_delta.v1")["$defs"]
+    for def_name in ("last_action", "last_api"):
+        assert delta_defs[def_name]["properties"] == screen_context_defs[def_name]["properties"]
+        assert set(delta_defs[def_name]["required"]) == set(
+            screen_context_defs[def_name]["required"]
+        )
+
+
 def test_app_event_type_enum_has_exactly_five_closed_members() -> None:
     """docs/08 §2.1: 'The taxonomy is intentionally closed.'"""
     schema = _load_schema("app_event.v1")
