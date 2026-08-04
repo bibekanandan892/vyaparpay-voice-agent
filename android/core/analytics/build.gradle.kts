@@ -35,5 +35,11 @@ dependencies {
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
 
+    // EventTracker.events / RingBufferEventTracker's MutableSharedFlow
+    // (Phase-4 T7b: the ctx.event observability gap — see EventTracker.kt's
+    // kdoc). :core:analytics had no coroutines dependency before this.
+    implementation(libs.kotlinx.coroutines.core)
+
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }

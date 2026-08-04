@@ -4,6 +4,10 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -16,6 +20,7 @@ import org.junit.Test
  * matching the multi-thread reality (`nav`/`tap`/`input`/`dialog` on main,
  * `api_error` from the OkHttp dispatcher, docs/08 §2.1).
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class RingBufferEventTrackerTest {
 
     private fun tap(n: Int): AppEvent.Tap = AppEvent.Tap(name = "tap_$n", ts = n.toLong(), screen = "PaymentScreen")
@@ -113,5 +118,38 @@ class RingBufferEventTrackerTest {
 
         assertTrue("no thread should throw: $failures", failures.isEmpty())
         assertEquals(EventTracker.RING_BUFFER_CAPACITY, tracker.recent(EventTracker.RING_BUFFER_CAPACITY).size)
+    }
+
+    // ------------------------------------------------------------------
+    // events (Phase-4 T7b — see EventTracker.eventStream's kdoc for the gap this closes)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `record emits the same event on events immediately`() = runTest {
+        val tracker = RingBufferEventTracker()
+        val received = mutableListOf<AppEvent>()
+        backgroundScope.launch { tracker.eventStream.collect { received += it } }
+        runCurrent()
+
+        val event = tap(1)
+        tracker.record(event)
+        runCurrent()
+
+        assertEquals(listOf(event), received)
+    }
+
+    @Test
+    fun `events has no replay -- a late subscriber does not see events recorded before it subscribed`() = runTest {
+        val tracker = RingBufferEventTracker()
+        tracker.record(tap(1))
+
+        val received = mutableListOf<AppEvent>()
+        backgroundScope.launch { tracker.eventStream.collect { received += it } }
+        runCurrent()
+
+        tracker.record(tap(2))
+        runCurrent()
+
+        assertEquals(listOf(tap(2)), received)
     }
 }
