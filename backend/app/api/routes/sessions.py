@@ -78,6 +78,7 @@ Judgment calls, flagged rather than buried:
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -92,13 +93,14 @@ from app.api.errors import (
     SessionNotFoundError,
     SessionSummaryPendingError,
     ValidationSchemaError,
-    ValidationUnsupportedVersionError,
     error_envelope,
     success_envelope,
 )
 from app.auth.signaling import SignalingToken, mint_signaling_token, store_signaling_token
 from app.auth.turn_credentials import mint_ice_servers
 from app.config import Settings
+from app.context.context_compressor import ContextCompressor
+from app.context.snapshot_ingestor import SnapshotIngestor
 from app.data.redis_client import RedisClient
 from app.data.repositories import ConversationRepo, ToolAuditRepo
 from app.domain.types import SessionState, SessionUser, ToolInvocationStatus
@@ -109,10 +111,6 @@ from app.obs.logging import get_logger
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
-
-# The only `screen_context` version this server understands
-# (protocol/schemas/session_create_request.v1.json's `"const"`).
-_SCREEN_CONTEXT_V1: Final = "screen_context/v1"
 
 # The control message DELETE publishes on `session_control:{id}` for the
 # voice-worker (judgment call 1). One word, no envelope: this channel
@@ -201,6 +199,25 @@ def get_session_manager(request: Request) -> SessionManager:
     return SessionManager(request.app.state.sessionmaker, request.app.state.redis)
 
 
+def get_snapshot_ingestor(redis: RedisClient = Depends(get_redis)) -> SnapshotIngestor:  # noqa: B008
+    """Phase-4 T3: a fresh `SnapshotIngestor` per request, over the same
+    `RedisClient` singleton `get_redis` hands out and a stateless
+    `ContextCompressor` (that class's own docstring: "one instance is
+    safely shared across sessions/requests", so constructing one here
+    rather than caching it on `app.state` costs nothing). Depending on
+    `get_redis` — rather than reading `request.app.state.redis` directly,
+    the way `get_session_manager` above does — means a test that swaps
+    `get_redis` via `dependency_overrides` (this module's own established
+    seam) transparently gets a `SnapshotIngestor` wired to the same fake.
+
+    Mirrors docs/08 §4's "same class, same validation, two entrypoints":
+    this is the REST entrypoint's instance; `app/voice/run.py`'s
+    `_build_brain_stack` builds the data-channel entrypoints' instance the
+    identical way, over the process-long `redis` singleton.
+    """
+    return SnapshotIngestor(redis, ContextCompressor())
+
+
 # --------------------------------------------------------------------------
 # Validation + ownership helpers
 # --------------------------------------------------------------------------
@@ -218,28 +235,6 @@ def _require_matching_user_id(body_user_id: str, principal: SessionUser) -> None
                     {"loc": ["body", "user_id"], "msg": "must equal the JWT sub claim"}
                 ]
             },
-        )
-
-
-def _require_supported_screen_context(screen_context: dict[str, Any] | None) -> None:
-    """`null` is valid and normal in Phase 3. A present snapshot must
-    carry `v` (schema `required`) and it must be the one version this
-    server ingests — an unknown version is `400
-    VALIDATION_UNSUPPORTED_VERSION`, not `VALIDATION_SCHEMA` (docs/13
-    §1.1). Whole-body rejection either way: never a partial ingest
-    (docs/13 §2.1)."""
-    if screen_context is None:
-        return
-    version = screen_context.get("v")
-    if version is None:
-        raise ValidationSchemaError(
-            "screen_context is missing its version marker",
-            details={"fields": [{"loc": ["body", "screen_context", "v"], "msg": "field required"}]},
-        )
-    if version != _SCREEN_CONTEXT_V1:
-        raise ValidationUnsupportedVersionError(
-            "Unsupported screen_context version",
-            details={"supported": [_SCREEN_CONTEXT_V1]},
         )
 
 
@@ -319,6 +314,58 @@ async def _issue_connect_bundle(
         ice_servers=ice_servers,
         expires=now + timedelta(seconds=settings.signaling_token_ttl_s),
     )
+
+
+# --------------------------------------------------------------------------
+# Initial screen-context persistence (docs/08 §3.1 / §4.1) — Phase-4 T3
+# --------------------------------------------------------------------------
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+async def _ingest_initial_screen_context(
+    snapshot_ingestor: SnapshotIngestor, session_id: str, screen_context: dict[str, Any]
+) -> None:
+    """Best-effort persistence of the REST-supplied snapshot into
+    `ctx:{session_id}` (docs/08 §3.1's "context before audio"; §4.1's REST
+    entrypoint). Replaces the old `_require_supported_screen_context`
+    placeholder (this route's previous docstring: "Phase 4 owns
+    ScreenContext ingestion") — that stub only checked the version marker
+    and never validated or stored anything; `SnapshotIngestor`'s own
+    module docstring names itself as that stub's "eventual full
+    replacement."
+
+    Judgment call: an `IngestResult` with `accepted=False` (bad version
+    marker, a schema violation, or an oversize payload that still fails
+    the schema after recompression — check (b) itself never rejects a
+    snapshot outright) does NOT fail this call, and by construction
+    cannot — this function only runs after `session_manager.create()`
+    already returned a live session, so the connect bundle downstream is
+    unaffected either way. docs/08 §7's closing line is explicit that
+    "the pipeline degrades context, never conversation": a merchant
+    calling in with a stale app build or a corrupted capture must still
+    be able to start the call, just with `ContextBuilder`'s slot 4
+    reading back empty (`ContextBuilder._get_screen_context`'s own
+    judgment call #5) — identical to sending `screen_context: null`, not
+    a new failure mode. `SnapshotIngestor` already logs every rejection
+    path at WARNING internally (its `_reject_*` helpers, each carrying
+    `session_id` and a `reason`) with a stable, dedicated event name per
+    check — logging again here would only duplicate that signal under a
+    third name, so this function logs nothing on rejection and only a
+    single INFO line on acceptance, mirroring this route's existing
+    `session_created` log.
+    """
+    result = await snapshot_ingestor.ingest_initial_snapshot(
+        session_id, screen_context, received_at_ms=_now_ms()
+    )
+    if result.accepted:
+        log.info(
+            "session_screen_context_ingested",
+            session_id=session_id,
+            outcome=result.outcome.value,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -427,21 +474,32 @@ async def create_session(
     session_manager: SessionManager = Depends(get_session_manager),  # noqa: B008
     redis: RedisClient = Depends(get_redis),  # noqa: B008
     settings: Settings = Depends(get_voice_settings),  # noqa: B008
+    snapshot_ingestor: SnapshotIngestor = Depends(get_snapshot_ingestor),  # noqa: B008
 ) -> dict[str, Any]:
     """docs/13 §2.1. Order of server-side effects, as that section pins
     them: validate the whole body -> rate-limit (the `require_rate_limit`
     dependency, which runs before this body) -> mint the session ->
     store the hashed one-time token -> compute the TURN pair -> return.
 
+    Phase-4 T3: the session mint is followed by a best-effort
+    `SnapshotIngestor.ingest_initial_snapshot()` call for a present
+    `screen_context` (`_ingest_initial_screen_context`'s own docstring
+    covers the accepted/rejected judgment call in full — short version:
+    a rejection degrades the session's screen-context slot, never this
+    response). It runs AFTER `session_manager.create()`, not before,
+    because `SnapshotIngestor` writes keyed by `session_id`, which does
+    not exist until the session is minted — unlike the old
+    `_require_supported_screen_context` placeholder this replaces, which
+    ran (and could reject) before any session existed at all.
+
     Not implemented in this task, and deliberately not faked: writing
-    `ctx:{id}` + the events list (Phase 4 owns ScreenContext ingestion —
-    Phase 3 clients always send `null`/`[]`, per
-    `protocol/schemas/session_create_request.v1.json`) and the speculative
-    context prefetch (no prefetcher exists yet). Both are additive later
-    without changing this response.
+    the `recent_events` list into `EventLog` (docs/08 §6's sequence
+    diagram shows both writes at session-create; this task's own brief
+    scopes only the `SnapshotIngestor`/screen_context half of that
+    diagram) and the speculative context prefetch (no prefetcher exists
+    yet). Both are additive later without changing this response.
     """
     _require_matching_user_id(body.user_id, principal)
-    _require_supported_screen_context(body.screen_context)
 
     minted = mint_signaling_token()
     session = await session_manager.create(
@@ -450,6 +508,10 @@ async def create_session(
         [event.model_dump() for event in body.recent_events],
         signaling_token_hash=minted.token_hash,
     )
+    if body.screen_context is not None:
+        await _ingest_initial_screen_context(
+            snapshot_ingestor, session.session_id, body.screen_context
+        )
     credentials = await _issue_connect_bundle(
         session_id=session.session_id,
         minted=minted,

@@ -11,6 +11,7 @@ app/agent/prompts/ — their bytes are part of what these tests pin
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,12 +21,20 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.agent.context_builder import _PROFILE_UNAVAILABLE, ContextBuilder
+from app.context.context_compressor import ContextCompressor
+from app.context.event_log import EventLog
+from app.context.snapshot_ingestor import SnapshotIngestor
+from app.data.redis_client import RedisClient
 from app.domain.interfaces import ContextBuilderProto
 from app.domain.types import Message, Role, Session, SessionState
 from app.memory.session_memory import SessionMemory
 from app.models.orm import Merchant
+from tests.support.fake_redis import FakeRedis
+
+_REDIS_SESSION_TTL = 86_400
 
 
 def make_db_session() -> AsyncMock:
@@ -69,20 +78,42 @@ def make_call_session() -> Session:
     )
 
 
+def make_redis_client() -> RedisClient:
+    """A fresh FakeRedis-backed `RedisClient` — no stored `ctx:*` state,
+    the same "nothing published yet" starting point every real session
+    has (tests/context/conftest.py's identical fixture, reused in spirit
+    rather than imported: this file's fixtures are function-scoped
+    per-test builders, not pytest fixtures)."""
+    return RedisClient(FakeRedis(), session_ttl_seconds=_REDIS_SESSION_TTL)  # type: ignore[arg-type]
+
+
 def make_builder(
     *,
     db_session: AsyncMock | None = None,
     memory: AsyncMock | None = None,
+    redis: RedisClient | AsyncMock | None = None,
+    event_log: EventLog | AsyncMock | None = None,
 ) -> ContextBuilder:
     """Builder with happy-path defaults: a DB session that returns the
-    canonical merchant and an empty window. A caller-supplied db_session
-    or memory is used exactly as configured."""
+    canonical merchant, an empty conversation window, and a fresh
+    FakeRedis-backed `RedisClient`/`EventLog` with no stored ctx:/events
+    state (slots 4/5 default to `""`, the expected-common-case degrade —
+    context_builder.py's judgment calls #5/#6). A caller-supplied
+    collaborator is used exactly as configured — e.g. an
+    `AsyncMock(spec=RedisClient)` with `.raw.get.side_effect` set
+    simulates a genuine Redis failure, distinct from the no-data case."""
     if db_session is None:
         db_session = make_db_session()
         db_session.get.return_value = make_merchant()
     if memory is None:
         memory = make_memory()
-    return ContextBuilder(make_sessionmaker(db_session), memory)
+    if redis is None:
+        redis = make_redis_client()
+    if event_log is None:
+        event_log = EventLog(redis) if isinstance(redis, RedisClient) else AsyncMock(spec=EventLog)
+    return ContextBuilder(
+        make_sessionmaker(db_session), memory, redis, event_log, ContextCompressor()
+    )
 
 
 def test_context_builder_satisfies_the_frozen_protocol() -> None:
@@ -96,7 +127,7 @@ def test_context_builder_satisfies_the_frozen_protocol() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_build_populates_the_five_phase2_slots_and_leaves_4_to_7_empty() -> None:
+async def test_build_populates_the_five_phase2_slots_and_leaves_6_to_7_empty() -> None:
     window = [
         Message(role=Role.USER, content="my payment failed"),
         Message(role=Role.ASSISTANT, content="Let me check that."),
@@ -110,7 +141,9 @@ async def test_build_populates_the_five_phase2_slots_and_leaves_4_to_7_empty() -
     assert bundle.user_profile.startswith("Business: Kumar General Store")
     assert bundle.conversation == tuple(window)
     assert bundle.current_utterance == "what's my limit?"
-    # Slots 4-7 stay at their "" defaults until Phase 4/5.
+    # Slots 4/5 are Phase-4 T3 scope: real, but empty here (no stored
+    # ctx:{session_id}/events state — the default builder's fresh
+    # FakeRedis). Slots 6-7 stay at their "" defaults until Phase 5.
     assert bundle.screen_context == ""
     assert bundle.recent_actions == ""
     assert bundle.memory_summary == ""
@@ -265,6 +298,149 @@ async def test_corrupt_transcript_degrades_the_window_to_empty() -> None:
     bundle = await builder.build(make_call_session(), current_utterance="hi")
 
     assert bundle.conversation == ()
+
+
+# --------------------------------------------------------------------------
+# screen_context slot (Phase-4 T3, docs/08 §4.3/§5.1 — judgment call #5):
+# real stored ctx:{session_id} state, seeded through the actual T2
+# `SnapshotIngestor` (the same production write path a real session-create
+# or data-channel snapshot would use), not a hand-rolled Redis dict.
+# --------------------------------------------------------------------------
+
+_VALID_SNAPSHOT = {
+    "v": "screen_context/v1",
+    "screen": "PaymentScreen",
+    "flow": "vendor_payment",
+    "components": [{"role": "primary_cta", "label": "Pay Now", "enabled": True}],
+    "last_action": None,
+    "last_api": None,
+    "dirty_fields": [],
+    "loading": False,
+}
+
+
+async def test_screen_context_slot_stays_empty_with_no_stored_snapshot() -> None:
+    """No `ctx:{session_id}` ever written — the expected common case
+    until T4 wires the data-channel dispatcher (judgment call #5) —
+    degrades silently to `""`, not logged as an error."""
+    builder = make_builder()
+
+    with capture_logs() as logs:
+        bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert bundle.screen_context == ""
+    assert not [e for e in logs if e["log_level"] == "warning"]
+
+
+async def test_screen_context_slot_renders_a_real_stored_snapshot() -> None:
+    redis = make_redis_client()
+    ingestor = SnapshotIngestor(redis, ContextCompressor())
+    await ingestor.ingest_initial_snapshot(
+        "sess_1", _VALID_SNAPSHOT, received_at_ms=int(time.time() * 1000)
+    )
+    builder = make_builder(redis=redis)
+
+    bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert '"screen":"PaymentScreen"' in bundle.screen_context
+    assert "Pay Now" in bundle.screen_context
+
+
+async def test_screen_context_slot_marks_a_stale_snapshot() -> None:
+    """`ContextCompressor.render_snapshot_slot`'s staleness header
+    (docs/08 §4.3: `now - received_ts > 30s`) — exercised through the
+    real compressor this class is wired to, not re-implemented here."""
+    redis = make_redis_client()
+    ingestor = SnapshotIngestor(redis, ContextCompressor())
+    stale_received_at_ms = int(time.time() * 1000) - 40_000
+    await ingestor.ingest_initial_snapshot(
+        "sess_1", _VALID_SNAPSHOT, received_at_ms=stale_received_at_ms
+    )
+    builder = make_builder(redis=redis)
+
+    bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert "may be stale" in bundle.screen_context
+
+
+async def test_screen_context_redis_failure_degrades_to_empty_and_logs_a_warning() -> None:
+    redis = AsyncMock(spec=RedisClient)
+    redis.raw = AsyncMock()
+    redis.raw.get.side_effect = RedisError("redis down")
+    builder = make_builder(redis=redis, event_log=AsyncMock(spec=EventLog))
+
+    with capture_logs() as logs:
+        bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert bundle.screen_context == ""
+    (event,) = [e for e in logs if e["event"] == "context.screen_context.redis_error"]
+    assert event["log_level"] == "warning"
+    assert event["session_id"] == "sess_1"
+
+
+async def test_screen_context_corrupt_json_degrades_to_empty_and_logs_a_warning() -> None:
+    """A stored `ctx:{session_id}` value that isn't valid JSON — a
+    corrupted write, never produced by `SnapshotIngestor` itself — is the
+    genuine-failure branch of judgment call #5, not the missing-key
+    branch."""
+    fake_redis = FakeRedis()
+    fake_redis.strings["ctx:sess_1"] = "{not valid json"
+    redis = RedisClient(fake_redis, session_ttl_seconds=_REDIS_SESSION_TTL)  # type: ignore[arg-type]
+    builder = make_builder(redis=redis)
+
+    with capture_logs() as logs:
+        bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert bundle.screen_context == ""
+    assert any(e["event"] == "context.screen_context.redis_error" for e in logs)
+
+
+# --------------------------------------------------------------------------
+# recent_actions slot (Phase-4 T3, docs/08 §4.2/§4.3/§5.1 — judgment call
+# #6): real stored ctx:{session_id}:events state, seeded through the
+# actual T2 `EventLog.append`.
+# --------------------------------------------------------------------------
+
+
+async def test_recent_actions_slot_stays_empty_with_no_stored_events() -> None:
+    """No events ever appended — the expected common case — degrades
+    silently to `""`, not logged as an error."""
+    builder = make_builder()
+
+    with capture_logs() as logs:
+        bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert bundle.recent_actions == ""
+    assert not [e for e in logs if e["log_level"] == "warning"]
+
+
+async def test_recent_actions_slot_renders_real_stored_events() -> None:
+    redis = make_redis_client()
+    event_log = EventLog(redis)
+    now_ms = int(time.time() * 1000)
+    await event_log.append("sess_1", {"type": "tap", "name": "Dismiss", "ts": now_ms - 5_000})
+    await event_log.append("sess_1", {"type": "nav", "name": "PaymentScreen", "ts": now_ms - 1_000})
+    builder = make_builder(redis=redis, event_log=event_log)
+
+    bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert "timeline" in bundle.recent_actions
+    assert 'tap "Dismiss"' in bundle.recent_actions
+    assert "nav → PaymentScreen" in bundle.recent_actions
+
+
+async def test_recent_actions_redis_failure_degrades_to_empty_and_logs_a_warning() -> None:
+    event_log = AsyncMock(spec=EventLog)
+    event_log.get_events.side_effect = RedisError("redis down")
+    builder = make_builder(event_log=event_log)
+
+    with capture_logs() as logs:
+        bundle = await builder.build(make_call_session(), current_utterance="hi")
+
+    assert bundle.recent_actions == ""
+    (event,) = [e for e in logs if e["event"] == "context.recent_actions.redis_error"]
+    assert event["log_level"] == "warning"
+    assert event["session_id"] == "sess_1"
 
 
 # --------------------------------------------------------------------------

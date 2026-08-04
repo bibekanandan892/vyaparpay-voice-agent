@@ -21,6 +21,7 @@ actually emits).
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -41,6 +42,7 @@ from app.config import get_settings
 from app.data.redis_client import RedisClient
 from app.domain.types import Session, SessionState
 from app.models import Conversation, ConversationTurn, ToolInvocation
+from tests.context.conftest import load_fixture
 from tests.contract.test_voice_protocol import _assert_valid, _load_schema
 from tests.support.fake_redis import FakeRedis
 
@@ -353,21 +355,6 @@ def test_create_session_uses_the_principal_not_the_body_user_id(
     assert session_manager.calls[0]["user_id"] == _MERCHANT_ID
 
 
-def test_create_session_rejects_an_unknown_screen_context_version(
-    client: TestClient, session_manager: _FakeSessionManager
-) -> None:
-    resp = client.post(
-        "/v1/sessions",
-        headers=_AUTH_HEADERS,
-        json=_create_body(screen_context={"v": "screen_context/v9", "screen": "PaymentScreen"}),
-    )
-
-    body = resp.json()
-    assert resp.status_code == 400
-    assert body["error"]["code"] == "VALIDATION_UNSUPPORTED_VERSION"
-    assert session_manager.calls == []
-
-
 def test_create_session_accepts_the_supported_screen_context_version(
     client: TestClient, session_manager: _FakeSessionManager
 ) -> None:
@@ -382,6 +369,133 @@ def test_create_session_accepts_the_supported_screen_context_version(
         "v": "screen_context/v1",
         "screen": "PaymentScreen",
     }
+
+
+# --------------------------------------------------------------------------
+# Phase-4 T3: SnapshotIngestor wiring at session-create (docs/08 §3.1/§4.1)
+#
+# docs/08 §7's closing line — "the pipeline degrades context, never
+# conversation" — is the behavior under test in the four cases below: a
+# session-create request must succeed (201) regardless of whether its
+# screen_context is missing, schema-invalid, an unsupported version, or
+# oversized. Only a genuinely SCHEMA-VALID snapshot actually lands in
+# `ctx:{session_id}`; every degraded case leaves that key absent (or,
+# same net effect, does not exist yet), identical to a client that sent
+# `screen_context: null`.
+# --------------------------------------------------------------------------
+
+
+def test_create_session_persists_a_valid_screen_context_snapshot(
+    client: TestClient,
+) -> None:
+    """The real `SnapshotIngestor` wiring: a fully schema-valid IR is
+    written to `ctx:{session_id}` at the REST entrypoint's genesis
+    `seq=0` (docs/08 §4.1 judgment call 4)."""
+    screen_context = load_fixture("screen_context_payment_decline")
+
+    resp = client.post(
+        "/v1/sessions", headers=_AUTH_HEADERS, json=_create_body(screen_context=screen_context)
+    )
+
+    assert resp.status_code == 201
+
+
+def test_create_session_stores_the_ingested_snapshot_in_redis(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    screen_context = load_fixture("screen_context_payment_decline")
+
+    client.post(
+        "/v1/sessions", headers=_AUTH_HEADERS, json=_create_body(screen_context=screen_context)
+    )
+
+    stored = json.loads(fake_redis.strings[f"ctx:{_SESSION_ID}"])
+    assert stored["screen"] == "PaymentScreen"
+    assert stored["seq"] == 0
+    assert "received_ts" in stored
+
+
+def test_create_session_rejects_an_unknown_screen_context_version_but_still_creates_the_session(
+    client: TestClient, session_manager: _FakeSessionManager, fake_redis: FakeRedis
+) -> None:
+    """An unsupported `v` used to fail the whole `POST /v1/sessions` call
+    (`VALIDATION_UNSUPPORTED_VERSION`, pre-Phase-4-T3). Now it degrades
+    only the screen-context slot: `SnapshotIngestor` rejects it
+    (`REJECTED_ENVELOPE`), nothing is written to `ctx:{session_id}`, but
+    the session itself is created exactly as if `screen_context` had been
+    `null` — the call can still start."""
+    resp = client.post(
+        "/v1/sessions",
+        headers=_AUTH_HEADERS,
+        json=_create_body(screen_context={"v": "screen_context/v9", "screen": "PaymentScreen"}),
+    )
+
+    assert resp.status_code == 201
+    assert session_manager.calls[0]["user_id"] == _MERCHANT_ID
+    assert f"ctx:{_SESSION_ID}" not in fake_redis.strings
+
+
+def test_create_session_accepts_a_schema_invalid_screen_context_without_failing(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    """A supported version marker with a field that fails the full
+    `screen_context.v1.json` schema (`screen` must be a string) is
+    `REJECTED_SCHEMA`, not a request failure — the missing-required-field
+    case `_require_supported_screen_context` never used to check at all,
+    since that placeholder only ever looked at the version marker."""
+    resp = client.post(
+        "/v1/sessions",
+        headers=_AUTH_HEADERS,
+        json=_create_body(
+            screen_context={
+                "v": "screen_context/v1",
+                "screen": 123,
+                "flow": "",
+                "components": [],
+                "last_action": None,
+                "last_api": None,
+                "dirty_fields": [],
+                "loading": False,
+            }
+        ),
+    )
+
+    assert resp.status_code == 201
+    assert f"ctx:{_SESSION_ID}" not in fake_redis.strings
+
+
+def test_create_session_accepts_and_recompresses_an_oversized_screen_context(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    """A screen_context whose serialized size exceeds the 8 KiB check-(b)
+    cap is routed through `ContextCompressor`'s docs/07 §7 drop ladder
+    (`SnapshotIngestor._enforce_size_cap_snapshot`) rather than rejected
+    outright — the ladder's rung 5 drops every non-minimal-role component
+    (`image` is not one of the six survivors), so this specific oversize
+    shape always converges on a schema-valid, well-under-budget IR and
+    the session-create call succeeds with the recompressed snapshot
+    actually stored."""
+    oversized = {
+        "v": "screen_context/v1",
+        "screen": "DashboardScreen",
+        "flow": "",
+        "components": [
+            {"role": "image", "label": f"icon-{n}-" + "x" * 100} for n in range(150)
+        ],
+        "last_action": None,
+        "last_api": None,
+        "dirty_fields": [],
+        "loading": False,
+    }
+    assert len(json.dumps(oversized)) > 8 * 1024  # the fixture really is oversized
+
+    resp = client.post(
+        "/v1/sessions", headers=_AUTH_HEADERS, json=_create_body(screen_context=oversized)
+    )
+
+    assert resp.status_code == 201
+    stored = json.loads(fake_redis.strings[f"ctx:{_SESSION_ID}"])
+    assert stored["components"] == []  # rung 5 dropped every `image` component
 
 
 def test_create_session_rejects_unknown_body_fields(client: TestClient) -> None:
