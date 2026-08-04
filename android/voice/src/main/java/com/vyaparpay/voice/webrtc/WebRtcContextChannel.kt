@@ -55,6 +55,14 @@ import kotlinx.coroutines.CancellationException
  * silent failure — `:voice` carries no logger, so a monotonic counter on the
  * adapter instance is the honest minimum, and it is what
  * `WebRtcContextChannelTest` asserts against.
+ *
+ * Review fix (MEDIUM): that claim was true of the counter and false of the
+ * wiring — `CallController` used to construct this adapter inline and drop the
+ * reference, so nothing outside a unit test could ever read
+ * [droppedFrameCount]. It now retains the instance and re-exposes the count as
+ * `CallController.contextFramesDropped`. The counter is genuinely reachable;
+ * what is still missing is a consumer, which arrives with the call-trigger UI's
+ * `CallViewModel`.
  */
 public class WebRtcContextChannel(
     private val webRtc: WebRtcClient,

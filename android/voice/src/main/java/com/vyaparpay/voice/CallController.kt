@@ -86,6 +86,24 @@ public class CallController(
     /** Non-null between [bindContextPublisher] and [releaseCall]; cancelling it *is* the publisher's `stop()`. */
     private var contextScope: CoroutineScope? = null
 
+    /** Set at [bindContextPublisher] and deliberately never cleared — see [contextFramesDropped]. */
+    private var contextChannel: WebRtcContextChannel? = null
+
+    /**
+     * Context frames the current (or most recent) call gave up on, because the
+     * `ctx` data channel was not OPEN when the publisher tried to ship them —
+     * routine during the docs/06 §6 reconnect grace, and non-zero afterwards
+     * means the agent spent part of the call reasoning about a stale screen.
+     *
+     * `:voice` carries no logger (verified: not one `android.util.Log` call in
+     * the module), so exposing the count is the honest alternative to
+     * pretending it is logged somewhere. Zero when no call has bound a
+     * publisher yet. The intended consumer is the `CallViewModel` that lands
+     * with the call-trigger UI; until then this is the seam that makes the
+     * counter reachable at all rather than test-only.
+     */
+    public val contextFramesDropped: Long get() = contextChannel?.droppedFrameCount ?: 0L
+
     init {
         scope.launch {
             for (event in events) {
@@ -247,7 +265,19 @@ public class CallController(
         )
         contextScope = publisherScope
 
-        publisher.start(WebRtcContextChannel(webRtc), publisherScope)
+        // Retained, not constructed inline (review fix, MEDIUM). The channel
+        // counts frames it had to drop, and [WebRtcContextChannel]'s own kdoc
+        // calls that counter "the observability that keeps this from being a
+        // silent failure" -- but an instance built inline and dropped on the
+        // floor is observable only to its unit test. Holding it here is what
+        // makes [contextFramesDropped] real. Deliberately NOT cleared in
+        // releaseCall(): the count is most interesting *after* the call, and
+        // this adds no retention -- the channel's only field is `webRtc`,
+        // which this controller already holds.
+        val channel = WebRtcContextChannel(webRtc)
+        contextChannel = channel
+
+        publisher.start(channel, publisherScope)
         publisherScope.launch { pumpContextDownlink(publisher) }
     }
 

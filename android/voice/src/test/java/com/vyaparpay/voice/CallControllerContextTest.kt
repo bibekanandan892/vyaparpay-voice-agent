@@ -307,6 +307,34 @@ class CallControllerContextTest {
         assertEquals(listOf("DashboardScreen"), webRtc.sentAsText())
     }
 
+    /**
+     * Review fix (MEDIUM): [WebRtcContextChannel.droppedFrameCount] is
+     * documented as "the observability that keeps this from being a silent
+     * failure", but the adapter used to be constructed inline and discarded,
+     * so in production nothing could ever read it — the counter was live only
+     * inside its own unit test. This asserts the count is reachable from the
+     * controller, which is what makes that documented intent true.
+     */
+    @Test
+    fun `frames dropped while the channel is down are counted and reachable from the controller`() = runTest {
+        val controller = controller()
+        assertEquals(0L, controller.contextFramesDropped)
+
+        driveToInCall(controller)
+        assertEquals(0L, controller.contextFramesDropped)
+
+        webRtc.failSends = true
+        publisher.screenState.value = "PaymentScreen"
+        runCurrent()
+
+        assertEquals(1L, controller.contextFramesDropped)
+
+        // Survives teardown: the count is most interesting after the call.
+        controller.hangUp()
+        runCurrent()
+        assertEquals(1L, controller.contextFramesDropped)
+    }
+
     private companion object {
         private val REQUEST_SNAPSHOT_FRAME =
             """{"v":1,"type":"ctx.request_snapshot","seq":7,"ts":1784536455900,"payload":{"last_good_seq":44}}"""
