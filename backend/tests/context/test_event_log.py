@@ -1,0 +1,100 @@
+"""`EventLog` — RPUSH + LTRIM append-only event timeline (docs/08
+§4.2)."""
+
+from __future__ import annotations
+
+import pytest
+
+from app.context.event_log import EVENTS_MAX_LEN, EventLog
+from app.context.redis_keys import CTX_TTL_SECONDS
+from tests.support.fake_redis import FakeRedis
+
+
+async def test_get_events_is_empty_when_session_absent(event_log: EventLog) -> None:
+    assert await event_log.get_events("sess_1") == []
+
+
+async def test_append_then_get_events_round_trips_in_order(event_log: EventLog) -> None:
+    event_1 = {"type": "nav", "name": "PaymentScreen", "ts": 1, "from": "DashboardScreen"}
+    event_2 = {"type": "tap", "name": "Pay Now", "ts": 2, "screen": "PaymentScreen"}
+
+    await event_log.append("sess_1", event_1)
+    await event_log.append("sess_1", event_2)
+
+    assert await event_log.get_events("sess_1") == [event_1, event_2]
+
+
+async def test_append_uses_the_canon_ctx_events_key(
+    event_log: EventLog, fake_redis: FakeRedis
+) -> None:
+    await event_log.append("sess_1", {"type": "tap", "name": "x", "ts": 1})
+
+    assert "ctx:sess_1:events" in fake_redis.lists
+    assert "ctx:sess_1" not in fake_redis.lists
+
+
+async def test_append_applies_the_60_minute_ctx_ttl(
+    event_log: EventLog, fake_redis: FakeRedis
+) -> None:
+    await event_log.append("sess_1", {"type": "tap", "name": "x", "ts": 1})
+
+    assert fake_redis.ttls["ctx:sess_1:events"] == CTX_TTL_SECONDS
+
+
+async def test_append_trims_to_the_newest_200_entries(event_log: EventLog) -> None:
+    for i in range(EVENTS_MAX_LEN + 10):
+        await event_log.append("sess_1", {"type": "tap", "name": str(i), "ts": i})
+
+    events = await event_log.get_events("sess_1")
+
+    assert len(events) == EVENTS_MAX_LEN
+    # Drop-oldest: the surviving window is the newest EVENTS_MAX_LEN, in order.
+    assert events[0]["name"] == "10"
+    assert events[-1]["name"] == str(EVENTS_MAX_LEN + 9)
+
+
+async def test_append_does_not_trim_under_the_cap(event_log: EventLog) -> None:
+    await event_log.append("sess_1", {"type": "tap", "name": "a", "ts": 1})
+    await event_log.append("sess_1", {"type": "tap", "name": "b", "ts": 2})
+
+    events = await event_log.get_events("sess_1")
+
+    assert [e["name"] for e in events] == ["a", "b"]
+
+
+async def test_get_events_with_limit_returns_only_the_newest_n(event_log: EventLog) -> None:
+    for i in range(5):
+        await event_log.append("sess_1", {"type": "tap", "name": str(i), "ts": i})
+
+    newest_two = await event_log.get_events("sess_1", limit=2)
+
+    assert [e["name"] for e in newest_two] == ["3", "4"]
+
+
+async def test_get_events_with_limit_zero_returns_empty(event_log: EventLog) -> None:
+    await event_log.append("sess_1", {"type": "tap", "name": "a", "ts": 1})
+
+    assert await event_log.get_events("sess_1", limit=0) == []
+
+
+async def test_get_events_with_limit_larger_than_stored_returns_everything(
+    event_log: EventLog,
+) -> None:
+    await event_log.append("sess_1", {"type": "tap", "name": "a", "ts": 1})
+
+    events = await event_log.get_events("sess_1", limit=200)
+
+    assert [e["name"] for e in events] == ["a"]
+
+
+async def test_events_are_scoped_per_session(event_log: EventLog) -> None:
+    await event_log.append("sess_1", {"type": "tap", "name": "a", "ts": 1})
+    await event_log.append("sess_2", {"type": "tap", "name": "b", "ts": 1})
+
+    assert [e["name"] for e in await event_log.get_events("sess_1")] == ["a"]
+    assert [e["name"] for e in await event_log.get_events("sess_2")] == ["b"]
+
+
+async def test_append_rejects_a_colon_in_session_id(event_log: EventLog) -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        await event_log.append("sess:evil", {"type": "tap", "name": "a", "ts": 1})
