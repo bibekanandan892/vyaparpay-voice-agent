@@ -3,22 +3,30 @@ package com.vyaparpay.feature.payments
 import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.node.RootForTest
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vyaparpay.core.screencontext.RawSemanticsNode
 import com.vyaparpay.core.screencontext.ScreenComponent
+import com.vyaparpay.core.screencontext.ScreenComponentRole
 import com.vyaparpay.core.screencontext.SemanticSnapshotBuilder
 import com.vyaparpay.core.screencontext.UiTreeCollector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowDialog
 
 /**
  * The CI canary docs/07-ui-semantic-context.md §2.1's "honesty note" calls
@@ -115,6 +123,94 @@ class UiTreeCollectorPaymentScreenCanaryTest {
         assertTrue("expected a recipient component", recipient != null)
         val cta = ir.components.filterIsInstance<ScreenComponent.PrimaryCta>().singleOrNull()
         assertTrue("expected an enabled primary_cta (canSubmit=true for amountInput=245)", cta?.enabled == true)
+    }
+
+    /**
+     * **Review fix (HIGH-1, independent review of 429f551).** The unit-level
+     * golden test in `:core:screencontext` proves `SemanticSnapshotBuilder`
+     * reconciles dialog-before-snackbar ordering given a hand-built
+     * [RawSemanticsTree]. This test proves the same thing against the REAL
+     * `PaymentScreen`, driven into the actual canonical decline scenario
+     * (both the "Daily Limit Exceeded" dialog AND the "Payment Failed"
+     * snackbar visible at once — [PaymentViewModel.onPaymentDeclined] sets
+     * both in the same state update) — the exact combination the
+     * independent review found nothing in the suite exercised, and the one
+     * where the golden test's OLD hand-arranged fixture (separate
+     * snackbar-as-its-own-root, ordered last) would have silently matched
+     * the canonical output even if the production reorder logic were wrong
+     * or missing.
+     *
+     * Two real [RootForTest] windows exist once the dialog is up: the main
+     * activity window (found the same way the test above does) and the
+     * `AlertDialog`'s own window (a real `android.app.Dialog` under
+     * Robolectric — [ShadowDialog.getLatestDialog] is the standard
+     * Robolectric mechanism for reaching it, since it is not reachable via
+     * `activity.window.decorView`). Both are attached to a fresh
+     * [UiTreeCollector] in the same order production does — main first (it
+     * never detaches while the screen is up), dialog second (it attaches
+     * only once `state.declineDialog` becomes non-null) — so this test's
+     * raw traversal order is the REAL one docs/07 §5 rule 5's kdoc (on
+     * `reconcileDialogBeforeSnackbar`) describes, not a fixture shortcut.
+     */
+    @Test
+    fun `a real dialog-plus-snackbar decline capture orders the dialog immediately before the snackbar`() {
+        val viewModel = PaymentViewModel(payments = SeededPaymentRepository())
+
+        composeTestRule.setContent {
+            val state by viewModel.state.collectAsStateWithLifecycle()
+            PaymentScreen(
+                state = state,
+                events = viewModel.events,
+                onAmountChanged = viewModel::onAmountChanged,
+                onPayNowClicked = viewModel::onPayNowClicked,
+                onDismissDialog = viewModel::onDeclineDialogDismissed,
+                onSnackbarShown = viewModel::onSnackbarShown,
+            )
+        }
+
+        // Rajesh's canonical over-limit amount (docs/01 §7 step 1) -- both
+        // the decline dialog AND the snackbar land in the same state update
+        // (PaymentViewModel.onPaymentDeclined).
+        composeTestRule.onNodeWithTag("amount_input").performTextInput("245")
+        composeTestRule.onNodeWithTag(PAY_NOW_TEST_TAG).performClick()
+        composeTestRule.waitForIdle()
+
+        val mainRoot = findRootForTest(composeTestRule.activity.window.decorView)
+            ?: error("No RootForTest found in the main activity window.")
+        val dialogWindow = ShadowDialog.getLatestDialog()
+            ?: error(
+                "No dialog window found via ShadowDialog -- the decline dialog should be " +
+                    "showing at this point (typing 245 and tapping Pay Now always declines, " +
+                    "per SeededPaymentRepository's daily-limit fixture).",
+            )
+        val dialogRoot = findRootForTest(dialogWindow.window!!.decorView)
+            ?: error("The dialog window was found, but no RootForTest inside it -- did AlertDialog's own internals change?")
+
+        // Real attach order: main root first (attached when the screen first
+        // composed), dialog root second (attached once state.declineDialog
+        // became non-null) -- UiTreeCollector.attachedRoots' documented
+        // contract.
+        val collector = UiTreeCollector(scope = CoroutineScope(Dispatchers.Unconfined))
+        collector.attachRoot(mainRoot)
+        collector.attachRoot(dialogRoot)
+        val tree = runBlocking { collector.tree.first() }
+
+        val ir = SemanticSnapshotBuilder.build(
+            tree = tree,
+            screen = "PaymentScreen",
+            flow = "vendor_payment",
+            recentEvents = emptyList(),
+        )
+
+        val dialogIndex = ir.components.indexOfFirst { it.role == ScreenComponentRole.DIALOG }
+        val snackbarIndex = ir.components.indexOfFirst { it.role == ScreenComponentRole.SNACKBAR }
+        assertTrue("expected a dialog component, roles were ${ir.components.map { it.role }}", dialogIndex >= 0)
+        assertTrue("expected a snackbar component, roles were ${ir.components.map { it.role }}", snackbarIndex >= 0)
+        assertEquals(
+            "the dialog must land immediately before the snackbar, matching docs/07 §3's canonical example",
+            snackbarIndex,
+            dialogIndex + 1,
+        )
     }
 
     private fun allTestTags(node: RawSemanticsNode): List<String> =

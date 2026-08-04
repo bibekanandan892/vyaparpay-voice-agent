@@ -46,6 +46,52 @@ public object SemanticSnapshotBuilder {
     private val PAN_LIKE = Regex("""\b[A-Z]{5}[0-9]{4}[A-Z]\b""")
     private val AADHAAR_LIKE = Regex("""\b(?:\d[ -]?){12}\b""")
 
+    /**
+     * **Review fix (CRITICAL 2, independent review of 429f551).** docs/07 §5
+     * rule 6 names five sensitive classes verbatim — "card number, CVV, PIN,
+     * Aadhaar, PAN" — and the three regexes above cover exactly three of
+     * them. CVV (3-4 digits) and PIN (4-6 digits) had zero backstop
+     * coverage: neither shape reaches 12 digits (Aadhaar's floor) or 13
+     * (card number's floor).
+     *
+     * **Judgment call, and why this is a labeled-context match, not a bare
+     * digit-count match.** A bare `^\d{3,6}$` pattern is a materially
+     * different bet than the three regexes above: `CARD_NUMBER_LIKE`/
+     * `PAN_LIKE`/`AADHAAR_LIKE` all key on a digit RUN long/shaped enough
+     * that an innocuous false positive is rare (13-19 digits, or a PAN's
+     * letter-digit-letter shape). A 3-6 digit span has no such rarity — it
+     * is a list index, a quantity, an OTP resend countdown, an item count
+     * ("3 of 47 settlement batches", docs/07 §8's own worked failure-mode
+     * example), or literally any small integer displayed anywhere in a
+     * fintech app. Redacting every such span on sight would make the IR
+     * noisy with false `[REDACTED]`s on completely ordinary screens — a
+     * real cost, not a free conservative choice, unlike the other three
+     * patterns. So this backstop only fires when the anchor's OWN merged
+     * text (its label parts, or its testTag) names the field as a PIN/CVV/
+     * OTP/security-code field — "likely in a labeled context," which is how
+     * every real PIN/CVV entry field actually renders (an `OutlinedTextField`
+     * with a "PIN" or "CVV" label is the realistic shape; a bare unlabeled
+     * 4-digit number is not this component at all, most of the time).
+     *
+     * **Given that trade-off, PIN/CVV protection leans primarily on the
+     * `_sensitive` testTag suffix / `IsSensitiveData` marker
+     * (`anchor.node.isSensitive`, checked first in [isSensitive] below and
+     * short-circuiting independently of this pattern), not on this regex.**
+     * The marker is authoritative and unconditional — CRITICAL-1's fix
+     * (this file, `extractState`) now routes every role's label and value
+     * through it, not just the two roles with `editableText` — while this
+     * pattern is a narrow, labeled-context-only backstop for the case where
+     * a screen author forgot the marker but still wrote a recognizable
+     * label. A lint rule that makes the `_sensitive` marker mandatory on
+     * PIN/CVV-shaped fields would close the remaining gap (an unmarked,
+     * unlabeled PIN field) more reliably than any regex could — out of
+     * scope for this fix (the review that raised this flagged it as a
+     * follow-up idea, not a requirement here).
+     */
+    private val PIN_LIKE = Regex("^\\d{4,6}$")
+    private val CVV_LIKE = Regex("^\\d{3,4}$")
+    private val PIN_OR_CVV_LABELED_CONTEXT = Regex("""(?i)\b(pin|cvv|cvc|otp|security[ _-]?code)\b""")
+
     private val CURRENCY_SYMBOL_ONLY = Regex("^[₹$€£¥]$")
 
     public fun build(
@@ -55,7 +101,8 @@ public object SemanticSnapshotBuilder {
         recentEvents: List<AppEvent>,
     ): ScreenContextIr {
         val anchors = tree.roots.flatMap { SemanticsTreeMerger.merge(it) } // rules 1-3
-        val components = anchors.map(::extractState) // rule 4 (+ rule 6 inline)
+        val extracted = anchors.map(::extractState) // rule 4 (+ rule 6 inline)
+        val components = reconcileDialogBeforeSnackbar(extracted) // rule 5's real-windowing fix, see kdoc below
         val ranked = rankAndCap(components) // rule 5
         return ScreenContextIr(
             screen = screen,
@@ -70,66 +117,95 @@ public object SemanticSnapshotBuilder {
 
     // -- Rule 4: extract state (+ rule 6: redact/normalize at source) -------
 
+    /**
+     * **Review fix (CRITICAL 1, independent review of 429f551).** Every
+     * branch below routes its `label` AND `value` through
+     * [redactedOrNormalized], not just the two roles ([AMOUNT_FIELD],
+     * [TEXT_FIELD]) that happen to carry `editableText`. The original
+     * version only redaction-checked those two, so a node whose testTag
+     * prefix-matches to [RECIPIENT] (or any of the other fourteen roles) via
+     * [TestTagRoles.roleFor] shipped its value — and label — through plain
+     * [normalize] with no sensitivity check at all, regardless of
+     * `anchor.node.isSensitive`. Concrete failure this closes: a screen
+     * tags a field `vendor_account_number_sensitive`; the `vendor_` prefix
+     * resolves it to [RECIPIENT] before sensitivity is ever consulted, so an
+     * account number would ship unredacted. `isSensitive` can in principle
+     * apply to any text the tree exposes — a dialog message, a list item, a
+     * status label — not only the two roles that happen to be editable
+     * fields, so every role's label and value now goes through the same
+     * check uniformly.
+     *
+     * One consequence, accepted deliberately: [MergedAnchor] carries a
+     * single `node` reference, so `anchor.node.isSensitive` is an
+     * anchor-level flag, not a per-text-run one. When a screen author flags
+     * the *anchor* node sensitive (e.g. the `recipient_row` itself, not just
+     * its editable value), every string derived from that anchor — its
+     * label included — redacts, even an otherwise-innocuous label like
+     * "To". That is over-redaction, not under-redaction: the same
+     * asymmetric-risk call already documented on the backstop regexes below
+     * ("false positives here cost a redacted label; false negatives leak
+     * PII") applies here too.
+     */
     private fun extractState(anchor: MergedAnchor): ScreenComponent = when (anchor.role) {
         ScreenComponentRole.AMOUNT_FIELD -> {
             val (label, value) = splitCurrencyLabelAndValue(anchor)
             ScreenComponent.AmountField(
-                label = normalize(label),
+                label = redactedOrNormalized(anchor, label),
                 value = redactedOrNormalized(anchor, value),
                 focused = anchor.node.focused,
             )
         }
         ScreenComponentRole.RECIPIENT -> ScreenComponent.Recipient(
-            label = normalize(anchor.textParts.getOrNull(0).orEmpty()),
-            value = normalize(anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
+            label = redactedOrNormalized(anchor, anchor.textParts.getOrNull(0).orEmpty()),
+            value = redactedOrNormalized(anchor, anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
         )
         ScreenComponentRole.PRIMARY_CTA -> ScreenComponent.PrimaryCta(
-            label = normalize(primaryLabel(anchor)),
+            label = redactedOrNormalized(anchor, primaryLabel(anchor)),
             enabled = anchor.node.enabled,
         )
         ScreenComponentRole.SECONDARY_CTA -> ScreenComponent.SecondaryCta(
-            label = normalize(primaryLabel(anchor)),
+            label = redactedOrNormalized(anchor, primaryLabel(anchor)),
             enabled = anchor.node.enabled,
         )
         ScreenComponentRole.TEXT_FIELD -> ScreenComponent.TextField(
-            label = normalize(anchor.textParts.joinToString(" ")),
+            label = redactedOrNormalized(anchor, anchor.textParts.joinToString(" ")),
             value = redactedOrNormalized(anchor, anchor.editableText.orEmpty()),
             focused = anchor.node.focused,
         )
         ScreenComponentRole.LIST -> ScreenComponent.ListComponent(
-            label = normalize(primaryLabel(anchor)),
+            label = redactedOrNormalized(anchor, primaryLabel(anchor)),
             visibleCount = 0, // filled in by rankAndCap's caller — see listVisibleCounts
             totalCount = anchor.node.collectionInfo?.totalCount ?: 0,
         )
         ScreenComponentRole.LIST_ITEM -> ScreenComponent.ListItem(
-            label = normalize(anchor.textParts.getOrNull(0).orEmpty()),
-            value = normalize(anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
+            label = redactedOrNormalized(anchor, anchor.textParts.getOrNull(0).orEmpty()),
+            value = redactedOrNormalized(anchor, anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
         )
         ScreenComponentRole.DIALOG -> ScreenComponent.Dialog(
-            label = normalize(anchor.node.paneTitle ?: anchor.textParts.firstOrNull().orEmpty()),
+            label = redactedOrNormalized(anchor, anchor.node.paneTitle ?: anchor.textParts.firstOrNull().orEmpty()),
         )
-        ScreenComponentRole.SNACKBAR -> ScreenComponent.Snackbar(label = normalize(primaryLabel(anchor)))
+        ScreenComponentRole.SNACKBAR -> ScreenComponent.Snackbar(label = redactedOrNormalized(anchor, primaryLabel(anchor)))
         ScreenComponentRole.TAB -> ScreenComponent.Tab(
-            label = normalize(primaryLabel(anchor)),
+            label = redactedOrNormalized(anchor, primaryLabel(anchor)),
             selected = anchor.node.selected ?: false,
         )
         ScreenComponentRole.TOGGLE -> ScreenComponent.Toggle(
-            label = normalize(primaryLabel(anchor)),
+            label = redactedOrNormalized(anchor, primaryLabel(anchor)),
             on = anchor.node.toggleableState == RawToggleableState.ON,
             enabled = anchor.node.enabled,
         )
         ScreenComponentRole.BALANCE_DISPLAY -> ScreenComponent.BalanceDisplay(
-            label = normalize(anchor.textParts.getOrNull(0).orEmpty()),
-            value = normalize(anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
+            label = redactedOrNormalized(anchor, anchor.textParts.getOrNull(0).orEmpty()),
+            value = redactedOrNormalized(anchor, anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
         )
         ScreenComponentRole.STATUS_BADGE -> ScreenComponent.StatusBadge(
-            label = normalize(anchor.textParts.getOrNull(0).orEmpty()),
-            value = normalize(anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
+            label = redactedOrNormalized(anchor, anchor.textParts.getOrNull(0).orEmpty()),
+            value = redactedOrNormalized(anchor, anchor.textParts.getOrNull(1) ?: anchor.editableText.orEmpty()),
         )
-        ScreenComponentRole.ERROR_BANNER -> ScreenComponent.ErrorBanner(label = normalize(primaryLabel(anchor)))
-        ScreenComponentRole.ALERT_BANNER -> ScreenComponent.AlertBanner(label = normalize(primaryLabel(anchor)))
+        ScreenComponentRole.ERROR_BANNER -> ScreenComponent.ErrorBanner(label = redactedOrNormalized(anchor, primaryLabel(anchor)))
+        ScreenComponentRole.ALERT_BANNER -> ScreenComponent.AlertBanner(label = redactedOrNormalized(anchor, primaryLabel(anchor)))
         ScreenComponentRole.IMAGE -> ScreenComponent.Image(
-            label = normalize(anchor.node.contentDescription.firstOrNull() ?: primaryLabel(anchor)),
+            label = redactedOrNormalized(anchor, anchor.node.contentDescription.firstOrNull() ?: primaryLabel(anchor)),
         )
     }
 
@@ -166,7 +242,16 @@ public object SemanticSnapshotBuilder {
         anchor.node.isSensitive ||
             CARD_NUMBER_LIKE.containsMatchIn(value) ||
             PAN_LIKE.containsMatchIn(value) ||
-            AADHAAR_LIKE.containsMatchIn(value)
+            AADHAAR_LIKE.containsMatchIn(value) ||
+            isPinOrCvvInLabeledContext(anchor, value)
+
+    /** See [PIN_LIKE]'s kdoc for why this backstop is context-gated rather than a bare digit-count match. */
+    private fun isPinOrCvvInLabeledContext(anchor: MergedAnchor, value: String): Boolean {
+        val trimmed = value.trim()
+        if (!PIN_LIKE.matches(trimmed) && !CVV_LIKE.matches(trimmed)) return false
+        val context = anchor.textParts.joinToString(" ") + " " + anchor.node.testTag.orEmpty()
+        return PIN_OR_CVV_LABELED_CONTEXT.containsMatchIn(context)
+    }
 
     private fun normalize(text: String): String {
         val stripped = CONTROL_OR_ZERO_WIDTH.replace(text, "")
@@ -174,6 +259,67 @@ public object SemanticSnapshotBuilder {
     }
 
     // -- Rule 5: rank and cap -------------------------------------------------
+
+    /**
+     * **Review fix (HIGH 1, independent review of 429f551).** A narrow
+     * reorder guard, not a full re-sort: if a `dialog`/`error_banner` (tier
+     * 1) component is anywhere AFTER the first `snackbar` (tier 2) in
+     * traversal order, it is moved to sit immediately before that snackbar.
+     * Everything else's relative order is untouched.
+     *
+     * **Why this exists.** docs/07 §3's canonical example orders
+     * `[amount_field, recipient, primary_cta, dialog, snackbar]` — dialog
+     * before snackbar. But a REAL capture of `PaymentScreen`'s decline
+     * scenario does not produce that order from plain traversal: `Snackbar`
+     * renders in-tree, inside the screen's own root `Box` (`PaymentScreen.kt`)
+     * — the LAST sibling after the `Scaffold` content — while `AlertDialog`
+     * opens a genuinely separate Compose window (Material3's `AlertDialog`
+     * builds on `androidx.compose.ui.window.Dialog`), attached to
+     * `UiTreeCollector.attachedRoots` only once `state.declineDialog` becomes
+     * non-null, i.e. AFTER the main root. `build` walks
+     * `tree.roots.flatMap { merge(it) }` — the main root's ENTIRE subtree
+     * (ending in the snackbar) before the dialog root — so the raw,
+     * unguarded traversal order for a real capture is `[..., snackbar,
+     * dialog]`, the reverse of the documented canonical example. An
+     * independent review of this file's first version traced this exactly:
+     * the original golden-test fixture modeled the snackbar as its OWN
+     * separate root, deliberately ordered last (`[main, dialog, snackbar]`),
+     * which happened to already match the canonical JSON but is not the
+     * topology a real capture produces (see
+     * `SemanticSnapshotBuilderTest.paymentScreenTree`'s corrected kdoc, and
+     * `UiTreeCollectorPaymentScreenCanaryTest`'s new real-screen case, both
+     * updated alongside this fix).
+     *
+     * **Why a targeted guard, not a full tier re-sort.** Rule 5's own text —
+     * "order components by support-relevance, THEN truncate to 20" — reads
+     * as a global sort, but [rankAndCap]'s own kdoc (below) already
+     * establishes, and this review re-confirmed against the real screen,
+     * that a full re-sort would ALSO reorder fields and the CTA relative to
+     * each other — contradicting the canonical example's OTHER ordering
+     * (fields, then CTA, in plain traversal order), which a real capture
+     * already reproduces correctly on its own. Only the dialog/snackbar pair
+     * has a real-vs-documented mismatch, caused specifically by Compose's
+     * separate-window dialog mechanics; only that pair gets corrected here,
+     * and it runs once, on the full traversal-order list, before [rankAndCap]
+     * so the 20-component cap's tie-breaking sees the corrected order too.
+     */
+    private fun reconcileDialogBeforeSnackbar(components: List<ScreenComponent>): List<ScreenComponent> {
+        val snackbarIndex = components.indexOfFirst { it.role == ScreenComponentRole.SNACKBAR }
+        if (snackbarIndex == -1) return components
+
+        val interruptionIndex = components.withIndex()
+            .firstOrNull { (index, component) ->
+                index > snackbarIndex &&
+                    (component.role == ScreenComponentRole.DIALOG || component.role == ScreenComponentRole.ERROR_BANNER)
+            }
+            ?.index
+            ?: return components
+
+        val reordered = components.toMutableList()
+        val interruption = reordered.removeAt(interruptionIndex)
+        reordered.add(snackbarIndex, interruption)
+        return reordered
+    }
 
     /**
      * docs/07 §5 rule 5's six tiers, used ONLY as a retention priority when
@@ -198,11 +344,26 @@ public object SemanticSnapshotBuilder {
      * still returned in their *original* traversal-order positions, not
      * grouped by tier. `SemanticSnapshotBuilderTest` exercises the over-cap
      * path explicitly since the golden fixture alone cannot.
+     *
+     * **Review fix (HIGH 2, independent review of 429f551).** Truncation now
+     * runs BEFORE [fillListVisibleCounts], not after. The original order
+     * computed `visible_count` against the full, pre-cap `components` list,
+     * so when the 20-component structural cap (not the separate
+     * token-budget [DropLadder]) is what ends up dropping trailing
+     * `list_item`s, the `list` component's `visible_count` kept counting
+     * items that no longer exist in the truncated output — a real desync
+     * between the field and the array a consumer would actually iterate.
+     * [tierOf] and the truncation algorithm below branch only on component
+     * TYPE (`is ScreenComponent.ListComponent`/`.ListItem`, etc.), never on
+     * `visibleCount`'s value, so reordering the two passes is safe: nothing
+     * upstream of [fillListVisibleCounts] depended on it running first.
      */
-    private fun rankAndCap(components: List<ScreenComponent>): List<ScreenComponent> {
-        val withCounts = fillListVisibleCounts(components)
-        if (withCounts.size <= MAX_COMPONENTS) return withCounts
-        val indexed = withCounts.withIndex().toList()
+    private fun rankAndCap(components: List<ScreenComponent>): List<ScreenComponent> =
+        fillListVisibleCounts(truncateToCap(components))
+
+    private fun truncateToCap(components: List<ScreenComponent>): List<ScreenComponent> {
+        if (components.size <= MAX_COMPONENTS) return components
+        val indexed = components.withIndex().toList()
         val survivingIndices = indexed
             .sortedWith(compareBy({ tierOf(it.value) }, { it.index }))
             .take(MAX_COMPONENTS)
@@ -215,10 +376,19 @@ public object SemanticSnapshotBuilder {
      * `list`'s `visible_count` is the count of `list_item`s that immediately
      * follow it in traversal order (schema convention: containment is
      * positional, not a parent-id field — see `screen_context.v1.json`'s own
-     * `list_item_component` description). Computed here, before rank/cap or
-     * the drop ladder touch anything, so it reflects what Compose actually
-     * realized (a `LazyColumn` only composes on-screen items), not any
-     * truncation this builder itself performs afterward.
+     * `list_item_component` description).
+     *
+     * **Review fix (HIGH 2, independent review of 429f551).** This now runs
+     * AFTER [truncateToCap], not before — see [rankAndCap]'s kdoc for why the
+     * original before-cap ordering let `visible_count` overstate what
+     * actually survives in `components` whenever the 20-component structural
+     * cap truncates trailing `list_item`s. Out of scope for this fix: the
+     * [DropLadder]'s own rung 1 (`list_item`s beyond the top 3 per list) is a
+     * separate, later, token-budget-driven truncation that operates on the
+     * already-serialized JSON and does not re-derive `visible_count` either —
+     * a pre-existing characteristic of that stage, inherited from mirroring
+     * the backend `ContextCompressor`'s own rung 1 (see [DropLadder]'s kdoc),
+     * not something this review flagged or this fix touches.
      */
     private fun fillListVisibleCounts(components: List<ScreenComponent>): List<ScreenComponent> {
         val out = components.toMutableList()

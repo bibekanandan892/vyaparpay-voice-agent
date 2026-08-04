@@ -55,16 +55,26 @@ class SemanticSnapshotBuilderTest {
      * recipient" chevron child; a decorative interop placeholder (rule 1
      * prune); an unmappable "Navigate up" back button + screen heading
      * (rule 1/3 prune, proving neither leaks into a sibling); the Pay Now
-     * CTA. The dialog and snackbar are modeled as their own separate roots
-     * in [RawSemanticsTree.roots] — see the class kdoc on
-     * [SemanticSnapshotBuilder]'s `rankAndCap` for why component order is
-     * traversal order, and why this fixture's root ordering is deliberately
-     * `[main, dialog, snackbar]` to reproduce the canonical fixture's given
-     * order (this is a fixture-construction choice, not a claim that a real
-     * UiTreeCollector walk of the actual PaymentScreen composable — where
-     * the Snackbar composable is an in-tree sibling, not a separate window —
-     * would necessarily produce the same root ordering; see that kdoc for
-     * the full reasoning).
+     * CTA.
+     *
+     * **Corrected topology (HIGH-1 fix, independent review of 429f551).**
+     * This fixture used to model the snackbar as its OWN separate root,
+     * placed last in [RawSemanticsTree.roots] — `[main, dialog, snackbar]` —
+     * purely to reproduce the canonical fixture's given component order. The
+     * review traced through the REAL `PaymentScreen.kt` and found that is
+     * not how Compose actually windows these two: `Snackbar` renders
+     * in-tree, as the last sibling inside the screen's own root `Box`
+     * (alongside `Scaffold`), while `AlertDialog` opens a genuinely separate
+     * window, attached to `UiTreeCollector.attachedRoots` only after the
+     * main root. The real topology is therefore `[main root (ending in the
+     * in-tree snackbar), dialog root]` — snackbar attached to the SAME root
+     * as the fields/CTA, dialog as its own later root — which is what this
+     * fixture now builds. Naively walked, that topology produces `[...,
+     * snackbar, dialog]` (the reverse of the canonical example);
+     * [SemanticSnapshotBuilder.build]'s `reconcileDialogBeforeSnackbar` (the
+     * HIGH-1 fix) is what reconciles it back to `[..., dialog, snackbar]`
+     * before this test's assertions ever see it — so this fixture, unlike
+     * before, exercises that guard rather than sidestepping it.
      */
     private fun paymentScreenTree(): RawSemanticsTree {
         val backButton = RawSemanticsNode(
@@ -111,12 +121,22 @@ class SemanticSnapshotBuilderTest {
             hasOnClick = true,
         )
 
+        // In-tree, real topology (see class kdoc above): the Snackbar is a
+        // sibling of screenRoot inside PaymentScreen's own Box, the LAST
+        // element under the main root — not a separate root.
+        val snackbarNode = RawSemanticsNode(
+            id = 119,
+            testTag = "payment_snackbar",
+            liveRegion = RawLiveRegion.POLITE,
+            textRuns = listOf("Payment Failed"),
+        )
+
         val screenRoot = RawSemanticsNode(
             id = 47,
             testTag = "payment_screen_root", // present, but resolves via TestTagRoles to UNRESOLVED — an unmappable ancestor, not an accident
             children = listOf(headerRow, amountField, currency, amountLabel, recipient, interopPlaceholder, payNowCta),
         )
-        val mainRoot = RawSemanticsNode(id = 1, children = listOf(screenRoot))
+        val mainRoot = RawSemanticsNode(id = 1, children = listOf(screenRoot, snackbarNode))
 
         val dialogBody = RawSemanticsNode(id = 132, textRuns = listOf("Your daily transaction limit has been reached."))
         val dialogRoot = RawSemanticsNode(
@@ -127,14 +147,11 @@ class SemanticSnapshotBuilderTest {
             children = listOf(dialogBody),
         )
 
-        val snackbarRoot = RawSemanticsNode(
-            id = 119,
-            testTag = "payment_snackbar",
-            liveRegion = RawLiveRegion.POLITE,
-            textRuns = listOf("Payment Failed"),
-        )
-
-        return RawSemanticsTree(roots = listOf(mainRoot, dialogRoot, snackbarRoot))
+        // Attach order: main root first (never detached while the screen is
+        // on-screen), dialog root second (attached once state.declineDialog
+        // becomes non-null) — matching UiTreeCollector.attachedRoots' real
+        // attach-order contract (RawSemanticsTree.kt's own kdoc).
+        return RawSemanticsTree(roots = listOf(mainRoot, dialogRoot))
     }
 
     /** docs/08 §2.4's own worked timeline for this exact incident, newest-first (matching `EventTracker.recent()`). */
@@ -216,6 +233,78 @@ class SemanticSnapshotBuilderTest {
         assertEquals(ScreenComponentRole.DIALOG, ir.components.last().role)
     }
 
+    @Test
+    fun `a dialog that traverses after a snackbar is moved to immediately before it`() {
+        // HIGH-1 fix (independent review of 429f551): a real capture of a
+        // screen where the dialog is a separate, later-attached root and the
+        // snackbar is in-tree produces raw traversal order [..., snackbar,
+        // dialog] -- reconcileDialogBeforeSnackbar must correct that to
+        // [..., dialog, snackbar] to match docs/07 §3's canonical example.
+        // Modeled directly here (not via paymentScreenTree()) so this guard
+        // has its own unit-level proof, independent of the golden fixture.
+        val cta = RawSemanticsNode(id = 1, testTag = "pay_now_cta", role = RawRole.BUTTON, hasOnClick = true, textRuns = listOf("Pay Now"))
+        val snackbarNode = RawSemanticsNode(id = 2, testTag = "payment_snackbar", liveRegion = RawLiveRegion.POLITE, textRuns = listOf("Payment Failed"))
+        val mainRoot = RawSemanticsNode(id = 0, children = listOf(cta, snackbarNode))
+        val dialogRoot = RawSemanticsNode(id = 3, isDialog = true, paneTitle = "Daily Limit Exceeded")
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(mainRoot, dialogRoot)), "PaymentScreen", "vendor_payment", emptyList())
+
+        assertEquals(
+            listOf(ScreenComponentRole.PRIMARY_CTA, ScreenComponentRole.DIALOG, ScreenComponentRole.SNACKBAR),
+            ir.components.map { it.role },
+        )
+    }
+
+    @Test
+    fun `an error_banner that traverses after a snackbar is also moved to immediately before it`() {
+        // The same guard covers error_banner, not just dialog (both are tier 1).
+        val snackbarNode = RawSemanticsNode(id = 1, testTag = "payment_snackbar", liveRegion = RawLiveRegion.POLITE, textRuns = listOf("Payment Failed"))
+        val errorBanner = RawSemanticsNode(id = 2, liveRegion = RawLiveRegion.ASSERTIVE, textRuns = listOf("Network unreachable"))
+        val root = RawSemanticsNode(id = 0, children = listOf(snackbarNode, errorBanner))
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(root)), "Screen", "flow", emptyList())
+
+        assertEquals(
+            listOf(ScreenComponentRole.ERROR_BANNER, ScreenComponentRole.SNACKBAR),
+            ir.components.map { it.role },
+        )
+    }
+
+    @Test
+    fun `a dialog that already precedes the snackbar is left untouched`() {
+        val dialog = RawSemanticsNode(id = 1, isDialog = true, paneTitle = "Daily Limit Exceeded")
+        val snackbarNode = RawSemanticsNode(id = 2, testTag = "payment_snackbar", liveRegion = RawLiveRegion.POLITE, textRuns = listOf("Payment Failed"))
+        val root = RawSemanticsNode(id = 0, children = listOf(dialog, snackbarNode))
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(root)), "Screen", "flow", emptyList())
+
+        assertEquals(listOf(ScreenComponentRole.DIALOG, ScreenComponentRole.SNACKBAR), ir.components.map { it.role })
+    }
+
+    @Test
+    fun `list visible_count reflects the truncated list_items, not the pre-truncation count`() {
+        // HIGH-2 fix (independent review of 429f551): fillListVisibleCounts
+        // must run AFTER the 20-component structural cap, not before, or
+        // visible_count overstates what actually survives in `components`.
+        val cta = RawSemanticsNode(id = 0, testTag = "pay_now_cta", role = RawRole.BUTTON, hasOnClick = true, textRuns = listOf("Pay Now"))
+        val items = (1..25).map { i -> RawSemanticsNode(id = i + 1, isListItem = true, textRuns = listOf("Batch $i")) }
+        val list = RawSemanticsNode(id = 1, collectionInfo = RawCollectionInfo(totalCount = 25), children = items)
+        val root = RawSemanticsNode(id = 100, children = listOf(cta, list))
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(root)), "Screen", "flow", emptyList())
+
+        assertEquals(20, ir.components.size)
+        val survivingItemCount = ir.components.count { it.role == ScreenComponentRole.LIST_ITEM }
+        assertTrue("expected some list_items to have been dropped by the cap", survivingItemCount < 25)
+        val listComponent = ir.components.filterIsInstance<ScreenComponent.ListComponent>().single()
+        assertEquals(
+            "visible_count must match what actually survived truncation, not the pre-truncation count",
+            survivingItemCount,
+            listComponent.visibleCount,
+        )
+        assertEquals(25, listComponent.totalCount) // total_count is unaffected -- it comes straight from CollectionInfo
+    }
+
     // -- Rule 6: redact at source ------------------------------------------
 
     @Test
@@ -237,6 +326,123 @@ class SemanticSnapshotBuilderTest {
 
         val field = ir.components.single() as ScreenComponent.TextField
         assertEquals("[REDACTED]", field.value)
+    }
+
+    // CRITICAL-1 fix (independent review of 429f551): the two tests above
+    // both happen to resolve to TEXT_FIELD, the one role that was already
+    // redaction-checked before this fix — passing tests alone did not prove
+    // redaction was safe across the other fourteen roles. These three cover
+    // the review's concrete failure scenario and the two other role shapes
+    // (a single-node label+value pair, and a message-only role) it named.
+
+    @Test
+    fun `a RECIPIENT resolved via the vendor_ prefix redacts a sensitive account number`() {
+        // The review's concrete failure: a field tagged
+        // vendor_account_number_sensitive prefix-matches TestTagRoles.roleFor
+        // to RECIPIENT (not TEXT_FIELD) before sensitivity is ever
+        // consulted. Before the fix, RECIPIENT's value went through plain
+        // normalize() with no redaction check at all.
+        val label = RawSemanticsNode(id = 2, textRuns = listOf("Account"))
+        val value = RawSemanticsNode(id = 3, textRuns = listOf("1234567890123456"))
+        val recipientRow = RawSemanticsNode(
+            id = 1,
+            testTag = "vendor_account_number_sensitive",
+            hasOnClick = true,
+            isSensitive = true,
+            children = listOf(label, value),
+        )
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(recipientRow)), "Screen", "flow", emptyList())
+
+        val recipient = ir.components.single() as ScreenComponent.Recipient
+        assertEquals(ScreenComponentRole.RECIPIENT, recipient.role)
+        assertEquals("[REDACTED]", recipient.value)
+    }
+
+    @Test
+    fun `a DIALOG label is redacted when the dialog body itself reveals a card number`() {
+        // dialog carries only a `label` (no separate value field), so a
+        // message-shaped role must have ITS label redaction-checked too --
+        // not just roles with a distinct editable value.
+        val dialogBody = RawSemanticsNode(id = 2, textRuns = listOf("Card 4111111111111111 was declined"))
+        val dialogRoot = RawSemanticsNode(id = 1, isDialog = true, children = listOf(dialogBody))
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(dialogRoot)), "Screen", "flow", emptyList())
+
+        val dialog = ir.components.single() as ScreenComponent.Dialog
+        assertEquals("[REDACTED]", dialog.label)
+    }
+
+    @Test
+    fun `a LIST_ITEM value is redacted when it looks like a card number`() {
+        val itemLabel = RawSemanticsNode(id = 3, textRuns = listOf("Vendor account"))
+        val itemValue = RawSemanticsNode(id = 4, textRuns = listOf("4111111111111111"))
+        val listItem = RawSemanticsNode(id = 2, isListItem = true, children = listOf(itemLabel, itemValue))
+        val list = RawSemanticsNode(id = 1, collectionInfo = RawCollectionInfo(totalCount = 1), children = listOf(listItem))
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(list)), "Screen", "flow", emptyList())
+
+        val item = ir.components.filterIsInstance<ScreenComponent.ListItem>().single()
+        assertEquals("Vendor account", item.label) // the label itself is not sensitive-shaped -- only the value is
+        assertEquals("[REDACTED]", item.value)
+    }
+
+    // CRITICAL-2 fix (independent review of 429f551): docs/07 §5 rule 6 also
+    // names CVV and PIN, which had zero backstop regex coverage. See
+    // PIN_LIKE's kdoc for why the backstop is context-gated (label/testTag
+    // must name the field a PIN/CVV/OTP) rather than a bare digit-count
+    // match, and why the `_sensitive` marker remains the primary defense.
+
+    @Test
+    fun `a 4-digit value is redacted when its own label names it a PIN`() {
+        val pinField = RawSemanticsNode(id = 1, textRuns = listOf("PIN"), editableText = "1234")
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(pinField)), "Screen", "flow", emptyList())
+
+        // Resolves via the amount_field bare-digit heuristic (RoleMapper's
+        // CURRENCY_LIKE fallback matches any short bare digit run) -- role
+        // resolution is a separate concern from CRITICAL-2; what matters
+        // here is that whichever role it lands in, the value redacts.
+        val value = (ir.components.single() as ScreenComponent.AmountField).value
+        assertEquals("[REDACTED]", value)
+    }
+
+    @Test
+    fun `a 3-digit value is redacted when its own label names it a CVV`() {
+        val cvvField = RawSemanticsNode(id = 1, textRuns = listOf("CVV"), editableText = "123")
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(cvvField)), "Screen", "flow", emptyList())
+
+        val value = (ir.components.single() as ScreenComponent.AmountField).value
+        assertEquals("[REDACTED]", value)
+    }
+
+    @Test
+    fun `a short digit value with no PIN or CVV context is NOT redacted`() {
+        // The false-positive guard PIN_LIKE's kdoc documents: an ordinary
+        // 4-digit balance/count with no PIN/CVV-labeled context must not be
+        // swept up by the backstop, or the IR would be noisy with false
+        // redactions on completely ordinary screens.
+        val quantityField = RawSemanticsNode(id = 1, testTag = "settled_balance", textRuns = listOf("Settled", "5000"))
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(quantityField)), "Screen", "flow", emptyList())
+
+        val value = (ir.components.single() as ScreenComponent.BalanceDisplay).value
+        assertEquals("5000", value)
+    }
+
+    @Test
+    fun `a PIN-shaped value redacts via the sensitive marker even with no PIN label`() {
+        // The marker is authoritative regardless of the labeled-context
+        // backstop above -- a screen author who tags a field _sensitive (or
+        // sets IsSensitiveData) is protected even if they never wrote "PIN"
+        // anywhere in the field's own text.
+        val markedField = RawSemanticsNode(id = 1, testTag = "login_pin_sensitive", editableText = "9821", isSensitive = true)
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(markedField)), "Screen", "flow", emptyList())
+
+        val value = (ir.components.single() as ScreenComponent.AmountField).value
+        assertEquals("[REDACTED]", value)
     }
 
     @Test
@@ -262,7 +468,14 @@ class SemanticSnapshotBuilderTest {
 
     @Test
     fun `fields are capped at 120 characters`() {
-        val longValueNode = RawSemanticsNode(id = 1, testTag = "long_balance", textRuns = listOf("Label", "9".repeat(200)))
+        // A repeated letter, not a repeated digit: since CRITICAL-1's fix
+        // (independent review of 429f551) routes every role's value through
+        // the same redaction backstop as text_field/amount_field, a long run
+        // of digits here would trip CARD_NUMBER_LIKE and redact to
+        // "[REDACTED]" before length-capping is even observable — this test
+        // is about truncation, not redaction, so it uses a shape neither
+        // backstop regex matches.
+        val longValueNode = RawSemanticsNode(id = 1, testTag = "long_balance", textRuns = listOf("Label", "x".repeat(200)))
 
         val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(longValueNode)), "S", "f", emptyList())
 
