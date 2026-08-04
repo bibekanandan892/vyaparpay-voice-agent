@@ -282,6 +282,38 @@ class SemanticSnapshotBuilderTest {
     }
 
     @Test
+    fun `two dialogs that both traverse after a snackbar are both moved before it, in their original order`() {
+        // Re-review fix (this guard was flagged MEDIUM on the first cut of
+        // the HIGH-1 fix): the original firstOrNull-based version only
+        // relocated the FIRST trailing interruption, leaving a second one
+        // stuck after the snackbar ([dialog1, snackbar, dialog2] instead of
+        // the fully-corrected [dialog1, dialog2, snackbar]). Not exploitable
+        // on the currently shipped PaymentScreen (which only ever produces
+        // one dialog alongside its one snackbar), but this module is
+        // designed to generalize to future screens/roles.
+        val cta = RawSemanticsNode(id = 0, testTag = "pay_now_cta", role = RawRole.BUTTON, hasOnClick = true, textRuns = listOf("Pay Now"))
+        val snackbarNode = RawSemanticsNode(id = 1, testTag = "payment_snackbar", liveRegion = RawLiveRegion.POLITE, textRuns = listOf("Payment Failed"))
+        val mainRoot = RawSemanticsNode(id = 10, children = listOf(cta, snackbarNode))
+        val dialog1 = RawSemanticsNode(id = 2, isDialog = true, paneTitle = "First Alert")
+        val dialog2 = RawSemanticsNode(id = 3, isDialog = true, paneTitle = "Second Alert")
+
+        val ir = SemanticSnapshotBuilder.build(
+            RawSemanticsTree(listOf(mainRoot, dialog1, dialog2)),
+            "Screen",
+            "flow",
+            emptyList(),
+        )
+
+        assertEquals(
+            listOf(ScreenComponentRole.PRIMARY_CTA, ScreenComponentRole.DIALOG, ScreenComponentRole.DIALOG, ScreenComponentRole.SNACKBAR),
+            ir.components.map { it.role },
+        )
+        // Relative order preserved: dialog1 (First Alert) before dialog2 (Second Alert).
+        val dialogs = ir.components.filterIsInstance<ScreenComponent.Dialog>()
+        assertEquals(listOf("First Alert", "Second Alert"), dialogs.map { it.label })
+    }
+
+    @Test
     fun `list visible_count reflects the truncated list_items, not the pre-truncation count`() {
         // HIGH-2 fix (independent review of 429f551): fillListVisibleCounts
         // must run AFTER the 20-component structural cap, not before, or
@@ -440,6 +472,38 @@ class SemanticSnapshotBuilderTest {
         val markedField = RawSemanticsNode(id = 1, testTag = "login_pin_sensitive", editableText = "9821", isSensitive = true)
 
         val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(markedField)), "Screen", "flow", emptyList())
+
+        val value = (ir.components.single() as ScreenComponent.AmountField).value
+        assertEquals("[REDACTED]", value)
+    }
+
+    @Test
+    fun `a PIN-shaped value redacts via a compound snake_case testTag with no explicit label`() {
+        // Re-review fix (this backstop was flagged HIGH on the first cut of
+        // the CRITICAL-2 fix): the original testTag check reused the
+        // free-text label's \b-delimited word-boundary regex, but `_` is a
+        // word character to Regex, so `\bpin\b` never matched inside a
+        // compound identifier like this codebase's own established
+        // snake_case testTag convention (`amount_input`, `pay_now_cta`) --
+        // only a bare, unrealistic tag of exactly "pin" would have matched.
+        // No _sensitive suffix, no IsSensitiveData marker, no "PIN"/"CVV"
+        // word in the label -- the testTag's own tokens are the only signal.
+        // Resolves via the amount_field bare-digit heuristic, same as the
+        // label-based PIN/CVV tests above -- role resolution is orthogonal
+        // to this fix; what matters is that the value redacts.
+        val pinField = RawSemanticsNode(id = 1, testTag = "pin_entry_field", textRuns = listOf("Enter code"), editableText = "4821")
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(pinField)), "Screen", "flow", emptyList())
+
+        val value = (ir.components.single() as ScreenComponent.AmountField).value
+        assertEquals("[REDACTED]", value)
+    }
+
+    @Test
+    fun `a CVV-shaped value redacts via a hyphenated testTag token`() {
+        val cvvField = RawSemanticsNode(id = 1, testTag = "card-cvv-field", textRuns = listOf("Security"), editableText = "123")
+
+        val ir = SemanticSnapshotBuilder.build(RawSemanticsTree(listOf(cvvField)), "Screen", "flow", emptyList())
 
         val value = (ir.components.single() as ScreenComponent.AmountField).value
         assertEquals("[REDACTED]", value)

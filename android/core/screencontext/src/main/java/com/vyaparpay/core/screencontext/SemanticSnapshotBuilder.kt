@@ -87,10 +87,31 @@ public object SemanticSnapshotBuilder {
      * unlabeled PIN field) more reliably than any regex could — out of
      * scope for this fix (the review that raised this flagged it as a
      * follow-up idea, not a requirement here).
+     *
+     * **Review fix (this pattern was flagged HIGH on the first cut of this
+     * fix, independent re-review).** The original version matched the
+     * testTag against the same `\b`-delimited word-boundary regex used for
+     * free-text labels. That is wrong for testTags specifically: `_` is a
+     * word character to `Regex`/`\b`, so `\bpin\b` never matches inside an
+     * underscore-joined identifier unless "pin" is the ENTIRE tag with no
+     * suffix — and every real testTag in this codebase is a compound
+     * snake_case identifier (`amount_input`, `pay_now_cta`,
+     * `vendor_account_number_sensitive`). A field named `pin_entry_field` or
+     * `card_cvv_field` — following this codebase's own established
+     * convention — matched neither the marker nor either half of the
+     * original backstop; the kdoc's claim that the testTag half provided
+     * real protection was true in principle but false for how testTags are
+     * actually named here. [isPinOrCvvInLabeledContext] now tokenizes the
+     * testTag on `_`/`-` and checks exact TOKEN membership (`pin_entry_field`
+     * -> `["pin","entry","field"]`, `"pin" in tokens` is true) instead of
+     * word-boundary substring matching — the free-text label path is
+     * unchanged (labels are naturally space-separated, so `\b` already works
+     * there).
      */
     private val PIN_LIKE = Regex("^\\d{4,6}$")
     private val CVV_LIKE = Regex("^\\d{3,4}$")
-    private val PIN_OR_CVV_LABELED_CONTEXT = Regex("""(?i)\b(pin|cvv|cvc|otp|security[ _-]?code)\b""")
+    private val PIN_OR_CVV_LABEL_WORDS = Regex("""(?i)\b(pin|cvv|cvc|otp|security[ _-]?code)\b""")
+    private val PIN_OR_CVV_TEST_TAG_TOKENS = setOf("pin", "cvv", "cvc", "otp")
 
     private val CURRENCY_SYMBOL_ONLY = Regex("^[₹$€£¥]$")
 
@@ -245,12 +266,18 @@ public object SemanticSnapshotBuilder {
             AADHAAR_LIKE.containsMatchIn(value) ||
             isPinOrCvvInLabeledContext(anchor, value)
 
-    /** See [PIN_LIKE]'s kdoc for why this backstop is context-gated rather than a bare digit-count match. */
+    /**
+     * See [PIN_LIKE]'s kdoc for why this backstop is context-gated rather
+     * than a bare digit-count match, and for why the testTag half tokenizes
+     * on `_`/`-` instead of reusing the label path's word-boundary regex.
+     */
     private fun isPinOrCvvInLabeledContext(anchor: MergedAnchor, value: String): Boolean {
         val trimmed = value.trim()
         if (!PIN_LIKE.matches(trimmed) && !CVV_LIKE.matches(trimmed)) return false
-        val context = anchor.textParts.joinToString(" ") + " " + anchor.node.testTag.orEmpty()
-        return PIN_OR_CVV_LABELED_CONTEXT.containsMatchIn(context)
+        if (PIN_OR_CVV_LABEL_WORDS.containsMatchIn(anchor.textParts.joinToString(" "))) return true
+        val testTagTokens = anchor.node.testTag.orEmpty().split('_', '-').filterNot { it.isEmpty() }.map { it.lowercase() }
+        return testTagTokens.any { it in PIN_OR_CVV_TEST_TAG_TOKENS } ||
+            ("security" in testTagTokens && "code" in testTagTokens)
     }
 
     private fun normalize(text: String): String {
@@ -302,23 +329,34 @@ public object SemanticSnapshotBuilder {
      * separate-window dialog mechanics; only that pair gets corrected here,
      * and it runs once, on the full traversal-order list, before [rankAndCap]
      * so the 20-component cap's tie-breaking sees the corrected order too.
+     *
+     * **Review fix (this guard was flagged MEDIUM on the first cut of this
+     * fix, independent re-review).** The original version used `firstOrNull`
+     * to find and relocate only the FIRST trailing dialog/error_banner —
+     * with two dialogs after one snackbar (`[snackbar, dialog1, dialog2]`),
+     * only `dialog1` moved, leaving `dialog2` stuck after the snackbar
+     * (`[dialog1, snackbar, dialog2]`). Not exploitable on the currently
+     * shipped `PaymentScreen` (its `onPaymentDeclined` sets exactly one
+     * dialog and one snackbar together, never two of either), but this
+     * module is explicitly designed to generalize to future screens (docs/07
+     * §9), so the guard now relocates ALL trailing interruptions, preserving
+     * their relative order, not just the first.
      */
     private fun reconcileDialogBeforeSnackbar(components: List<ScreenComponent>): List<ScreenComponent> {
         val snackbarIndex = components.indexOfFirst { it.role == ScreenComponentRole.SNACKBAR }
         if (snackbarIndex == -1) return components
 
-        val interruptionIndex = components.withIndex()
-            .firstOrNull { (index, component) ->
-                index > snackbarIndex &&
-                    (component.role == ScreenComponentRole.DIALOG || component.role == ScreenComponentRole.ERROR_BANNER)
-            }
-            ?.index
-            ?: return components
+        fun isInterruption(component: ScreenComponent) =
+            component.role == ScreenComponentRole.DIALOG || component.role == ScreenComponentRole.ERROR_BANNER
 
-        val reordered = components.toMutableList()
-        val interruption = reordered.removeAt(interruptionIndex)
-        reordered.add(snackbarIndex, interruption)
-        return reordered
+        val trailing = components.withIndex()
+            .filter { (index, component) -> index > snackbarIndex && isInterruption(component) }
+        if (trailing.isEmpty()) return components
+
+        val trailingIndices = trailing.map { it.index }.toSet()
+        val withoutTrailing = components.filterIndexed { index, _ -> index !in trailingIndices }
+        val insertAt = withoutTrailing.indexOfFirst { it.role == ScreenComponentRole.SNACKBAR }
+        return withoutTrailing.toMutableList().apply { addAll(insertAt, trailing.map { it.value }) }
     }
 
     /**
