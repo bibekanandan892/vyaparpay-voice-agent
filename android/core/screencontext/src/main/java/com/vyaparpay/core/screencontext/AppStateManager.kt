@@ -132,13 +132,75 @@ public class AppStateManager internal constructor(
     // fields document (confinement, not visibility, is what makes this safe).
     private var retainedOperationalScreen: ScreenContextIr? = null
 
+    /**
+     * The last [RawSemanticsTree] this combine has already processed —
+     * whether or not it produced a build (an excluded route observes a
+     * capture and deliberately discards it, but the capture is still
+     * *seen*). Distinct from [retainedOperationalScreen], which only ever
+     * advances on a build; see [state]'s own comment for why both are
+     * needed.
+     */
+    private var lastSeenTree: RawSemanticsTree? = null
+
     public val state: StateFlow<AppContextState> = combine(
         rawSemanticsTree,
         navigationTracker.route,
     ) { tree, route ->
         val flow = navigationTracker.flowFor(route)
         val recentEvents = eventTracker.recent()
-        if (!isExcludedFromCapture(route, flow)) {
+
+        // **Audit fix (2026-08-04) — never build from a stale tree.**
+        // `NavigationTracker.onDestinationChanged` sets `route` SYNCHRONOUSLY
+        // inside the `NavController` destination-changed listener, which fires
+        // during `navigate()` — before the destination's composable has
+        // recomposed, and therefore long before `UiTreeCollector` has captured
+        // it. A route change consequently wakes this combine while `tree` is
+        // still the PREVIOUS screen's capture, and the old unconditional build
+        // produced an IR labelled with the new route but populated with the old
+        // screen's components. `ScreenContextPublisher` then saw
+        // `previous.screen != newScreen.screen`, classified it as a screen
+        // change, and shipped that fabrication as a full `ctx.snapshot` — the
+        // agent reasoning about a screen the merchant was never on, on the one
+        // signal this whole pipeline exists to get right.
+        //
+        // The guard: build only when a genuinely NEW capture arrived. The
+        // reverse pairing (fresh tree, stale route) cannot occur — `route`
+        // updates strictly before the recomposition a capture reflects — so
+        // "a new tree arrived" is exactly the condition under which
+        // `(tree, route)` is known-consistent.
+        //
+        // Identity (`!==`), not equality, is the right test for "a new capture
+        // arrived": `UiTreeCollector.tree` is backed by a `MutableStateFlow`,
+        // which already conflates structurally-equal values, so a re-emission
+        // this combine can observe is always a distinct object.
+        //
+        // [lastSeenTree] advances on every capture INCLUDING excluded ones.
+        // Skipping that update would reintroduce the same bug one step later:
+        // leaving HelpScreen for an operational route would find the retained
+        // tree pointer still on the pre-Help capture, mark Help's tree "new",
+        // and build the new route's IR out of HelpScreen's components.
+        //
+        // No starvation risk: navigation always recomposes, so a capture always
+        // follows within `UiTreeCollector`'s 300 ms debounce. Until it lands,
+        // `screen` simply holds its previous, correctly-labelled value — the
+        // same retained-IR shape capture exclusion already relies on, and one
+        // `ScreenContextPublisher` handles by publishing nothing (its diff sees
+        // no change), rather than by shipping something wrong.
+        //
+        // Review note (the trade-off this makes, stated plainly): if
+        // `UiTreeCollector.start()`/`attachRoot()` were never wired, no capture
+        // ever arrives and `screen` holds one stale-but-honestly-labelled IR
+        // forever. Before this guard the same broken wiring produced loudly
+        // WRONG content (a fresh route stamped onto old components) that QA
+        // would spot immediately; now it produces quietly STALE content, which
+        // is harder to notice. That is the deliberate trade — docs/08 §7's
+        // "degrade, never lie" — but it means the capture wiring itself needs
+        // its own liveness proof rather than relying on wrong output as a
+        // smoke alarm. `MainActivityScreenContextTest` (`:app`) is that proof.
+        val isNewCapture = tree !== lastSeenTree
+        lastSeenTree = tree
+
+        if (isNewCapture && !isExcludedFromCapture(route, flow)) {
             retainedOperationalScreen = SemanticSnapshotBuilder.build(
                 tree = tree,
                 screen = route,

@@ -541,6 +541,54 @@ def test_create_session_accepts_and_recompresses_an_oversized_screen_context(
     assert stored["components"] == []  # rung 5 dropped every `image` component
 
 
+def test_create_session_survives_an_oversized_and_structurally_malformed_screen_context(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    """Audit fix (2026-08-04): the `_ingest_initial_screen_context` guard
+    used to be `except RedisError`, which covered only the `_write_ctx`
+    failure it was written for. `ingest_initial_snapshot` runs its 8 KiB
+    size cap BEFORE schema validation, and the oversize branch feeds the
+    payload to `ContextCompressor`'s drop ladder, whose rungs call
+    `component.get("role")` on every entry of `components`. A payload that
+    is both over the cap AND structurally malformed — `components` holding
+    strings instead of objects, i.e. a buggy or outdated client build —
+    therefore raised `AttributeError` straight past the guard and turned
+    an already-committed session creation into a client-visible 500.
+
+    That is the exact failure mode the original CRITICAL fix exists to
+    prevent (`test_create_session_survives_a_redis_failure_...` above),
+    reached through a different door: docs/08 §7's rule is absolute — the
+    pipeline degrades context, never conversation. This payload must yield
+    a normal 201 with an empty context slot, identical to sending
+    `screen_context: null`.
+
+    Ordering matters to this test: the malformed `components` must ALSO
+    push the payload over the cap, since a malformed-but-small payload
+    never reaches the ladder at all (schema validation rejects it first,
+    the already-covered `REJECTED_SCHEMA` path)."""
+    malformed_and_oversized = {
+        "v": "screen_context/v1",
+        "screen": "PaymentScreen",
+        "flow": "vendor_payment",
+        # Strings, not objects -- the ladder calls .get("role") on each.
+        "components": ["not-an-object-" + "x" * 40 for _ in range(300)],
+        "last_action": None,
+        "last_api": None,
+        "dirty_fields": [],
+        "loading": False,
+    }
+    assert len(json.dumps(malformed_and_oversized)) > 8 * 1024  # really is oversized
+
+    resp = client.post(
+        "/v1/sessions",
+        headers=_AUTH_HEADERS,
+        json=_create_body(screen_context=malformed_and_oversized),
+    )
+
+    assert resp.status_code == 201
+    assert f"ctx:{_SESSION_ID}" not in fake_redis.strings
+
+
 def test_create_session_rejects_unknown_body_fields(client: TestClient) -> None:
     """`additionalProperties: false` in
     protocol/schemas/session_create_request.v1.json — new request fields

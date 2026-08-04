@@ -173,15 +173,17 @@ services:
       - "8000:8000"
 
   voice-worker:
-    # THIS SERVICE CANNOT START YET — `backend/app/voice/run.py` does not
-    # exist. It lands in a later Phase-3 task that owns backend/app/voice/;
-    # until then `docker compose up` brings the rest of the stack up and
-    # this one container exits with "No module named app.voice.run". Use
-    # `docker compose up postgres redis coturn agent-api` in the meantime.
+    # `backend/app/voice/run.py` now exists (Phase-3), so this service is
+    # live — the "CANNOT START YET, run.py does not exist" note that stood
+    # here was stale from the pre-Phase-3 wiring and is removed.
     #
-    # It is wired ahead of the code deliberately: the infrastructure shape
-    # (image, command, ports, env, dependencies) is reviewable now, and the
-    # task that adds run.py then adds only run.py.
+    # Audit fix (2026-08-04): that stale note was actively harmful, because
+    # it made a REAL startup failure look expected. The shared Dockerfile
+    # installed the base package only, so this container died on
+    # `ModuleNotFoundError` for aiortc — indistinguishable, to anyone
+    # reading this comment, from the documented "run.py isn't written yet"
+    # exit. backend/Dockerfile now installs the `[voice]` extra; see its
+    # own comment for why the extra goes into the shared image.
     #
     # Same build context and same image tag as agent-api — the second of
     # the two entrypoints in docs/04 §1. Only `command:` differs.
