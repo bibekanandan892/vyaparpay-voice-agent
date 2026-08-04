@@ -5,6 +5,14 @@ package com.vyaparpay.core.ui.testtag
  *
  * [UNRESOLVED] is what a node gets when its testTag follows no convention —
  * the signal the `:core:screencontext` lint check turns into a warning.
+ *
+ * Named for documentation/completeness against `ScreenComponentRole`'s full
+ * sixteen-member wire vocabulary (`:core:screencontext`'s `ScreenContextIr.kt`),
+ * but only [IMAGE] has a testTag convention wired below in [TestTagRoles] and
+ * `RoleMapper.fromTestTagRole()`. [TEXT_FIELD], [LIST], [LIST_ITEM], [DIALOG],
+ * [TAB], and [TOGGLE] are resolved structurally/heuristically by `RoleMapper`
+ * instead (see that class's kdoc for why) — their presence here does not mean
+ * `roleFor` can produce them; `roleFor` never returns them.
  */
 public enum class TestTagRole(public val wireName: String) {
     PRIMARY_CTA("primary_cta"),
@@ -16,6 +24,13 @@ public enum class TestTagRole(public val wireName: String) {
     SNACKBAR("snackbar"),
     ERROR_BANNER("error_banner"),
     ALERT_BANNER("alert_banner"),
+    TEXT_FIELD("text_field"),
+    LIST("list"),
+    LIST_ITEM("list_item"),
+    DIALOG("dialog"),
+    TAB("tab"),
+    TOGGLE("toggle"),
+    IMAGE("image"),
     UNRESOLVED("unresolved"),
 }
 
@@ -48,6 +63,7 @@ public object TestTagRoles {
         testTag.endsWith("_snackbar") -> TestTagRole.SNACKBAR
         testTag.endsWith("_error") -> TestTagRole.ERROR_BANNER
         testTag.endsWith("_alert") -> TestTagRole.ALERT_BANNER
+        testTag.endsWith("_image") -> TestTagRole.IMAGE
         else -> TestTagRole.UNRESOLVED
     }
 }

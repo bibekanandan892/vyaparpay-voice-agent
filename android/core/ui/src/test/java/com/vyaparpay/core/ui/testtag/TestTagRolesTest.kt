@@ -17,6 +17,7 @@ class TestTagRolesTest {
             "payment_snackbar" to TestTagRole.SNACKBAR,
             "pin_error" to TestTagRole.ERROR_BANNER,
             "kyc_alert" to TestTagRole.ALERT_BANNER,
+            "receipt_image" to TestTagRole.IMAGE,
         )
 
         expected.forEach { (tag, role) ->
