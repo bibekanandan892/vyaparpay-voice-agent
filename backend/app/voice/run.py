@@ -5,6 +5,11 @@ server on the configured port, graceful shutdown on SIGTERM — and, since
 T5.1, the REAL per-call wiring: every accepted call gets a `CallSession`
 (app/voice/call_session.py) running `VoiceAgentWorker` over DeepgramStt /
 ElevenLabsTts / SileroVad and a per-call `ConversationManager` brain.
+Since Phase-4 T4, every call also gets a `ContextDispatcher`
+(app/voice/context_dispatch.py) over a process-long `SnapshotIngestor`/
+`EventLog` pair built here from the same `redis` client — the
+composition-root pattern this module already uses for every other
+process-long collaborator (`stack`, `deps_of`).
 
 Judgment calls, flagged per house style:
 
@@ -73,6 +78,7 @@ from app.agent.tool_executor import ToolExecutor
 from app.config import Settings, get_settings
 from app.context.context_compressor import ContextCompressor
 from app.context.event_log import EventLog
+from app.context.snapshot_ingestor import SnapshotIngestor
 from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.domain.voice import IceServer
@@ -245,10 +251,23 @@ async def main() -> None:
     stack = _build_brain_stack(settings, http, sessionmaker, redis)
     brain_factory = _make_brain_factory(settings, sessionmaker, redis, stack)
     deps_of = _lazy_call_deps(settings, brain_factory)
+    # Phase-4 T4: process-long, stateless-per-call collaborators (same
+    # sharing rationale as `redis`/`stack` above) — `SnapshotIngestor`
+    # keys everything off the `session_id` argument, `ContextCompressor`
+    # is documented stateless, `EventLog` wraps `redis` the same way
+    # `SessionMemory` does. `call_session.py`'s `ContextDispatcher` wiring
+    # (judgment call 6) is independent of `deps_of()` above.
+    snapshot_ingestor = SnapshotIngestor(redis, ContextCompressor())
+    event_log = EventLog(redis)
 
     def peer_factory(session_id: str, send_signal: SendSignal) -> CallSession:
         return CallSession(
-            session_id, send_signal, ice_servers=ice_servers, deps=deps_of()
+            session_id,
+            send_signal,
+            ice_servers=ice_servers,
+            deps=deps_of(),
+            snapshot_ingestor=snapshot_ingestor,
+            event_log=event_log,
         )
 
     server = SignalingServer(redis=redis, peer_factory=peer_factory)
