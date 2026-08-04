@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "type": "ctx.delta",
+  "seq": 44,
+  "ts": 1784536447210,
+  "payload": {
+    "base_seq": 42,
+    "changed": [{"role": "dialog", "label": "Daily Limit Exceeded", "visible": false}],
+    "removed": [],
+    "last_action": {"type": "tap", "target": "Dismiss", "ts": 1784536447102}
+  }
+}

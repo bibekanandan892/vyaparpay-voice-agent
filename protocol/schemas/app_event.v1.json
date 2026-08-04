@@ -1,0 +1,89 @@
+{
+  "name": "app_event.v1",
+  "description": "One app_event/v1 timeline entry (docs/08 §2.1): an EventTracker ring-buffer entry, used identically in three places — session_create_request.v1.json's 'recent_events' items, the ctx.event data-channel payload (docs/13 §4), and this file, which is the shape all three defer to. The taxonomy is 'intentionally closed — a new event type is a protocol version bump, not a config flag' (docs/08 §2.1), so 'type' is a closed enum here, unlike error_code-style strings elsewhere in this protocol family that stay open on purpose. Every entry carries {type, name, ts} (docs/08 §2.1 canon); each type adds the fields in its docs/08 §2.1 table row. Deliberately excluded, per docs/08 §2.3: raw keystrokes, values of sensitive fields (omitted, not redacted-in-place — the field is simply absent), scroll positions, typing cadence, and anything outside VyaparPay's process. additionalProperties is left unset (docs/13 §9 additive-within-v1 posture), matching data_channel_envelope.v1.json/session_create_response.v1.json rather than the protocol/tools/*.json request-input style.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "enum": ["nav", "tap", "input", "api_error", "dialog"],
+      "description": "The five closed event kinds (docs/08 §2.1)."
+    },
+    "name": {
+      "type": "string",
+      "description": "Meaning depends on type (docs/08 §2.1 'name carries' column): destination route for nav, target label/testTag for tap, field testTag/label for input, 'METHOD path' for api_error, dialog title for dialog."
+    },
+    "ts": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "When the event happened on-device, epoch milliseconds (docs/08 §2.1)."
+    }
+  },
+  "required": ["type", "name", "ts"],
+  "oneOf": [
+    { "$ref": "#/$defs/nav_event" },
+    { "$ref": "#/$defs/tap_event" },
+    { "$ref": "#/$defs/input_event" },
+    { "$ref": "#/$defs/api_error_event" },
+    { "$ref": "#/$defs/dialog_event" }
+  ],
+  "$defs": {
+    "nav_event": {
+      "type": "object",
+      "description": "Fired by NavigationTracker's destination-changed listener (docs/08 §2.1). name is the destination route.",
+      "properties": {
+        "type": { "const": "nav" },
+        "name": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 },
+        "from": { "type": "string", "description": "The previous route (docs/08 §2.1)." }
+      },
+      "required": ["type", "name", "ts", "from"]
+    },
+    "tap_event": {
+      "type": "object",
+      "description": "Fired by the shared clickable modifier's click hook in :core:ui (docs/08 §2.1).",
+      "properties": {
+        "type": { "const": "tap" },
+        "name": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 },
+        "screen": { "type": "string", "description": "The route the tap happened on (docs/08 §2.1)." }
+      },
+      "required": ["type", "name", "ts", "screen"]
+    },
+    "input_event": {
+      "type": "object",
+      "description": "Fired on field COMMIT only (focus loss or IME done) — never per keystroke (docs/08 §2.1, §2.3). value is present only for non-sensitive field classes and omitted entirely otherwise (docs/08 §2.1: 'the event omits the value rather than sending [REDACTED]' — a deliberate asymmetry from the snapshot's in-place redaction marker, docs/07 §5 rule 6), which is why value is optional here rather than required-and-nullable.",
+      "properties": {
+        "type": { "const": "input" },
+        "name": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 },
+        "value": { "type": "string", "description": "Committed field value; absent for sensitive field classes (docs/08 §2.1)." }
+      },
+      "required": ["type", "name", "ts"]
+    },
+    "api_error_event": {
+      "type": "object",
+      "description": "Fired by the core:network interceptor on any non-2xx response (docs/08 §2.1). name is 'METHOD path'.",
+      "properties": {
+        "type": { "const": "api_error" },
+        "name": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 },
+        "status": { "type": "integer", "description": "HTTP status code, e.g. 402 (docs/08 §2.1)." },
+        "code": {
+          "type": "string",
+          "description": "docs/13 §1.1 error-code vocabulary — the same string across the HTTP body, this event, and the ScreenContext IR's last_api.error_code (docs/13 §1: 'one vocabulary'). Deliberately not an enum: new codes may be added within a class without a version bump (docs/13 §1.1, §9)."
+        }
+      },
+      "required": ["type", "name", "ts", "status", "code"]
+    },
+    "dialog_event": {
+      "type": "object",
+      "description": "Fired on dialog window attach/detach — the same hook as the docs/07 §2.1 capture bypass (docs/08 §2.1). name is the dialog title.",
+      "properties": {
+        "type": { "const": "dialog" },
+        "name": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 },
+        "visible": { "type": "boolean", "description": "true on attach, false on detach (docs/08 §2.1)." }
+      },
+      "required": ["type", "name", "ts", "visible"]
+    }
+  }
+}

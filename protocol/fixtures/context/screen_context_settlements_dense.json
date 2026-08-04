@@ -1,0 +1,31 @@
+{
+  "v": "screen_context/v1",
+  "screen": "SettlementsScreen",
+  "flow": "settlements_review",
+  "components": [
+    {"role": "dialog", "label": "Export Settlements", "visible": false},
+    {"role": "error_banner", "label": "Sync delayed", "visible": true},
+    {"role": "snackbar", "label": "Batch refreshed", "visible": true},
+    {"role": "primary_cta", "label": "Raise Complaint", "enabled": true},
+    {"role": "secondary_cta", "label": "Export CSV", "enabled": false},
+    {"role": "amount_field", "label": "Min amount", "value": "₹0"},
+    {"role": "recipient", "label": "Filter vendor", "value": "All vendors"},
+    {"role": "balance_display", "label": "Net settled (30d)", "value": "₹8,11,370"},
+    {"role": "status_badge", "label": "Latest batch", "value": "SETTLED"},
+    {"role": "status_badge", "label": "Previous batch", "value": "PENDING"},
+    {"role": "text_field", "label": "Search batches", "value": ""},
+    {"role": "list", "label": "Settlement batches", "visible_count": 3, "total_count": 47},
+    {"role": "list_item", "label": "23 Jul batch", "value": "₹81,137.00"},
+    {"role": "list_item", "label": "22 Jul batch", "value": "₹65,322.00"},
+    {"role": "list_item", "label": "21 Jul batch", "value": "₹58,910.00"},
+    {"role": "tab", "label": "This month", "selected": true},
+    {"role": "tab", "label": "Last month", "selected": false},
+    {"role": "toggle", "label": "Show disputed only", "value": "off"},
+    {"role": "alert_banner", "label": "3 batches flagged for shortfall", "visible": true},
+    {"role": "image", "label": "Download report"}
+  ],
+  "last_action": {"type": "tap", "target": "This month", "ts": 1784536500000},
+  "last_api": null,
+  "dirty_fields": [],
+  "loading": false
+}

@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "type": "ctx.event",
+  "seq": 43,
+  "ts": 1784536447150,
+  "payload": {"type": "tap", "name": "Dismiss", "screen": "PaymentScreen", "ts": 1784536447102}
+}

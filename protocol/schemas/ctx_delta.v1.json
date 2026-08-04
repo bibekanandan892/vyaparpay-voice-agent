@@ -1,0 +1,100 @@
+{
+  "name": "ctx_delta.v1",
+  "description": "The ctx.delta data-channel payload (docs/07 §6, docs/13 §4): changed components only, base_seq-verified merge onto the last snapshot or delta. This is the one ctx.* payload shape with no existing authority elsewhere in protocol/ — data_channel_envelope.v1.json's 'ctx_delta_payload' $def deliberately stays generic ('Component shape authority is docs/07 / screen_context.v1.json') and this file is that authority for the delta-specific parts. It is deliberately NOT the same file as screen_context.v1.json even though 'changed' entries look like components: duplicating the full sixteen-role oneOf here would create two copies of that discriminated union that could silently drift apart, which is precisely the coherence risk a protocol freeze exists to prevent. Instead 'changed'/'removed' entries are validated at the identity+common-fields level (role from the same closed vocabulary, plus the fields any role can carry) — a consumer that needs full per-role shape validation on the merged result validates the post-merge state against screen_context.v1.json instead, which is exactly what SnapshotIngestor's merge-then-store flow does (docs/08 §4.1: deltas merge into ctx:{session_id}, read back as the full IR). additionalProperties is left unset throughout, matching the rest of this protocol family's additive-within-v1 posture (docs/13 §9).",
+  "type": "object",
+  "properties": {
+    "base_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "seq of the last snapshot or delta this delta merges onto — NOT simply the previous message's seq, because ctx.event shares the single client seq counter without advancing screen state (docs/13 §4). SnapshotIngestor rejects a merge whose base_seq does not match the state actually held (docs/08 §4.1)."
+    },
+    "changed": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/changed_component" },
+      "description": "Components whose serialized form changed since the base state, each carried in full (docs/07 §6) — not a field-level diff of the previous value."
+    },
+    "removed": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/component_identity" },
+      "description": "Components no longer present, by identity. Wire identity is role+label (docs/07 §6: 'Component identity for diffing is testTag when present, else role + label') — testTag itself never appears on the wire in any fixture in this protocol, so the wire-level identity used for removal is always role+label; a component whose label changed fails identity matching and appears as a remove+add pair, which is accepted per docs/07 §6."
+    },
+    "last_action": {
+      "$ref": "#/$defs/last_action",
+      "description": "Present only when the action that produced this delta changed (docs/07 §6 'plus any changed top-level fields') — omitted entirely when absent, unlike screen_context.v1.json's last_action, which is always present (possibly null) because a full snapshot states its complete state."
+    },
+    "last_api": {
+      "$ref": "#/$defs/last_api",
+      "description": "Present only when the most recent non-2xx response changed since the base state (docs/07 rule 7, §6)."
+    },
+    "loading": {
+      "type": "boolean",
+      "description": "Present only when the loading flag changed since the base state (docs/07 §6)."
+    },
+    "dirty_fields": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Present only when the dirty-fields set changed since the base state (docs/07 §6, rule 4)."
+    }
+  },
+  "required": ["base_seq", "changed", "removed"],
+  "$defs": {
+    "changed_component": {
+      "type": "object",
+      "description": "A full current component, same field vocabulary as screen_context.v1.json's per-role components, validated here at the common-fields level rather than the full discriminated union (see file description). role is still checked against the closed docs/07 §4 vocabulary.",
+      "properties": {
+        "role": {
+          "enum": [
+            "amount_field", "recipient", "primary_cta", "secondary_cta", "text_field",
+            "list", "list_item", "dialog", "snackbar", "tab", "toggle",
+            "balance_display", "status_badge", "error_banner", "alert_banner", "image"
+          ]
+        },
+        "label": { "type": "string", "maxLength": 120 },
+        "value": { "type": "string", "maxLength": 120 },
+        "enabled": { "type": "boolean" },
+        "visible": { "type": "boolean" },
+        "focused": { "type": "boolean" },
+        "selected": { "type": "boolean" },
+        "visible_count": { "type": "integer", "minimum": 0 },
+        "total_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["role", "label"]
+    },
+    "component_identity": {
+      "type": "object",
+      "description": "Wire-level identity for a removal: role + label (docs/07 §6).",
+      "properties": {
+        "role": {
+          "enum": [
+            "amount_field", "recipient", "primary_cta", "secondary_cta", "text_field",
+            "list", "list_item", "dialog", "snackbar", "tab", "toggle",
+            "balance_display", "status_badge", "error_banner", "alert_banner", "image"
+          ]
+        },
+        "label": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["role", "label"]
+    },
+    "last_action": {
+      "type": "object",
+      "description": "Duplicated locally from screen_context.v1.json — this walker only resolves local $ref (see backend/tests/contract/test_context_protocol.py), and no schema file in this repo cross-references another.",
+      "properties": {
+        "type": { "type": "string" },
+        "target": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["type", "target", "ts"]
+    },
+    "last_api": {
+      "type": "object",
+      "description": "Duplicated locally from screen_context.v1.json, same reason as last_action above.",
+      "properties": {
+        "method": { "type": "string" },
+        "path": { "type": "string" },
+        "status": { "type": "integer" },
+        "error_code": { "type": "string" }
+      },
+      "required": ["method", "path", "status", "error_code"]
+    }
+  }
+}

@@ -1,0 +1,2 @@
+{"type": "api_error", "name": "POST /payments", "status": 402,
+ "code": "DAILY_LIMIT_EXCEEDED", "ts": 1784536440820}
