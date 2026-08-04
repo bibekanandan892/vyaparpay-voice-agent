@@ -47,6 +47,18 @@ class FakePipeline:
         self._ops.append(("expire", (key, seconds)))
         return self
 
+    def rpush(self, key: str, *values: str) -> FakePipeline:
+        # Audit fix, 2026-08-05: added alongside `ltrim` so `EventLog
+        # .append_many`'s pipeline (RPUSH all events, LTRIM, EXPIRE) has
+        # something to queue against -- this pipeline previously only ever
+        # carried `enforce_rate`'s zset ops.
+        self._ops.append(("rpush", (key, *values)))
+        return self
+
+    def ltrim(self, key: str, start: int, end: int) -> FakePipeline:
+        self._ops.append(("ltrim", (key, start, end)))
+        return self
+
     async def execute(self) -> list[Any]:
         results = [getattr(self._store, f"_{name}")(*args) for name, args in self._ops]
         self._ops.clear()
@@ -90,8 +102,15 @@ class FakeRedis:
         self.ttls[key] = seconds
 
     # -- list ----------------------------------------------------------
-    async def rpush(self, key: str, value: str) -> None:
-        self.lists.setdefault(key, []).append(value)
+    async def rpush(self, key: str, *values: str) -> None:
+        # Variadic (audit fix, 2026-08-05): real `RPUSH key v1 v2 ... vn` is
+        # variadic, and `EventLog.append_many` pipelines exactly one such
+        # call for a whole batch rather than N single-value RPUSHes -- the
+        # fake needs the same shape or that pipeline breaks under every test
+        # that exercises it. `EventLog.append`'s existing single-value call
+        # site still works unchanged: one positional argument is a
+        # one-element `values` tuple.
+        self.lists.setdefault(key, []).extend(values)
 
     async def lrange(self, key: str, start: int, end: int) -> list[str]:
         items = self.lists.get(key, [])
@@ -145,6 +164,16 @@ class FakeRedis:
 
     def _expire(self, key: str, seconds: int) -> bool:
         self.ttls[key] = seconds
+        return True
+
+    def _rpush(self, key: str, *values: str) -> int:
+        target = self.lists.setdefault(key, [])
+        target.extend(values)
+        return len(target)
+
+    def _ltrim(self, key: str, start: int, end: int) -> bool:
+        items = self.lists.get(key, [])
+        self.lists[key] = items[start:] if end == -1 else items[start : end + 1]
         return True
 
     def pipeline(self, transaction: bool = True) -> FakePipeline:

@@ -480,20 +480,29 @@ async def _persist_recent_events(
     `exc_info=True` keeps the real traceback in the logs, so the broad catch
     hides nothing from operators.
 
-    A failure part-way through a multi-event list leaves the events that
-    already landed in place rather than deleting them. Deliberate: `RPUSH`
-    order is preserved, so what survives is a valid — if truncated —
-    oldest-first prefix of the timeline, and rolling it back would trade
-    partial context for none at all in service of an atomicity nothing
-    downstream requires (`render_timeline_slot` renders whatever it is
-    given, and `EventLog`'s own `LTRIM` cap already means the list is a
-    window, never a complete archive).
+    Audit fix (2026-08-05) — `event_log.append_many`, not a loop over
+    `event_log.append`. The loop shape cost up to `_MAX_RECENT_EVENTS` (50)
+    calls to a 3-round-trip method — up to 150 sequential awaited Redis
+    round trips blocking the `201` on exactly the "merchant is trying to
+    start a support call" path docs/13 §2.1 says the ergonomics matter for.
+    `append_many` pipelines the whole batch (`RPUSH` all events, `LTRIM`,
+    `EXPIRE`) into one round trip, the same tool `enforce_rate`
+    (`app/data/redis_client.py`) already uses for the identical reason.
+
+    This does change one thing the loop-shaped version of this docstring
+    used to claim: `append_many`'s pipeline is a Redis `MULTI`/`EXEC`
+    transaction, so a failure now yields *nothing* written rather than a
+    truncated oldest-first prefix. That is still exactly the already-
+    accepted degraded outcome, not a new failure mode: a fully-empty
+    `ctx:{session_id}:events` reads back identically to a client that sent
+    `recent_events: []`, which this function already treats as fine. What
+    changed is which *empty-or-full* outcome a mid-write failure produces,
+    not whether a failure here can fail the call — it still cannot.
     """
     if not recent_events:
         return
     try:
-        for event in recent_events:
-            await event_log.append(session_id, event)
+        await event_log.append_many(session_id, recent_events)
     except Exception:
         log.warning("session_recent_events_persist_failed", session_id=session_id, exc_info=True)
         return

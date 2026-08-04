@@ -756,12 +756,21 @@ def test_create_session_survives_a_failure_while_persisting_recent_events(
     session creation into a client-visible 500 — the merchant gets their
     call with an empty slot-5 timeline, exactly as if they had sent
     `recent_events: []`.
+
+    Audit fix (2026-08-05): `EventLog.append_many` now pipelines RPUSH/
+    LTRIM/EXPIRE into one round trip rather than calling the top-level
+    async `rpush` once per event, so the failure must be injected into
+    `FakePipeline.execute`'s dispatch target -- the private, synchronous
+    `_rpush` -- not the public async method the pipeline path no longer
+    calls. (Patching the old target here would silently stop testing
+    anything: the request would just succeed for real, and this test
+    would keep passing for the wrong reason.)
     """
 
-    async def _fail(key: str, value: str) -> None:
+    def _fail(key: str, *values: str) -> None:
         raise RedisError("redis down")
 
-    monkeypatch.setattr(fake_redis, "rpush", _fail)
+    monkeypatch.setattr(fake_redis, "_rpush", _fail)
 
     resp = client.post(
         "/v1/sessions",

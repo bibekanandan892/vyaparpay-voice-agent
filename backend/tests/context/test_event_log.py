@@ -98,3 +98,86 @@ async def test_events_are_scoped_per_session(event_log: EventLog) -> None:
 async def test_append_rejects_a_colon_in_session_id(event_log: EventLog) -> None:
     with pytest.raises(ValueError, match="session_id"):
         await event_log.append("sess:evil", {"type": "tap", "name": "a", "ts": 1})
+
+
+# -- append_many (audit fix, 2026-08-05: pipelined batch for POST /v1/sessions'
+# recent_events, replacing an N-call loop over append) ---------------------
+
+
+async def test_append_many_round_trips_in_order(event_log: EventLog) -> None:
+    event_1 = {"type": "nav", "name": "PaymentScreen", "ts": 1, "from": "DashboardScreen"}
+    event_2 = {"type": "tap", "name": "Pay Now", "ts": 2, "screen": "PaymentScreen"}
+
+    await event_log.append_many("sess_1", [event_1, event_2])
+
+    assert await event_log.get_events("sess_1") == [event_1, event_2]
+
+
+async def test_append_many_is_one_pipelined_round_trip(
+    event_log: EventLog, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the fix: one `pipeline().execute()`, not N awaited
+    `rpush`/`ltrim`/`expire` calls. Counts real `Redis.pipeline()`
+    invocations rather than asserting call counts on individual commands,
+    since a pipeline queues synchronously and only the final `execute()`
+    is an awaited round trip."""
+    pipeline_calls = 0
+    real_pipeline = fake_redis.pipeline
+
+    def _counting_pipeline(transaction: bool = True):
+        nonlocal pipeline_calls
+        pipeline_calls += 1
+        return real_pipeline(transaction=transaction)
+
+    monkeypatch.setattr(fake_redis, "pipeline", _counting_pipeline)
+
+    await event_log.append_many(
+        "sess_1", [{"type": "tap", "name": str(i), "ts": i} for i in range(5)]
+    )
+
+    assert pipeline_calls == 1
+
+
+async def test_append_many_applies_the_ttl_and_trims_to_the_cap(
+    event_log: EventLog, fake_redis: FakeRedis
+) -> None:
+    await event_log.append_many(
+        "sess_1", [{"type": "tap", "name": str(i), "ts": i} for i in range(EVENTS_MAX_LEN + 10)]
+    )
+
+    events = await event_log.get_events("sess_1")
+
+    assert len(events) == EVENTS_MAX_LEN
+    assert events[0]["name"] == "10"
+    assert fake_redis.ttls["ctx:sess_1:events"] == CTX_TTL_SECONDS
+
+
+async def test_append_many_with_empty_list_writes_nothing(
+    event_log: EventLog, fake_redis: FakeRedis
+) -> None:
+    """A no-op, deliberately: an empty `RPUSH` is invalid, and "nothing to
+    persist" needs no round trip -- matches `_persist_recent_events`'s own
+    early return for `recent_events: []`, which relies on this."""
+    await event_log.append_many("sess_1", [])
+
+    assert "ctx:sess_1:events" not in fake_redis.lists
+
+
+async def test_append_many_survives_alongside_append_on_the_same_key(
+    event_log: EventLog,
+) -> None:
+    """`ContextDispatcher` (in-call, one event at a time) and
+    `_persist_recent_events` (REST, batched) both ultimately write through
+    the same key shape -- confirms the two paths compose rather than
+    stepping on each other's ordering."""
+    await event_log.append("sess_1", {"type": "nav", "name": "first", "ts": 1})
+    await event_log.append_many(
+        "sess_1",
+        [
+            {"type": "tap", "name": "second", "ts": 2},
+            {"type": "tap", "name": "third", "ts": 3},
+        ],
+    )
+
+    events = await event_log.get_events("sess_1")
+    assert [e["name"] for e in events] == ["first", "second", "third"]
