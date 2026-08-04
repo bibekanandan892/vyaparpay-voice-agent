@@ -7,6 +7,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.vyaparpay.feature.dashboard.DashboardRoute
+import com.vyaparpay.feature.payments.OrderTrackingRoute
 import com.vyaparpay.feature.payments.OrdersRoute
 import com.vyaparpay.feature.payments.PaymentRoute
 import com.vyaparpay.feature.payments.SettlementsRoute
@@ -33,7 +34,16 @@ public fun AppNavHost(
         composable(AppRoute.DASHBOARD.route) { DashboardRoute() }
         composable(AppRoute.PAYMENT.route) { PaymentRoute() }
         composable(AppRoute.SETTLEMENTS.route) { SettlementsRoute() }
-        composable(AppRoute.ORDERS.route) { OrdersRoute() }
+        composable(AppRoute.ORDERS.route) {
+            OrdersRoute(
+                onOrderSelected = { navController.navigate(AppRoute.ORDER_TRACKING.route) },
+            )
+        }
+        composable(AppRoute.ORDER_TRACKING.route) {
+            OrderTrackingRoute(
+                onBack = { navController.popBackStack() },
+            )
+        }
         composable(AppRoute.SUPPORT.route) { SupportRoute() }
     }
 }

@@ -1,13 +1,14 @@
 package com.vyaparpay.navigation
 
 import com.vyaparpay.feature.dashboard.DashboardDestination
+import com.vyaparpay.feature.payments.OrderTrackingDestination
 import com.vyaparpay.feature.payments.OrdersDestination
 import com.vyaparpay.feature.payments.PaymentDestination
 import com.vyaparpay.feature.payments.SettlementsDestination
 import com.vyaparpay.feature.support.SupportDestination
 
 /**
- * The app's five destinations, assembled from the constants each feature owns.
+ * The app's six destinations, assembled from the constants each feature owns.
  *
  * This enum is the assembly point, not the source of truth: a feature declares
  * its own route, flow and capture policy, and `:app` only decides which of them
@@ -42,6 +43,14 @@ public enum class AppRoute(
         route = OrdersDestination.ROUTE,
         flow = OrdersDestination.FLOW,
         isCaptured = OrdersDestination.IS_CAPTURED,
+    ),
+    // Deliberately shares `flow` with ORDERS (docs/03 §3.8: `flow` is a
+    // nav-graph GROUP, not a per-screen key) -- see AppRouteTest's own
+    // rewritten assertion for why that is correct, not a collision.
+    ORDER_TRACKING(
+        route = OrderTrackingDestination.ROUTE,
+        flow = OrderTrackingDestination.FLOW,
+        isCaptured = OrderTrackingDestination.IS_CAPTURED,
     ),
     SUPPORT(
         route = SupportDestination.ROUTE,
