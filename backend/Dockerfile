@@ -1,9 +1,16 @@
-# backend/Dockerfile — agent-api runtime image.
+# backend/Dockerfile — the SHARED runtime image for both backend services.
 #
-# Builds the FastAPI service defined by backend/pyproject.toml. app.main:app
-# doesn't exist yet as of this file's authoring (Batch 1 of the Phase-2
-# plan) — it lands in a later batch — but the CMD is wired correctly now so
-# no later task needs to touch this file.
+# docs/04 §1 is "one image, built once, started two ways": docker-compose.yml
+# builds this once as `vyapar-backend:dev` and runs it as both `agent-api`
+# (this file's CMD) and `voice-worker` (which overrides CMD with
+# `python -m app.voice.run`). Calling it "the agent-api image" — as this
+# comment did until 2026-08-04 — is what made it easy to miss that the
+# install line below has to satisfy the worker's imports too; see that line.
+#
+# Builds the FastAPI service defined by backend/pyproject.toml. (An earlier
+# version of this comment said `app.main:app` "doesn't exist yet" — it was
+# written in Phase-2 Batch 1, ahead of the code, and has been stale since
+# that module landed.)
 
 FROM python:3.12-slim
 

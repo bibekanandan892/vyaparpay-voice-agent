@@ -186,6 +186,17 @@ public class AppStateManager internal constructor(
         // same retained-IR shape capture exclusion already relies on, and one
         // `ScreenContextPublisher` handles by publishing nothing (its diff sees
         // no change), rather than by shipping something wrong.
+        //
+        // Review note (the trade-off this makes, stated plainly): if
+        // `UiTreeCollector.start()`/`attachRoot()` were never wired, no capture
+        // ever arrives and `screen` holds one stale-but-honestly-labelled IR
+        // forever. Before this guard the same broken wiring produced loudly
+        // WRONG content (a fresh route stamped onto old components) that QA
+        // would spot immediately; now it produces quietly STALE content, which
+        // is harder to notice. That is the deliberate trade — docs/08 §7's
+        // "degrade, never lie" — but it means the capture wiring itself needs
+        // its own liveness proof rather than relying on wrong output as a
+        // smoke alarm. `MainActivityScreenContextTest` (`:app`) is that proof.
         val isNewCapture = tree !== lastSeenTree
         lastSeenTree = tree
 
