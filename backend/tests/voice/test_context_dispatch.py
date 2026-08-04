@@ -64,12 +64,37 @@ async def _until(predicate, *, timeout: float = 5.0, message: str) -> None:
         await asyncio.sleep(0.01)
 
 
+class YieldingFakeRedis(FakeRedis):
+    """`FakeRedis`'s `get`/`set` never hit an `await` that actually
+    suspends, so two `SnapshotIngestor.ingest_delta` calls racing on the
+    same `ctx:{session_id}` key can never truly interleave against it —
+    `test_run_processes_messages_in_delivery_order` would pass identically
+    whether `ContextDispatcher.run()` used its single-consumer queue
+    (judgment call 1) or a `create_task()`-per-message loop, since nothing
+    ever yields control between one message's Redis read and its write.
+
+    Overriding just `get`/`set` (the two ops `_read_ctx`/`_write_ctx` use)
+    with a real `asyncio.sleep(0)` gives the event loop an actual point to
+    switch tasks at — a regression back to fire-and-forget dispatch would
+    let a second delta's `get` interleave before the first delta's `set`,
+    losing an update and making this test's `'"seq":3' in stored()`
+    assertion fail for real, not just by design argument."""
+
+    async def get(self, key: str) -> str | None:
+        await asyncio.sleep(0)
+        return await super().get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        await asyncio.sleep(0)
+        await super().set(key, value, ex=ex)
+
+
 class Rig:
     """One `ContextDispatcher` over a REAL `SnapshotIngestor`/`EventLog`
     pair wired to `FakeRedis` — see module docstring for why."""
 
-    def __init__(self) -> None:
-        self.fake_redis = FakeRedis()
+    def __init__(self, *, fake_redis: FakeRedis | None = None) -> None:
+        self.fake_redis = fake_redis if fake_redis is not None else FakeRedis()
         self.redis = RedisClient(self.fake_redis, session_ttl_seconds=86_400)  # type: ignore[arg-type]
         self.ingestor = SnapshotIngestor(self.redis, ContextCompressor())
         self.event_log = EventLog(self.redis)
@@ -307,8 +332,12 @@ async def test_handle_message_and_run_deliver_an_accepted_snapshot() -> None:
 async def test_run_processes_messages_in_delivery_order() -> None:
     """Judgment call 1: a single serialized consumer, not one task per
     message — two back-to-back deltas must apply in the order they were
-    enqueued, not race each other's Redis read."""
-    rig = Rig()
+    enqueued, not race each other's Redis read. Uses `YieldingFakeRedis`
+    (not plain `FakeRedis`) so that a regression to a `create_task()`-per-
+    message loop would actually be caught here: plain `FakeRedis`'s `get`/
+    `set` never suspend, so the two deltas could never interleave against
+    it regardless of how `run()` dispatched them."""
+    rig = Rig(fake_redis=YieldingFakeRedis())
     await rig.process(_snapshot_envelope(1))
     await rig.start()
     try:
