@@ -162,12 +162,21 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   be exercised by any test in this repo and whose failure mode on an
  *   unknown OEM build is unknowable. It is written down here rather than
  *   quietly worked around.
- * * **Anything thrown.** Every framework call below is wrapped; the first
- *   [Throwable] logs once and latches [degraded], after which this class is
- *   inert for the rest of the process. `Throwable`, not `Exception`, is
- *   deliberate: a future SDK could turn hidden-API-ish access into an
- *   `Error`, and there is no failure here worth taking a live support call
- *   down for.
+ * * **Anything thrown.** Every framework call that can realistically fail is
+ *   wrapped; the first [Throwable] logs once and latches [degraded], after
+ *   which this class is inert for the rest of the process. `Throwable`, not
+ *   `Exception`, is deliberate: a future SDK could turn hidden-API-ish access
+ *   into an `Error`, and there is no failure here worth taking a live support
+ *   call down for.
+ *
+ *   Two calls are deliberately NOT wrapped, and the exclusion is named rather
+ *   than left for a reader to discover as a discrepancy (review fix, LOW —
+ *   this paragraph used to claim *every* call was wrapped, which was false of
+ *   exactly these two): [Handler.post] and
+ *   [Handler.removeCallbacksAndMessages] on a live main-looper handler are
+ *   queue operations with no failure mode short of OOM, and wrapping an
+ *   infallible call would imply a risk that isn't there while adding a
+ *   swallow point that could hide a genuine future change in their contract.
  *
  * @param hostView the activity's `window.decorView` — both the window to
  *   exclude (its root is [MainActivity]'s own responsibility) and the
@@ -199,13 +208,27 @@ internal class ChildWindowTracker(
 
     private var applyObserver: ObserverHandle? = null
     private var focusListener: ViewTreeObserver.OnWindowFocusChangeListener? = null
-    private var started = false
+
+    // @Volatile on the three flags below (review fix, LOW). All three are
+    // written on the main thread but READ from [scheduleScan], which a snapshot
+    // apply can invoke on whichever thread did the applying. A reviewer traced
+    // the actual guarantee through `androidx.compose.runtime`'s source and
+    // found it already holds without `@Volatile`: `registerApplyObserver` adds
+    // the observer under a lock that the apply-notification path also takes
+    // before invoking observers, which establishes a happens-before edge
+    // carrying the `started = true` write along with it. That is a correct
+    // argument and it is also an argument about someone else's private
+    // implementation detail — it would evaporate silently if Compose ever
+    // restructured that locking, and nothing here would fail loudly enough to
+    // notice. `@Volatile` costs a read barrier on a path that already posts to
+    // a Handler, and makes the safety self-evident from this file alone.
+    @Volatile private var started = false
 
     /** Terminal once [stop] has run — [start] must not resurrect a torn-down tracker. */
-    private var terminated = false
+    @Volatile private var terminated = false
 
     /** Latched by [degrade]; see the class kdoc's degradation section. */
-    private var degraded = false
+    @Volatile private var degraded = false
 
     /**
      * Begins watching for sibling windows. Call once, on the main thread,
