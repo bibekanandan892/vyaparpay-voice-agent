@@ -100,6 +100,15 @@ public class VoiceCallService : LifecycleService() {
             ACTION_START -> handleStart(intent)
             ACTION_MUTE -> coordinator?.toggleMute()
             ACTION_END -> controller?.hangUp()
+            else -> {
+                // Review fix (MEDIUM): an unrecognized/absent action on a
+                // fresh instance (no ACTION_START yet reached `controller !=
+                // null`) is the same "started but never foregrounded" hazard
+                // the malformed-payload branch in handleStart() exists to
+                // close — this closes the other way to reach it: the wrong
+                // action instead of a bad extra.
+                if (controller == null) stopSelf()
+            }
         }
 
         // A real in-progress call: the OS should recreate this service (with
@@ -123,25 +132,67 @@ public class VoiceCallService : LifecycleService() {
             return
         }
 
-        val session = AndroidCallAudioSession(getSystemService(AudioManager::class.java))
-        audioSession = session
+        // HIGH fix (independent review of c767074): promote to foreground
+        // synchronously here, before ANY of the construction below runs.
+        // WebRtcClientFactory.create() does real synchronous native work
+        // (System.loadLibrary / PeerConnectionFactory.initialize), and the
+        // previous code only reached startForeground() indirectly — through
+        // VoiceCallCoordinator observing the Requesting state on a
+        // background dispatcher, itself reachable only after that native
+        // work plus a channel hop through CallController's event loop. On
+        // API 31+ a mic-type FGS that doesn't call startForeground()
+        // promptly after startForegroundService() crashes the *host app*
+        // (ForegroundServiceDidNotStartInTimeException); notifier.initial()
+        // has zero dependency on CallState, so there is no reason to make
+        // that race depend on state-machine timing. VoiceCallCoordinator's
+        // own onForegroundServiceRequired callback still fires later —
+        // guarded by its `everForegrounded` flag, so the resulting second
+        // ServiceCompat.startForeground() call below is a harmless
+        // notification refresh — and that later call is still what keeps
+        // audio-focus acquisition correctly ordered before
+        // WebRtcClient.start() opens the mic.
+        promoteToForeground()
 
-        val newController = CallController(
-            api = buildApi(),
-            signaling = OkHttpSignalingClient(sharedOkHttp, serviceScope),
-            webRtc = WebRtcClientFactory.create(applicationContext),
-            scope = serviceScope,
-        )
-        val newCoordinator = VoiceCallCoordinator(
-            callState = newController.state,
-            audioSession = session,
-            notifier = notifier,
-            scope = serviceScope,
-            setMuted = newController::setMuted,
-            hangUp = newController::hangUp,
-            onForegroundServiceRequired = ::promoteToForeground,
-            onCallEnded = ::stopSelf,
-        )
+        val session: AndroidCallAudioSession
+        val newController: CallController
+        val newCoordinator: VoiceCallCoordinator
+        try {
+            session = AndroidCallAudioSession(getSystemService(AudioManager::class.java))
+            newController = CallController(
+                api = buildApi(),
+                signaling = OkHttpSignalingClient(sharedOkHttp, serviceScope),
+                webRtc = WebRtcClientFactory.create(applicationContext),
+                scope = serviceScope,
+            )
+            newCoordinator = VoiceCallCoordinator(
+                callState = newController.state,
+                audioSession = session,
+                notifier = notifier,
+                scope = serviceScope,
+                setMuted = newController::setMuted,
+                hangUp = newController::hangUp,
+                onForegroundServiceRequired = ::promoteToForeground,
+                onCallEnded = ::stopSelf,
+            )
+        } catch (error: Throwable) {
+            // HIGH fix (independent review of c767074): WebRtcClientFactory
+            // .create() does real native init that can throw — e.g. an
+            // UnsatisfiedLinkError on a packaging/ABI problem, which is an
+            // Error, not an Exception, hence catching Throwable rather than
+            // Exception. We are already foreground at this point
+            // (promoteToForeground() above already ran), so letting this
+            // propagate would crash the process with a live foreground
+            // notification and nothing behind it — the same "started but
+            // broken" hazard the malformed-payload branch above exists to
+            // avoid. No CallController/VoiceCallCoordinator field was
+            // assigned yet, so there is nothing to release beyond the
+            // notification itself.
+            notifier.clear()
+            stopSelf()
+            return
+        }
+
+        audioSession = session
         controller = newController
         coordinator = newCoordinator
 

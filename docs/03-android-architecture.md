@@ -182,12 +182,12 @@ class CallStateMachine {
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Requesting: SupportTapped / POST v1 sessions
+    Idle --> Requesting: SupportTapped / POST v1 sessions, start FGS, request audio focus
     Requesting --> Signaling: SessionMinted / WS connect, createOffer
     Requesting --> Ended: Failed (429 / 503 / error)
     Signaling --> Connecting: AnswerApplied / trickle ICE both directions
     Signaling --> Ended: Failed (WS refused / bad token / answer timeout)
-    Connecting --> InCall: PeerConnected / wire ContextChannel, request audio focus
+    Connecting --> InCall: PeerConnected / wire ContextChannel
     Connecting --> Ended: Failed (ICE failed / DTLS timeout)
     InCall --> Reconnecting: TransportLost / ICE restart re-offer
     Reconnecting --> InCall: TransportResumed / request ctx snapshot
@@ -198,12 +198,12 @@ stateDiagram-v2
 
 | Transition | Trigger | Side effects (executed by the service) |
 |---|---|---|
-| `Idle → Requesting` | user taps `SupportButton` (perms granted) | build session body from `AppStateManager.value`; start FGS; show overlay |
+| `Idle → Requesting` | user taps `SupportButton` (perms granted) | build session body from `AppStateManager.value`; start FGS; request audio focus (ahead of `WebRtcClient.start()` opening the mic on the next transition, §3.4); show overlay |
 | `Requesting → Signaling` | `201` from `POST /v1/sessions` | `SignalingClient.connect(signaling_url, signaling_token)`; `WebRtcClient.start(ice_servers)` — mic track added, `ctx` channel created, offer sent |
 | `Requesting → Ended` | `429`/`503`/network error | show "couldn't start the call"; stop FGS (nothing to tear down, [docs/13 §2.1](13-api-contracts.md)) |
 | `Signaling → Connecting` | `answer` received, `setRemoteDescription` applied | trickle ICE continues in both directions; candidate pairs start checking |
 | `Signaling → Ended` | WS refused / `error` frame / answer timeout | dispose the half-built peer; show "couldn't start the call" |
-| `Connecting → InCall` | `PeerConnectionState.CONNECTED` — ICE pair selected, DTLS-SRTP up, `ctx` channel open | bind `ScreenContextPublisher` to the data channel; request audio focus |
+| `Connecting → InCall` | `PeerConnectionState.CONNECTED` — ICE pair selected, DTLS-SRTP up, `ctx` channel open | bind `ScreenContextPublisher` to the data channel (audio focus was already requested at `Idle → Requesting`, not here) |
 | `InCall → Reconnecting` | ICE `disconnected`/`failed`, or network-change callback (§3.4) | `WebRtcClient.restartIce()` → re-offer with `iceRestart: true` over the WS; overlay shows "reconnecting"; notification updated |
 | `Reconnecting → InCall` | ICE re-established on the new candidate pair | publisher sends a fresh full snapshot (seq re-sync, [docs/08 §3.3](08-context-and-events.md)) |
 | `Reconnecting → Ended` | 30 s grace elapsed ([docs/06 §6](06-voice-pipeline.md)) | tear down; next attempt mints a fresh session |
@@ -265,7 +265,7 @@ interface WebRtcClient {
 
 **ICE restart on network change.** A `ConnectivityManager.NetworkCallback` registered for the call's duration fires when the default network changes (Wi-Fi ↔ cellular — a daily event for a merchant walking out of the shop). The client responds with `restartIce()` — a new offer with `iceRestart: true` sent over the same (or a reconnected) signaling WS — rather than tearing the call down: ICE re-gathers on the new interface, DTLS re-keys on the new candidate pair, and media resumes on the same session (canon §10). The state machine sees this as `TransportLost → Reconnecting`, bounded by the 30 s grace.
 
-**Audio focus and routing.** On `InCall` the client requests focus with `AudioFocusRequest(AUDIOFOCUS_GAIN_TRANSIENT)` over `AudioAttributes` with `USAGE_VOICE_COMMUNICATION` / `CONTENT_TYPE_SPEECH`, and sets `AudioManager.mode = MODE_IN_COMMUNICATION` — which engages the device's hardware AEC via the `VOICE_COMMUNICATION` capture preset, the single most load-bearing DSP block in the system ([docs/06 §2.3](06-voice-pipeline.md)). Default route is **earpiece** (best AEC, least false barge-in); the user toggles speakerphone via `AudioManager` (`setCommunicationDevice` on API 31+, `isSpeakerphoneOn` below). **Bluetooth SCO note:** on API 31+ routing to a headset uses `setCommunicationDevice(TYPE_BLUETOOTH_SCO)`; the legacy `startBluetoothSco()` path is retained only as a pre-31 fallback and is known-flaky on cheap handsets — an honest limitation, mirrored by the AEC caveat in [docs/06 §2.3](06-voice-pipeline.md).
+**Audio focus and routing.** Focus is requested at `Idle → Requesting` — ahead of this class opening the mic on `Requesting → Signaling` — with `AudioFocusRequest(AUDIOFOCUS_GAIN_TRANSIENT)` over `AudioAttributes` with `USAGE_VOICE_COMMUNICATION` / `CONTENT_TYPE_SPEECH`, and sets `AudioManager.mode = MODE_IN_COMMUNICATION` — which engages the device's hardware AEC via the `VOICE_COMMUNICATION` capture preset, the single most load-bearing DSP block in the system ([docs/06 §2.3](06-voice-pipeline.md)). Default route is **earpiece** (best AEC, least false barge-in); the user toggles speakerphone via `AudioManager` (`setCommunicationDevice` on API 31+, `isSpeakerphoneOn` below). **Bluetooth SCO note:** on API 31+ routing to a headset uses `setCommunicationDevice(TYPE_BLUETOOTH_SCO)`; the legacy `startBluetoothSco()` path is retained only as a pre-31 fallback and is known-flaky on cheap handsets — an honest limitation, mirrored by the AEC caveat in [docs/06 §2.3](06-voice-pipeline.md).
 
 **Lifecycle.** Constructed by `VoiceCallService` on start, released on `Ended` — `close()` disposes the data channel, the tracks, and the `PeerConnection`, abandons focus, and restores `AudioManager.mode`. **Threading.** libwebrtc delivers observer callbacks (`onIceCandidate`, `onConnectionChange`, data-channel `onMessage`) on its internal signaling thread; they are re-emitted onto `events`/`incoming` and consumed on the call scope — no libwebrtc thread ever touches app state directly.
 
