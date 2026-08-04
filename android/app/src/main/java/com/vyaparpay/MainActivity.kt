@@ -90,12 +90,34 @@ import javax.inject.Inject
  *    observer leaked across recreation: the old instance's `stop()` tears
  *    down its `Snapshot.registerApplyObserver` registration before the new
  *    one's `start()` registers a fresh one. There is deliberately no
- *    `detachRoot` call here — `UiTreeCollector`'s own kdoc reserves
- *    `detachRoot` for a window detaching *while the activity is still alive*
- *    (e.g. a dialog dismissing, tracked at the dialog's own attach point,
- *    which this task does not add); the main window detaching because the
- *    activity itself is being destroyed needs no symmetric call — the whole
- *    collector instance is discarded with it.
+ *    `detachRoot` call for the MAIN window — `UiTreeCollector`'s own kdoc
+ *    reserves `detachRoot` for a window detaching *while the activity is
+ *    still alive*, and the main window detaching because the activity itself
+ *    is being destroyed is a different event. Sibling windows are a different
+ *    matter entirely: see judgment call 7.
+ *
+ * 7. **Sibling windows are tracked by [ChildWindowTracker], not by a second
+ *    `decorView` walk (Phase-4 T8f).** Judgment call 5's walk is complete for
+ *    the window it is given and structurally blind to every other one: a
+ *    Compose `AlertDialog` is its own `android.app.Dialog`, with its own
+ *    decorView and its own `AndroidComposeView`, attached straight to
+ *    `WindowManager` and never a descendant of `window.decorView`. Until this
+ *    task, the "Daily Limit Exceeded" dialog docs/01 §7 step 2 builds the
+ *    entire product on was therefore missing from every snapshot the running
+ *    app produced. [ChildWindowTracker] closes that hole and owns the
+ *    `attachRoot`/`detachRoot` PAIR for those windows — a dialog dismisses as
+ *    well as appears, and an unbalanced `attachRoot` would leave
+ *    `UiTreeCollector.attachedRoots` (an app-lifetime `@Singleton`)
+ *    accumulating dead windows and republishing stale dialog components
+ *    forever. Its own kdoc carries the discovery-mechanism reasoning; what
+ *    belongs here is the division of labour, which is deliberate: the main
+ *    window keeps the direct, proven walk below (it is the one window whose
+ *    existence and lifetime this activity already knows for certain), and the
+ *    tracker is scoped to exactly the windows nothing else can see. Folding
+ *    the main window into the tracker too would be tidier on paper and would
+ *    trade a mechanism proven by [MainActivityScreenContextTest] for one that
+ *    has to re-derive the same answer through a process-wide query — no gain,
+ *    real risk.
  */
 @AndroidEntryPoint
 public class MainActivity : ComponentActivity() {
@@ -106,9 +128,23 @@ public class MainActivity : ComponentActivity() {
     @Inject
     internal lateinit var navigationTracker: NavigationTracker
 
+    /**
+     * Created eagerly in `onCreate` but only armed once the Compose tree
+     * exists (judgment call 7). `internal` for the same reason the two
+     * injected fields are: [MainActivityDialogWindowCaptureTest] asserts
+     * against the real instance this activity built, not an equivalent one.
+     */
+    internal lateinit var childWindowTracker: ChildWindowTracker
+        private set
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         uiTreeCollector.start()
+        childWindowTracker = ChildWindowTracker(
+            hostView = window.decorView,
+            onRootAttached = uiTreeCollector::attachRoot,
+            onRootDetached = uiTreeCollector::detachRoot,
+        )
 
         setContent {
             val navController = rememberNavController()
@@ -126,12 +162,22 @@ public class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // Before `uiTreeCollector.stop()`: the tracker's own stop() reports
+        // every sibling window it is still tracking as detached, and that has
+        // to land on a collector that is still listening.
+        childWindowTracker.stop()
         uiTreeCollector.stop()
         super.onDestroy()
     }
 
     private fun attachComposeRoot() {
         findRootForTest(window.decorView)?.let(uiTreeCollector::attachRoot)
+        // Started here, not in `onCreate`, for the same timing reason the walk
+        // above is posted: `ChildWindowTracker.start()` runs an immediate first
+        // scan, and running it before the host window has attached would make
+        // that scan's "skip the host window" rule moot and its first result
+        // meaningless.
+        childWindowTracker.start()
     }
 }
 
