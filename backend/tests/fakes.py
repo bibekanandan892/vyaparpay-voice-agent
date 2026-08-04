@@ -268,9 +268,18 @@ class FakeBrain:
     def __init__(self) -> None:
         self._replies: list[str] = []
         self.calls: list[str] = []
+        self._hold: asyncio.Event | None = None
 
     def script(self, *replies: str) -> None:
         self._replies.extend(replies)
+
+    def hold_next_reply(self, event: asyncio.Event) -> None:
+        """Block the NEXT `on_stt_final()` call until `event` is set, then
+        clear the hold — lets a test keep a turn parked in THINKING (the
+        brain call in flight) while it drives VAD/STT events that must
+        land before that call resolves (worker judgment call 4: an
+        endpoint arriving mid-turn is queued, not opened as a new turn)."""
+        self._hold = event
 
     async def on_stt_final(self, text: str) -> str:
         self.calls.append(text)
@@ -279,6 +288,9 @@ class FakeBrain:
                 "FakeBrain.on_stt_final() called with no scripted reply left — "
                 "script one reply per expected turn."
             )
+        if self._hold is not None:
+            hold, self._hold = self._hold, None
+            await hold.wait()
         return self._replies.pop(0)
 
 

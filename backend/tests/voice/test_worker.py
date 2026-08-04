@@ -318,6 +318,55 @@ async def test_full_turn_happy_path(settings: Settings) -> None:
     assert final_agent.payload["text"] == "First sentence. Second one."
 
 
+async def test_endpoint_during_thinking_is_queued_and_latest_wins(settings: Settings) -> None:
+    """Judgment call 4: an endpoint that fires while a turn is still in
+    THINKING — the brain call in flight, `turn.speaking` still False so
+    the VAD hops that drive it cannot trigger a barge-in — does not
+    abandon the turn. It is queued (one slot), and a second endpoint
+    arriving before the queued one ever starts replaces it: latest wins.
+    Regression for a coverage gap flagged in the T5.1 review — every
+    other multi-turn test lets turn N finish before turn N+1 opens, so
+    `_pending_endpoint` was never actually exercised."""
+    rig = Rig(settings)
+    hold = asyncio.Event()
+    rig.brain.script("Reply one.", "Reply three.")
+    rig.brain.hold_next_reply(hold)
+    await rig.start()
+    try:
+        await _open_turn(rig, "First question?")
+        await _until(lambda: "thinking" in rig.states(), message="the THINKING transition")
+        assert rig.brain.calls == ["First question?"]
+
+        # A second endpoint fires while turn 1 is still awaiting the
+        # brain — queued, not opened as a second turn.
+        await _open_turn(rig, "Second question?")
+        assert rig.brain.calls == ["First question?"]
+
+        # A third endpoint arrives before the queued (second) one ever
+        # starts — replaces it in the one-slot queue.
+        await _open_turn(rig, "Third question?")
+        assert rig.brain.calls == ["First question?"]
+
+        hold.set()
+        await _until(lambda: len(rig.brain.calls) == 2, message="the queued turn to open")
+        await _until(
+            lambda: len(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")) == 2,
+            message="the queued turn to finish",
+        )
+    finally:
+        hold.set()
+        await rig.stop()
+
+    # Exactly one extra turn opened — carrying the THIRD endpoint's
+    # utterance, never the second's — numbered 2, not 3: no turn was
+    # silently dropped, and none was opened for the replaced endpoint.
+    assert rig.brain.calls == ["First question?", "Third question?"]
+    agent_finals = rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")
+    assert [m.payload["turn"] for m in agent_finals] == [1, 2]
+    user_finals = rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="user")
+    assert [m.payload["text"] for m in user_finals] == ["First question?", "Third question?"]
+
+
 async def test_two_turns_number_sequentially(settings: Settings) -> None:
     rig = Rig(settings)
     rig.brain.script("Reply one.", "Reply two.")
