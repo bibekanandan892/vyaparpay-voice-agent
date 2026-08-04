@@ -84,6 +84,7 @@ from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.session_manager import SessionManager
@@ -337,29 +338,42 @@ async def _ingest_initial_screen_context(
     module docstring names itself as that stub's "eventual full
     replacement."
 
-    Judgment call: an `IngestResult` with `accepted=False` (bad version
-    marker, a schema violation, or an oversize payload that still fails
-    the schema after recompression — check (b) itself never rejects a
-    snapshot outright) does NOT fail this call, and by construction
-    cannot — this function only runs after `session_manager.create()`
-    already returned a live session, so the connect bundle downstream is
-    unaffected either way. docs/08 §7's closing line is explicit that
-    "the pipeline degrades context, never conversation": a merchant
-    calling in with a stale app build or a corrupted capture must still
-    be able to start the call, just with `ContextBuilder`'s slot 4
-    reading back empty (`ContextBuilder._get_screen_context`'s own
-    judgment call #5) — identical to sending `screen_context: null`, not
-    a new failure mode. `SnapshotIngestor` already logs every rejection
-    path at WARNING internally (its `_reject_*` helpers, each carrying
-    `session_id` and a `reason`) with a stable, dedicated event name per
-    check — logging again here would only duplicate that signal under a
-    third name, so this function logs nothing on rejection and only a
-    single INFO line on acceptance, mirroring this route's existing
-    `session_created` log.
+    Judgment call: neither an `IngestResult` with `accepted=False` (bad
+    version marker, a schema violation, or an oversize payload that still
+    fails the schema after recompression) NOR a genuine infrastructure
+    failure writing to Redis may fail this call — this function only runs
+    after `session_manager.create()` already returned a live session, so
+    the connect bundle downstream is unaffected either way. docs/08 §7's
+    closing line is explicit that "the pipeline degrades context, never
+    conversation": a merchant calling in with a stale app build, a
+    corrupted capture, or hitting a transient Redis blip must still be
+    able to start the call, just with `ContextBuilder`'s slot 4 reading
+    back empty (`ContextBuilder._get_screen_context`'s own judgment call
+    #5) — identical to sending `screen_context: null`, not a new failure
+    mode. Review fix: `SnapshotIngestor.ingest_initial_snapshot`'s final
+    step (`_write_ctx`) is an unguarded `redis.raw.set(...)` with no
+    try/except of its own — a connection drop/timeout there previously
+    propagated uncaught through this route into `ErrorEnvelopeMiddleware`,
+    turning an already-successful session creation (the `conversations`
+    row is already committed by this point) into a client-visible 500.
+    `RedisError` is now caught here, matching `ContextBuilder`'s own
+    established convention for exactly this exception surface.
+    `SnapshotIngestor` already logs every REJECTION path at WARNING
+    internally (its `_reject_*` helpers, each carrying `session_id` and a
+    `reason`) with a stable, dedicated event name per check — logging
+    again here would only duplicate that signal under a third name, so
+    this function logs nothing on a normal rejection; it logs its own
+    WARNING only for the genuine-infrastructure-failure case this fix
+    adds, and a single INFO line on acceptance, mirroring this route's
+    existing `session_created` log.
     """
-    result = await snapshot_ingestor.ingest_initial_snapshot(
-        session_id, screen_context, received_at_ms=_now_ms()
-    )
+    try:
+        result = await snapshot_ingestor.ingest_initial_snapshot(
+            session_id, screen_context, received_at_ms=_now_ms()
+        )
+    except RedisError:
+        log.warning("session_screen_context_ingest_failed", session_id=session_id, exc_info=True)
+        return
     if result.accepted:
         log.info(
             "session_screen_context_ingested",

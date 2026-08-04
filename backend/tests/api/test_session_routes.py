@@ -29,6 +29,7 @@ from typing import Any
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from redis.exceptions import RedisError
 
 from app.api.deps import get_db, require_rate_limit
 from app.api.routes.sessions import (
@@ -428,6 +429,48 @@ def test_create_session_rejects_an_unknown_screen_context_version_but_still_crea
         "/v1/sessions",
         headers=_AUTH_HEADERS,
         json=_create_body(screen_context={"v": "screen_context/v9", "screen": "PaymentScreen"}),
+    )
+
+    assert resp.status_code == 201
+    assert session_manager.calls[0]["user_id"] == _MERCHANT_ID
+    assert f"ctx:{_SESSION_ID}" not in fake_redis.strings
+
+
+def test_create_session_survives_a_redis_failure_while_persisting_screen_context(
+    client: TestClient,
+    session_manager: _FakeSessionManager,
+    fake_redis: FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review fix (CRITICAL, Phase-4 T3 review): `SnapshotIngestor
+    .ingest_initial_snapshot`'s final step (`_write_ctx`) is an unguarded
+    Redis `SET` — before the fix, a connection drop/timeout there
+    propagated uncaught through this route into `ErrorEnvelopeMiddleware`,
+    turning an already-successful session creation (the `conversations`
+    row is already committed by this point) into a client-visible 500. A
+    Redis failure while persisting screen-context must degrade the slot,
+    never the request — the session is created exactly as if
+    `screen_context` had failed validation (docs/08 §7's "degrades
+    context, never conversation").
+
+    The failure is injected only for the `ctx:{session_id}` key — a
+    blanket failure on every `SET` would also break the route's separate,
+    pre-existing, equally-unguarded signaling-token write
+    (`store_signaling_token`, `_issue_connect_bundle`), which is a real
+    but different, already-accepted risk this test is not about."""
+    real_set = fake_redis.set
+
+    async def _fail_only_ctx_key(key: str, value: str, ex: int | None = None) -> None:
+        if key.startswith("ctx:"):
+            raise RedisError("redis down")
+        await real_set(key, value, ex=ex)
+
+    monkeypatch.setattr(fake_redis, "set", _fail_only_ctx_key)
+
+    resp = client.post(
+        "/v1/sessions",
+        headers=_AUTH_HEADERS,
+        json=_create_body(screen_context=load_fixture("screen_context_payment_decline")),
     )
 
     assert resp.status_code == 201

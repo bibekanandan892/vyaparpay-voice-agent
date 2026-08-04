@@ -76,6 +76,7 @@ change mid-call in Phase 2.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -201,10 +202,41 @@ class ContextBuilder:
         ) as span:
             safe_set_attribute(span, "session_id", session.session_id)
             try:
-                user_profile = await self._build_user_profile(session.user_id)
-                conversation = await self._get_window(session.session_id)
-                screen_context = await self._get_screen_context(session.session_id)
-                recent_actions = await self._get_recent_actions(session.session_id)
+                # Review fix (HIGH): docs/08 §5 states the span is
+                # "dominated by three pipelined Redis reads... one round
+                # trip, not three" — these four reads (the three Redis
+                # reads plus the independent Postgres profile read) share
+                # no data dependency on each other, so awaiting them one
+                # at a time was pure serialized latency with no
+                # correctness reason to be sequential. `asyncio.gather`
+                # runs all four concurrently, collapsing the wall-clock
+                # cost from the sum of four round trips to the slowest
+                # one — the effect docs/08 §5 is actually budgeting for.
+                # This is concurrent dispatch, not a literal Redis
+                # MULTI/pipeline batching the three `ctx:*`/session reads
+                # onto one TCP round trip (the two `ctx:*` reads and the
+                # session-window read live behind three separate
+                # encapsulated classes — SessionMemory, RedisClient.raw,
+                # EventLog — with no shared pipeline object today; that
+                # would be a larger, riskier restructure than this fix's
+                # scope). Each coroutine already owns its full expected
+                # exception surface internally (RedisError/ValueError/
+                # KeyError/TypeError, all degrade-to-empty), so
+                # `asyncio.gather`'s default (no `return_exceptions`) is
+                # correct here — none of the four should ever propagate,
+                # and if one somehow did, failing the whole turn loudly
+                # is preferable to a silent mismatch.
+                (
+                    user_profile,
+                    conversation,
+                    screen_context,
+                    recent_actions,
+                ) = await asyncio.gather(
+                    self._build_user_profile(session.user_id),
+                    self._get_window(session.session_id),
+                    self._get_screen_context(session.session_id),
+                    self._get_recent_actions(session.session_id),
+                )
                 return ContextBundle(
                     persona=self._persona,
                     business_rules=self._business_rules,
