@@ -31,7 +31,12 @@ dependencies {
     api(project(":core:analytics"))
     api(project(":core:network"))
 
-    // NavigationTracker.route/.flow are StateFlow (docs/03 §3.8).
+    // RoleMapper resolves testTags through the SAME TestTagRoles.roleFor
+    // :core:ui's lint check and every screen already use (docs/07 §5 rule 3
+    // tier (a)) — not a parallel/divergent mapping.
+    implementation(project(":core:ui"))
+
+    // NavigationTracker.route/.flow are StateFlow (docs/03 §3.8); UiTreeCollector's debounce.
     implementation(libs.kotlinx.coroutines.core)
 
     // NavController itself — the base artifact, not -compose: this module has
@@ -39,9 +44,23 @@ dependencies {
     // :app constructs.
     implementation(libs.androidx.navigation.runtime)
 
+    // UiTreeCollector: RootForTest/SemanticsOwner/SemanticsNode (`ui`),
+    // Snapshot.registerApplyObserver (`runtime`) — see the libs.versions.toml
+    // comment on androidx-compose-runtime for why buildFeatures.compose is
+    // NOT enabled here despite these.
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.runtime)
+
+    // ScreenContextIr.toJson()/DropLadder's JsonObject wire representation
+    // (docs/07 §5 rule 8, §7) — hand-built, not derived, so no
+    // kotlin.serialization compiler plugin is needed, only the runtime types.
+    implementation(libs.kotlinx.serialization.json)
+
     // @Inject/@Singleton on NavigationTracker, without the full Hilt plugin —
     // see NavigationTracker's kdoc for why the deeper Hilt wiring is deferred.
     implementation(libs.javax.inject)
 
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }

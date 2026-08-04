@@ -95,6 +95,12 @@ androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = 
 androidx-compose-foundation = { module = "androidx.compose.foundation:foundation" }
 androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
 androidx-compose-ui = { module = "androidx.compose.ui:ui" }
+# UiTreeCollector's own dependency, not a UI-authoring one: RootForTest,
+# SemanticsNode/SemanticsOwner/SemanticsProperties live in `ui`;
+# Snapshot.registerApplyObserver lives in `runtime`. Neither module declaring
+# this pulls in `buildFeatures.compose`/the Compose compiler plugin — those
+# are for modules that author @Composable functions, which this one does not.
+androidx-compose-runtime = { module = "androidx.compose.runtime:runtime" }
 androidx-compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
 androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 androidx-compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
