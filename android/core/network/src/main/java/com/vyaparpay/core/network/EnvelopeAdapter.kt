@@ -130,15 +130,7 @@ private class EnvelopeCall<T>(
         } catch (e: IOException) {
             null
         }
-        if (raw.isNullOrBlank()) return malformedFailure()
-        val envelope = try {
-            json.decodeFromString(errorEnvelopeSerializer, raw)
-        } catch (e: SerializationException) {
-            return malformedFailure()
-        } catch (e: IllegalArgumentException) {
-            return malformedFailure()
-        }
-        return envelope.error?.toFailure() ?: malformedFailure()
+        return decodeWireError(json, raw)?.toFailure() ?: malformedFailure()
     }
 
     private fun WireErrorDto.toFailure(): ApiResult.Failure = ApiResult.Failure(
@@ -161,14 +153,35 @@ private class EnvelopeCall<T>(
     override fun isCanceled(): Boolean = delegate.isCanceled
     override fun request(): Request = delegate.request()
     override fun timeout(): Timeout = delegate.timeout()
+}
 
-    private companion object {
-        /**
-         * Error bodies always carry `data: null` (docs/13 §1), so one fixed
-         * serializer covers every endpoint's failure path; the [JsonObject]
-         * parameter is never exercised.
-         */
-        private val errorEnvelopeSerializer =
-            EnvelopeDto.serializer(JsonObject.serializer())
+/**
+ * Error bodies always carry `data: null` (docs/13 §1), so one fixed
+ * serializer covers every endpoint's failure path; the [JsonObject]
+ * parameter is never exercised.
+ */
+private val errorEnvelopeSerializer = EnvelopeDto.serializer(JsonObject.serializer())
+
+/**
+ * Parses a non-2xx response body's `error` object, folding a missing,
+ * blank, or malformed body to `null` rather than throwing — the docs/13 §9
+ * fold-don't-crash posture applied at the parse boundary.
+ *
+ * Shared by [EnvelopeCall] (folds to a full [ApiResult.Failure] with message
+ * and details, for repository callers) and [ApiErrorReportingInterceptor]
+ * (folds to just the [ApiError] code, for the timeline) — one parse, two
+ * consumers, so the mapping can never drift between the two call sites.
+ */
+internal fun decodeWireError(json: Json, rawBody: String?): WireErrorDto? {
+    if (rawBody.isNullOrBlank()) return null
+    return try {
+        json.decodeFromString(errorEnvelopeSerializer, rawBody).error
+    } catch (e: SerializationException) {
+        null
+    } catch (e: IllegalArgumentException) {
+        null
     }
 }
+
+/** Maps a parsed wire error onto [ApiError], folding a missing/absent error to [ApiError.UNKNOWN]. */
+internal fun WireErrorDto?.toApiError(): ApiError = ApiError.fromWireCode(this?.code)

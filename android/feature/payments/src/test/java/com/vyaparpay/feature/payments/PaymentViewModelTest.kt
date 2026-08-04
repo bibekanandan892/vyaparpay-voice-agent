@@ -2,7 +2,6 @@ package com.vyaparpay.feature.payments
 
 import app.cash.turbine.test
 import com.vyaparpay.core.analytics.AppEvent
-import com.vyaparpay.core.analytics.AppEventType
 import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.network.ApiError
 import com.vyaparpay.core.network.ApiResult
@@ -110,8 +109,12 @@ class PaymentViewModelTest {
         assertNotNull(state.snackbar)
         assertTrue(
             "expected an api_error timeline entry for DAILY_LIMIT_EXCEEDED",
+            // Merge fix: AppEvent became a sealed interface (Phase-4 T7) --
+            // `target` was renamed `name` and moved behind the ApiErrorEvent
+            // variant; the wire-shape `code` field is what actually carries
+            // the ApiError, so that's what this assertion checks.
             tracker.events.any {
-                it.type == AppEventType.API_ERROR && it.target == ApiError.DAILY_LIMIT_EXCEEDED.name
+                it is AppEvent.ApiErrorEvent && it.code == ApiError.DAILY_LIMIT_EXCEEDED.name
             },
         )
     }

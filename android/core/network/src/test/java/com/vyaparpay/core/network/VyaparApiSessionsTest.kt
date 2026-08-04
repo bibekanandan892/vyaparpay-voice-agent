@@ -1,5 +1,6 @@
 package com.vyaparpay.core.network
 
+import com.vyaparpay.core.analytics.RingBufferEventTracker
 import com.vyaparpay.core.network.di.NetworkModule
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -33,7 +34,9 @@ class VyaparApiSessionsTest {
         server = MockWebServer()
         server.start()
         val factory = NetworkModule.provideVyaparApiFactory(
-            NetworkModule.provideOkHttpClient(),
+            NetworkModule.provideOkHttpClient(
+                ApiErrorReportingInterceptor(ApiErrorReporter(RingBufferEventTracker()), json),
+            ),
             json,
         )
         api = factory.create(server.url("/v1/").toString())

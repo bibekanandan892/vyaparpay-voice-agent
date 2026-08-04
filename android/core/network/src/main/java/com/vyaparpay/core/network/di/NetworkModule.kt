@@ -1,5 +1,6 @@
 package com.vyaparpay.core.network.di
 
+import com.vyaparpay.core.network.ApiErrorReportingInterceptor
 import com.vyaparpay.core.network.VyaparApiFactory
 import dagger.Module
 import dagger.Provides
@@ -38,9 +39,16 @@ public object NetworkModule {
 
     @Provides
     @Singleton
-    public fun provideOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
+    public fun provideOkHttpClient(
+        apiErrorReportingInterceptor: ApiErrorReportingInterceptor,
+    ): OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        // docs/08 §2.1: every non-2xx response becomes an `api_error` timeline
+        // entry. An application interceptor (not a network interceptor) so it
+        // still fires on a response OkHttp itself served from cache — there is
+        // no cache configured today, but this is the correct default either way.
+        .addInterceptor(apiErrorReportingInterceptor)
         .build()
 
     @Provides

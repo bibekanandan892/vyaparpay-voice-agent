@@ -31,5 +31,17 @@ dependencies {
     api(project(":core:analytics"))
     api(project(":core:network"))
 
+    // NavigationTracker.route/.flow are StateFlow (docs/03 §3.8).
+    implementation(libs.kotlinx.coroutines.core)
+
+    // NavController itself — the base artifact, not -compose: this module has
+    // no Compose UI of its own, only a listener bound to a NavController that
+    // :app constructs.
+    implementation(libs.androidx.navigation.runtime)
+
+    // @Inject/@Singleton on NavigationTracker, without the full Hilt plugin —
+    // see NavigationTracker's kdoc for why the deeper Hilt wiring is deferred.
+    implementation(libs.javax.inject)
+
     testImplementation(libs.junit)
 }

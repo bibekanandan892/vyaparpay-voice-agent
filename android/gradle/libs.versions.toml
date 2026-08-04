@@ -57,6 +57,13 @@ retrofit = "3.0.0"
 kotlinxSerialization = "1.11.0"
 kotlinxCoroutines = "1.10.2"
 
+# --- DI annotations without the full Hilt plugin ---
+# JSR-330, unversioned in practice — the same @Inject/@Singleton annotations
+# Hilt itself re-exports. Used by modules (:core:screencontext) that annotate
+# an injectable class for a later Hilt integration task without yet paying
+# for the Hilt Gradle plugin + KSP processor in that module.
+javaxInject = "1"
+
 # --- Voice transport ---
 # The maintained libwebrtc build (canon ADR-1, docs/03 §3.4). Declared but not
 # yet consumed by any module: :voice gains it with WebRtcClient, and pulling a
@@ -80,6 +87,9 @@ androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-
 # component in the app is (docs/03 §2's UDF/lifecycle-awareness convention).
 androidx-lifecycle-service = { module = "androidx.lifecycle:lifecycle-service", version.ref = "androidxLifecycle" }
 androidx-navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "androidxNavigation" }
+# The base artifact carrying NavController itself, for modules that need the
+# type without pulling in Compose (:core:screencontext's NavigationTracker).
+androidx-navigation-runtime = { module = "androidx.navigation:navigation-runtime", version.ref = "androidxNavigation" }
 
 androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
 androidx-compose-foundation = { module = "androidx.compose.foundation:foundation" }
@@ -103,6 +113,8 @@ kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serializa
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinxCoroutines" }
+
+javax-inject = { module = "javax.inject:javax.inject", version.ref = "javaxInject" }
 
 webrtc-android = { module = "io.github.webrtc-sdk:android", version.ref = "webrtc" }
 
