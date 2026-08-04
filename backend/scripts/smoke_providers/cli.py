@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import os
 import sys
+import wave
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
@@ -198,10 +199,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         checks = asyncio.run(_run_checks(settings, args))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, wave.Error) as exc:
         # A bad --wav path/format, or a provider construction error that
         # somehow slipped past the env-var gate above — an invocation
-        # problem, not a vendor finding.
+        # problem, not a vendor finding. `wave.Error` (a structurally
+        # malformed RIFF/WAV — e.g. a renamed non-WAV file or a truncated
+        # recording) is its own hierarchy, not an OSError/ValueError
+        # subclass, so it needs listing explicitly (review fix).
         print(f"[smoke_providers] {exc}", file=sys.stderr)
         return 2
 

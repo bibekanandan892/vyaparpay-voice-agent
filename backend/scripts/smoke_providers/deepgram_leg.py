@@ -261,10 +261,28 @@ def _cadence_checks(raw: _RawObservation) -> list[Check]:
 
 
 def _mapping_checks(prov: _ProviderObservation, *, real_speech: bool) -> list[Check]:
-    """DG-5/DG-6/DG-7/DG-8: what the accumulator produced from that cadence."""
+    """DG-5/DG-6/DG-7/DG-8: what the accumulator produced from that cadence.
+
+    Review fix: a mid-stream `prov.error` used to be invisible to all four
+    checks (only DG-10 read it) — an errored real-speech run with zero
+    finals rendered DG-6's evidence as "expected under --synthetic",
+    which is simply false when `--wav` was used and the provider crashed.
+    `incomplete` folds the error in everywhere prov.finals gates the
+    verdict, and `no_final_reason` picks the evidence text that actually
+    matches why there is nothing to inspect.
+    """
     text = prov.finals[-1].text if prov.finals else ""
     artifacts = [a for a in _PUNCT_ARTIFACTS if a in text]
     utterances = 2 if prov.gap_attempted else 1
+    errored = prov.error is not None
+    incomplete = errored or not (real_speech and prov.finals)
+    no_final_reason = (
+        f"stream errored before completing: {prov.error}"
+        if errored
+        else "expected under --synthetic (harness JC 3)"
+        if not real_speech
+        else "no non-empty final arrived"
+    )
     return [
         check(
             "DG-5",
@@ -273,21 +291,18 @@ def _mapping_checks(prov: _ProviderObservation, *, real_speech: bool) -> list[Ch
             "SttFinal at its end — never an SttFinal mid-utterance",
             Verdict.UNKNOWN if not prov.order else Verdict.PASS,
             f"event order: {''.join(prov.order) or 'no events'} "
-            f"({len(prov.partials)} partial, {len(prov.finals)} final)",
+            f"({len(prov.partials)} partial, {len(prov.finals)} final)"
+            + (f"; stream errored: {prov.error}" if errored else ""),
         ),
         check(
             "DG-6",
             _JC1,
             "joining finalized segments with a single space yields sane spacing and "
             "punctuation (no doubled spaces, no space before a full stop)",
-            Verdict.UNKNOWN
-            if not (real_speech and prov.finals)
-            else Verdict.FAIL
-            if artifacts
-            else Verdict.PASS,
+            Verdict.UNKNOWN if incomplete else Verdict.FAIL if artifacts else Verdict.PASS,
             f"final text: {text!r}; join artifacts: {artifacts or 'none'}"
             if prov.finals
-            else "no non-empty final — expected under --synthetic (harness JC 3)",
+            else no_final_reason,
         ),
         check(
             "DG-7",
@@ -295,11 +310,11 @@ def _mapping_checks(prov: _ProviderObservation, *, real_speech: bool) -> list[Ch
             "smart_format=true puts terminal punctuation on finals, which docs/06 §5's "
             "completeness hold inspects",
             Verdict.UNKNOWN
-            if not (real_speech and prov.finals)
+            if incomplete
             else Verdict.PASS
             if text.endswith(_TERMINAL_PUNCT)
             else Verdict.FAIL,
-            f"final ends with {text[-1]!r}" if text else "no non-empty final to inspect",
+            f"final ends with {text[-1]!r}" if prov.finals else no_final_reason,
         ),
         check(
             "DG-8",
@@ -307,11 +322,13 @@ def _mapping_checks(prov: _ProviderObservation, *, real_speech: bool) -> list[Ch
             "endpointing=250 closes one utterance per spoken phrase, rather than "
             "fragmenting it into several",
             Verdict.UNKNOWN
-            if not (real_speech and prov.finals)
+            if incomplete
             else Verdict.PASS
             if len(prov.finals) == utterances
             else Verdict.FAIL,
-            f"{len(prov.finals)} SttFinal for {utterances} spoken phrase(s)",
+            f"{len(prov.finals)} SttFinal for {utterances} spoken phrase(s)"
+            if prov.finals
+            else no_final_reason,
         ),
     ]
 
