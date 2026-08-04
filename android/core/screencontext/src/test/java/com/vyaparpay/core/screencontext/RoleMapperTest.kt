@@ -50,6 +50,16 @@ class RoleMapperTest {
     }
 
     @Test
+    fun `testTag suffix _image resolves to image`() {
+        // The one wiring this task adds: TestTagRole.IMAGE ->
+        // ScreenComponentRole.IMAGE via fromTestTagRole, making
+        // ScreenComponent.Image constructible in production for the first
+        // time (see RoleMapper's class kdoc — image has no tier (c)
+        // heuristic and is tier (a)-only).
+        assertEquals(ScreenComponentRole.IMAGE, RoleMapper.resolve(node(testTag = "receipt_image")))
+    }
+
+    @Test
     fun `an unresolved testTag falls through to tier b instead of blocking resolution`() {
         // "limit_dialog" matches no TestTagRoles convention — tier (a) must
         // fail silently and let tier (b)'s IsDialog structural check resolve

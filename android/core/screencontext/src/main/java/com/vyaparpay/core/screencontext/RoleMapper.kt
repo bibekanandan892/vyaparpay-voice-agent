@@ -32,13 +32,17 @@ public enum class ScreenComponentRole(public val wireName: String) {
  *
  * (a) **testTag convention**, resolved through [TestTagRoles.roleFor] — the
  * exact same function `:core:ui`'s own lint check and every already-merged
- * screen use, not a parallel/divergent mapping. [TestTagRole] only names nine
- * of the sixteen wire roles (the ones docs/07 §4's table assigns a testTag
- * convention at all); the other seven — `text_field`, `list`, `list_item`,
- * `dialog`, `tab`, `toggle`, `image` — are structural/heuristic by design
- * (dialog detection in particular is explicitly *not* testTag-based — see
- * `PaymentScreen.kt`'s own kdoc — so [TestTagRole] having no `DIALOG` member
- * is correct, not a gap).
+ * screen use, not a parallel/divergent mapping. [TestTagRole] names all
+ * sixteen wire roles for documentation/completeness against
+ * `ScreenComponentRole`, but only ten of them — the nine original members
+ * plus `image` — actually resolve through [TestTagRoles.roleFor] and
+ * [fromTestTagRole] below. The other six — `text_field`, `list`,
+ * `list_item`, `dialog`, `tab`, `toggle` — have no testTag suffix
+ * convention and [fromTestTagRole] maps them to `null`; they stay
+ * structural/heuristic by design (dialog detection in particular is
+ * explicitly *not* testTag-based — see `PaymentScreen.kt`'s own kdoc — so
+ * [TestTagRole] having no testTag convention for `DIALOG` is correct, not a
+ * gap).
  *
  * (b) **Semantics properties**, exact/structural: `IsDialog`, `Role.Tab`,
  * `ToggleableState`, `CollectionInfo`, `CollectionItemInfo`.
@@ -138,7 +142,15 @@ internal object RoleMapper {
         TestTagRole.SNACKBAR -> ScreenComponentRole.SNACKBAR
         TestTagRole.ERROR_BANNER -> ScreenComponentRole.ERROR_BANNER
         TestTagRole.ALERT_BANNER -> ScreenComponentRole.ALERT_BANNER
-        TestTagRole.UNRESOLVED -> null
+        TestTagRole.IMAGE -> ScreenComponentRole.IMAGE
+        TestTagRole.TEXT_FIELD,
+        TestTagRole.LIST,
+        TestTagRole.LIST_ITEM,
+        TestTagRole.DIALOG,
+        TestTagRole.TAB,
+        TestTagRole.TOGGLE,
+        TestTagRole.UNRESOLVED,
+        -> null
     }
 }
 
