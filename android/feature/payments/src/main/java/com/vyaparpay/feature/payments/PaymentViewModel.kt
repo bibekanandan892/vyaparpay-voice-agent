@@ -97,7 +97,13 @@ public class PaymentViewModel @JvmOverloads constructor(
     private fun onPaymentDeclined(failure: ApiResult.Failure) {
         // docs/01 §7 step 2: the dialog's appearance is what UiTreeCollector
         // captures alongside the `api_error` timeline entry this records.
-        errorReporter.report(failure.code, PaymentDestination.ROUTE)
+        // Merge fix: ApiErrorReporter.report()'s signature changed (dropped
+        // `screen` -- the app_event/v1 api_error variant has no screen field,
+        // see ApiErrorReporter's own KDoc) after this call site was written;
+        // method/path/status describe the simulated payment call this seeded
+        // decline stands in for (POST /payments, 402 -- ApiError.kt's own
+        // comment pins DAILY_LIMIT_EXCEEDED to 402).
+        errorReporter.report(error = failure.code, method = "POST", path = "/payments", status = 402)
         _state.update {
             it.copy(
                 isSubmitting = false,

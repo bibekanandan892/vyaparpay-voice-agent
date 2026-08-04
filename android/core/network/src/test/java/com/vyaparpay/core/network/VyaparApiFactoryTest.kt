@@ -1,5 +1,6 @@
 package com.vyaparpay.core.network
 
+import com.vyaparpay.core.analytics.RingBufferEventTracker
 import com.vyaparpay.core.network.di.NetworkModule
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
@@ -13,7 +14,9 @@ import org.junit.Test
 class VyaparApiFactoryTest {
 
     private val factory = NetworkModule.provideVyaparApiFactory(
-        NetworkModule.provideOkHttpClient(),
+        NetworkModule.provideOkHttpClient(
+            ApiErrorReportingInterceptor(ApiErrorReporter(RingBufferEventTracker()), NetworkModule.provideJson()),
+        ),
         NetworkModule.provideJson(),
     )
 

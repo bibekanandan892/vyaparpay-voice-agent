@@ -5,13 +5,11 @@ package com.vyaparpay.core.analytics
  *
  * A fixed-capacity ring buffer of [AppEvent], in-memory and process-lifetime,
  * feeding both the session-create `recent_events` payload and the in-call
- * `ctx.event` stream.
- *
- * This module ships the *shape* only — the `@Singleton` ring-buffer
- * implementation lands with the context pipeline. It exists now so the graph
- * edges `:core:ui -> :core:analytics`, `:core:network -> :core:analytics` and
- * `:core:screencontext -> :core:analytics` are real from day one rather than
- * being retrofitted onto a codebase that already learned to live without them.
+ * `ctx.event` stream. [RingBufferEventTracker] is the real, `@Singleton`
+ * implementation — this interface exists so `:core:ui`, `:core:network`, and
+ * `:core:screencontext` depend on the *contract*, not the ring-buffer detail,
+ * and so a test can substitute a fake without a lock or an `ArrayDeque` in
+ * sight.
  *
  * Implementations must be safe to call from any thread: taps and navigation
  * arrive on main, `api_error` arrives on the OkHttp dispatcher.

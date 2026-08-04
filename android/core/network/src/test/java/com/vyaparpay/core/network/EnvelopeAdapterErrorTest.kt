@@ -1,5 +1,6 @@
 package com.vyaparpay.core.network
 
+import com.vyaparpay.core.analytics.RingBufferEventTracker
 import com.vyaparpay.core.network.di.NetworkModule
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
@@ -31,7 +32,7 @@ class EnvelopeAdapterErrorTest {
     fun setUp() {
         server = MockWebServer()
         server.start()
-        api = apiAgainstServer(NetworkModule.provideOkHttpClient())
+        api = apiAgainstServer(defaultInterceptedClient())
     }
 
     @After
@@ -42,6 +43,13 @@ class EnvelopeAdapterErrorTest {
     private fun apiAgainstServer(client: OkHttpClient): VyaparApi =
         NetworkModule.provideVyaparApiFactory(client, NetworkModule.provideJson())
             .create(server.url("/v1/").toString())
+
+    /** The interceptor-equipped default client, matching what `:app` actually gets from `NetworkModule`. */
+    private fun defaultInterceptedClient(): OkHttpClient {
+        val json = NetworkModule.provideJson()
+        val interceptor = ApiErrorReportingInterceptor(ApiErrorReporter(RingBufferEventTracker()), json)
+        return NetworkModule.provideOkHttpClient(interceptor)
+    }
 
     private fun enqueueError(status: Int, body: String) {
         server.enqueue(MockResponse().setResponseCode(status).setBody(body))

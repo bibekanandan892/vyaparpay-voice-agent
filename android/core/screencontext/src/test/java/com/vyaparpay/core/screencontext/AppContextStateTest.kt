@@ -26,7 +26,7 @@ class AppContextStateTest {
             route = "PaymentScreen",
             flow = "vendor_payment",
             recentEvents = listOf(
-                AppEvent(type = AppEventType.TAP, target = "pay_now_cta", screen = "PaymentScreen"),
+                AppEvent.Tap(name = "pay_now_cta", ts = 1_784_536_440_000L, screen = "PaymentScreen"),
             ),
             lastApiError = ApiError.DAILY_LIMIT_EXCEEDED,
         )
