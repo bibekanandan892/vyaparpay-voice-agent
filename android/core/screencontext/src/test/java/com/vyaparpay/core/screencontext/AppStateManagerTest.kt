@@ -289,6 +289,98 @@ class AppStateManagerTest {
         val tapDto = body.recentEvents.first { it.name == "pay_now_cta" }
         assertEquals("tap", tapDto.type)
         assertEquals(1_784_536_440_000L, tapDto.ts)
+        assertEquals("PaymentScreen", tapDto.screen)
+    }
+
+    @Test
+    fun `sessionCreateBody ships recent events oldest first, reversing the tracker's order`() = runTest {
+        // Audit fix: session_create_request.v1.json pins `recent_events`
+        // oldest-first, but EventTracker.recent() is newest-first by its own
+        // contract (RingBufferEventTracker returns `buffer.asReversed()`).
+        // Shipping the tracker's order straight through made the backend
+        // RPUSH the timeline backwards, so ContextCompressor's
+        // `events[-15:]` "newest fifteen" would have taken the OLDEST
+        // fifteen and rendered them in reverse.
+        val tree = MutableStateFlow(payNowCtaTree())
+        val eventTracker = FakeEventTracker()
+        // Pinned clock so the nav event `onDestinationChanged` records below
+        // has a deterministic `ts` — it is the newest event either way, since
+        // the ring buffer is ordered by insertion, not by `ts`.
+        val navigationTracker = NavigationTracker(eventTracker) { 1_784_536_450_000L }
+        val manager = AppStateManager(tree, navigationTracker, eventTracker, backgroundScope)
+
+        repeat(4) { n ->
+            eventTracker.record(
+                AppEvent.Tap(name = "e$n", ts = 1_784_536_440_000L + n * 1_000L, screen = "PaymentScreen"),
+            )
+        }
+        navigationTracker.onDestinationChanged("PaymentScreen")
+        runCurrent()
+
+        val body = manager.sessionCreateBody("usr_rajesh01")
+        // The tracker itself still hands out newest-first — the contract
+        // `lastAction` and SemanticSnapshotBuilder's `last_api` scan rely on.
+        // (The trailing/leading "PaymentScreen" entry is the nav event
+        // NavigationTracker records for the destination change itself.)
+        assertEquals(
+            listOf("PaymentScreen", "e3", "e2", "e1", "e0"),
+            eventTracker.recent().map { it.name },
+        )
+        // ...and only this mapping flips it for the wire.
+        assertEquals(
+            listOf("e0", "e1", "e2", "e3", "PaymentScreen"),
+            body.recentEvents.map { it.name },
+        )
+        assertEquals(body.recentEvents.map { it.ts }.sorted(), body.recentEvents.map { it.ts })
+    }
+
+    @Test
+    fun `sessionCreateBody carries every per-variant app_event field`() = runTest {
+        // Audit fix: the DTO used to be a hard {type, name, ts} projection,
+        // which dropped api_error's status/code — the single fact that says
+        // WHICH failure the merchant just hit — plus nav.from,
+        // dialog.visible, tap.screen and input.value. app_event.v1.json is
+        // explicitly the shape authority for session-create's recent_events.
+        val tree = MutableStateFlow(payNowCtaTree())
+        val eventTracker = FakeEventTracker()
+        val navigationTracker = NavigationTracker(eventTracker)
+        val manager = AppStateManager(tree, navigationTracker, eventTracker, backgroundScope)
+
+        // The nav entry is named for a route the destination change below
+        // does NOT also produce, so `associateBy` cannot collide with the
+        // nav event NavigationTracker records for that change itself.
+        eventTracker.record(AppEvent.Nav(name = "CheckoutScreen", ts = 1L, from = "DashboardScreen"))
+        eventTracker.record(AppEvent.Input(name = "amount", ts = 2L, value = "₹245"))
+        eventTracker.record(AppEvent.Input(name = "upi_pin", ts = 3L))  // sensitive: no value
+        eventTracker.record(AppEvent.Tap(name = "Pay Now", ts = 4L, screen = "PaymentScreen"))
+        eventTracker.record(
+            AppEvent.ApiErrorEvent(
+                name = "POST /payments", ts = 5L, status = 402, code = "DAILY_LIMIT_EXCEEDED",
+            ),
+        )
+        eventTracker.record(AppEvent.Dialog(name = "Daily Limit Exceeded", ts = 6L, visible = true))
+        navigationTracker.onDestinationChanged("PaymentScreen")
+        runCurrent()
+
+        val byName = manager.sessionCreateBody("usr_rajesh01").recentEvents.associateBy { it.name }
+
+        val nav = byName.getValue("CheckoutScreen")
+        assertEquals("nav", nav.type)
+        assertEquals("DashboardScreen", nav.from)
+
+        assertEquals("₹245", byName.getValue("amount").value)
+        // docs/08 §2.1: a sensitive field class omits the value outright
+        // rather than sending a redaction marker.
+        assertNull(byName.getValue("upi_pin").value)
+
+        assertEquals("PaymentScreen", byName.getValue("Pay Now").screen)
+
+        val apiError = byName.getValue("POST /payments")
+        assertEquals("api_error", apiError.type)
+        assertEquals(402, apiError.status)
+        assertEquals("DAILY_LIMIT_EXCEEDED", apiError.code)
+
+        assertEquals(true, byName.getValue("Daily Limit Exceeded").visible)
     }
 
     // ------------------------------------------------------------------

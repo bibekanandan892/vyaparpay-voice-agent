@@ -100,6 +100,7 @@ from app.auth.signaling import SignalingToken, mint_signaling_token, store_signa
 from app.auth.turn_credentials import mint_ice_servers
 from app.config import Settings
 from app.context.context_compressor import ContextCompressor
+from app.context.event_log import EventLog
 from app.context.snapshot_ingestor import SnapshotIngestor
 from app.data.redis_client import RedisClient
 from app.data.repositories import ConversationRepo, ToolAuditRepo
@@ -139,9 +140,20 @@ _MAX_RECENT_EVENTS: Final = 50
 
 class RecentEvent(BaseModel):
     """One `app_event/v1` timeline entry. Only the three fields every
-    event variant carries are pinned (the schema's own scope); extras are
-    allowed through because docs/07/08 own the per-variant shapes and
-    docs/13 §9 makes new fields additive."""
+    event variant carries are pinned (`protocol/schemas/app_event.v1.json`
+    calls `{type, name, ts}` the docs/08 §2.1 canon); extras are allowed
+    through because that schema's `oneOf` owns the per-variant shapes and
+    docs/13 §9 makes new fields additive.
+
+    `extra="allow"` is load-bearing, not laxity: it is the only thing that
+    carries `api_error.status`/`code`, `nav.from`, `dialog.visible` and
+    `input.value` from the wire into `EventLog` (`_persist_recent_events`),
+    and `api_error`'s status/code is the single highest-value diagnostic in
+    the whole pre-call timeline. Tightening this to `extra="forbid"` — the
+    instinct `CreateSessionRequest` below deliberately does apply at the
+    body level — would silently amputate every per-variant field and leave
+    `ContextCompressor._render_event_line` rendering `api_error POST
+    /payments ? ` with the status and code it needs missing."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -216,6 +228,22 @@ def get_snapshot_ingestor(redis: RedisClient = Depends(get_redis)) -> SnapshotIn
     identical way, over the process-long `redis` singleton.
     """
     return SnapshotIngestor(redis, ContextCompressor())
+
+
+def get_event_log(redis: RedisClient = Depends(get_redis)) -> EventLog:  # noqa: B008
+    """Phase-4 T2 follow-up: the `ctx:{session_id}:events` writer for the
+    `recent_events` half of docs/08 §6's session-create sequence, built the
+    same way (and for the same reasons) as `get_snapshot_ingestor` above —
+    a fresh, stateless wrapper per request over the one `RedisClient`
+    `get_redis` hands out, so a test that swaps `get_redis` transparently
+    gets an `EventLog` on the same fake.
+
+    Mirrors `app/voice/run.py`'s `_build_brain_stack`, which builds the
+    in-call entrypoint's `EventLog` over the process-long `redis` singleton
+    identically — one class, two entrypoints, exactly as `SnapshotIngestor`
+    already is.
+    """
+    return EventLog(redis)
 
 
 # --------------------------------------------------------------------------
@@ -404,6 +432,77 @@ async def _ingest_initial_screen_context(
 
 
 # --------------------------------------------------------------------------
+# Pre-call timeline persistence (docs/08 §4.2 / §6) — Phase-4 T2 follow-up
+# --------------------------------------------------------------------------
+
+
+async def _persist_recent_events(
+    event_log: EventLog, session_id: str, recent_events: list[dict[str, Any]]
+) -> None:
+    """Best-effort persistence of the REST-supplied `recent_events` timeline
+    into `ctx:{session_id}:events` — the second of the two writes docs/08
+    §6's session-create sequence diagram shows, and docs/13 §2.1's "write
+    `ctx:a1f3c9` **and the events list**".
+
+    Until this landed, this route accepted `recent_events`, handed them to
+    `SessionManager.create()` (which "accepts and ignores" them, per its own
+    docstring), and nothing ever called `EventLog.append` — so
+    `ContextBuilder`'s slot-5 timeline read back empty for the opening turns
+    of every call, which is precisely the "what were they just doing"
+    context this field exists to carry. The previous version of this route's
+    `create_session` docstring named that gap as deliberately deferred; this
+    function is that deferral being paid off.
+
+    Order is the contract, and it is the caller's, not this function's.
+    `session_create_request.v1.json` pins `recent_events` as **oldest
+    first** and this function appends in the order it is given, because
+    `EventLog.append` is `RPUSH` — so list position *is* chronological
+    order, and `ContextCompressor.render_timeline_slot` (which slices
+    `events[-15:]` for "the newest 15") reads correctly only if that
+    invariant holds all the way from the client. Nothing here re-sorts by
+    `ts`: a server-side sort would silently paper over a client that got the
+    ordering wrong, and the Android side (`AppStateManager.sessionCreateBody`)
+    now reverses `EventTracker.recent()`'s newest-first buffer at the one
+    place that speaks this wire, which is where that fix belongs.
+
+    Judgment call — the guard, and why it is `except Exception`: identical
+    reasoning to `_ingest_initial_screen_context` above, and deliberately
+    the same shape rather than a narrower `RedisError`. This function only
+    runs after `session_manager.create()` has already committed the
+    `conversations` row, so by the time it can fail the session exists and
+    the caller is owed its connect bundle. docs/08 §7's rule is absolute —
+    "the pipeline degrades context, never conversation" — and there is no
+    failure mode of timeline persistence (a Redis blip, an orjson encode
+    failure on some future payload shape) that should be allowed to fail a
+    call the merchant is trying to start. The degraded outcome is a session
+    whose slot-5 timeline reads back empty, which is exactly what a client
+    sending `recent_events: []` already produces — not a new failure mode.
+    `exc_info=True` keeps the real traceback in the logs, so the broad catch
+    hides nothing from operators.
+
+    A failure part-way through a multi-event list leaves the events that
+    already landed in place rather than deleting them. Deliberate: `RPUSH`
+    order is preserved, so what survives is a valid — if truncated —
+    oldest-first prefix of the timeline, and rolling it back would trade
+    partial context for none at all in service of an atomicity nothing
+    downstream requires (`render_timeline_slot` renders whatever it is
+    given, and `EventLog`'s own `LTRIM` cap already means the list is a
+    window, never a complete archive).
+    """
+    if not recent_events:
+        return
+    try:
+        for event in recent_events:
+            await event_log.append(session_id, event)
+    except Exception:
+        log.warning("session_recent_events_persist_failed", session_id=session_id, exc_info=True)
+        return
+    log.info(
+        "session_recent_events_persisted", session_id=session_id, event_count=len(recent_events)
+    )
+
+
+# --------------------------------------------------------------------------
 # Summary assembly (docs/13 §2.3) — mechanical, no LLM (judgment call 2)
 # --------------------------------------------------------------------------
 
@@ -510,6 +609,7 @@ async def create_session(
     redis: RedisClient = Depends(get_redis),  # noqa: B008
     settings: Settings = Depends(get_voice_settings),  # noqa: B008
     snapshot_ingestor: SnapshotIngestor = Depends(get_snapshot_ingestor),  # noqa: B008
+    event_log: EventLog = Depends(get_event_log),  # noqa: B008
 ) -> dict[str, Any]:
     """docs/13 §2.1. Order of server-side effects, as that section pins
     them: validate the whole body -> rate-limit (the `require_rate_limit`
@@ -527,26 +627,38 @@ async def create_session(
     `_require_supported_screen_context` placeholder this replaces, which
     ran (and could reject) before any session existed at all.
 
-    Not implemented in this task, and deliberately not faked: writing
-    the `recent_events` list into `EventLog` (docs/08 §6's sequence
-    diagram shows both writes at session-create; this task's own brief
-    scopes only the `SnapshotIngestor`/screen_context half of that
-    diagram) and the speculative context prefetch (no prefetcher exists
-    yet). Both are additive later without changing this response.
+    Both of docs/08 §6's session-create writes now happen here, in that
+    diagram's own order: the snapshot into `ctx:{session_id}`, then the
+    timeline into `ctx:{session_id}:events` (`_persist_recent_events`,
+    same after-the-mint placement and the same degrade-never-fail guard,
+    for the same reason). Neither can fail this response.
+
+    Still deliberately absent, and deliberately not faked: the speculative
+    context prefetch docs/13 §2.1 also lists (no prefetcher exists yet).
+    Additive later without changing this response.
     """
     _require_matching_user_id(body.user_id, principal)
 
     minted = mint_signaling_token()
+    # One `model_dump()` per event, reused for both the (ignoring)
+    # `SessionManager.create()` argument and the `EventLog` write, so the
+    # two can never see differently-shaped copies of the same timeline.
+    # `RecentEvent` is `extra="allow"`, so this carries the per-variant
+    # fields (`nav.from`, `api_error.status`/`code`, `dialog.visible`,
+    # `input.value`) straight through to Redis — docs/08 §2.1's per-type
+    # table is what makes the timeline diagnostic rather than decorative.
+    recent_events = [event.model_dump() for event in body.recent_events]
     session = await session_manager.create(
         principal.user_id,
         body.screen_context,
-        [event.model_dump() for event in body.recent_events],
+        recent_events,
         signaling_token_hash=minted.token_hash,
     )
     if body.screen_context is not None:
         await _ingest_initial_screen_context(
             snapshot_ingestor, session.session_id, body.screen_context
         )
+    await _persist_recent_events(event_log, session.session_id, recent_events)
     credentials = await _issue_connect_bundle(
         session_id=session.session_id,
         minted=minted,

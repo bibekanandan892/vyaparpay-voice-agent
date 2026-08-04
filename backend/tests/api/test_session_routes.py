@@ -44,7 +44,7 @@ from app.data.redis_client import RedisClient
 from app.domain.types import Session, SessionState
 from app.models import Conversation, ConversationTurn, ToolInvocation
 from tests.context.conftest import load_fixture
-from tests.contract.test_voice_protocol import _assert_valid, _load_schema
+from tests.contract.test_voice_protocol import _assert_valid, _load_fixture, _load_schema
 from tests.support.fake_redis import FakeRedis
 
 _JWT_SECRET = "test-jwt-secret"
@@ -644,6 +644,149 @@ def test_create_session_accepts_a_recent_events_array_at_the_cap(
 
     assert resp.status_code == 201
     assert len(session_manager.calls[0]["recent_events"]) == _MAX_RECENT_EVENTS
+
+
+# --------------------------------------------------------------------------
+# recent_events -> EventLog (docs/08 §4.2, §6; docs/13 §2.1's "write
+# ctx:a1f3c9 AND the events list")
+#
+# Until this landed the route accepted `recent_events`, handed them to
+# `SessionManager.create()` (which "accepts and ignores" them) and never
+# called `EventLog.append` — so `ContextBuilder`'s slot-5 timeline read
+# back empty for the opening turns of every call. The three properties
+# below are what "the timeline actually reaches the agent" means:
+# per-variant fields survive, order survives, and a persistence failure
+# still degrades context rather than the call.
+# --------------------------------------------------------------------------
+
+
+def _stored_events(fake_redis: FakeRedis) -> list[dict[str, Any]]:
+    """What `EventLog.get_events` / `ContextBuilder` will read back —
+    `ctx:{id}:events` in RPUSH order, i.e. oldest first."""
+    return [json.loads(entry) for entry in fake_redis.lists.get(f"ctx:{_SESSION_ID}:events", [])]
+
+
+def test_create_session_persists_recent_events_to_the_event_log(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    events = [
+        {
+            "type": "nav",
+            "name": "PaymentScreen",
+            "from": "DashboardScreen",
+            "ts": 1_784_536_395_000,
+        },
+        {"type": "tap", "name": "Pay Now", "screen": "PaymentScreen", "ts": 1_784_536_440_000},
+    ]
+
+    resp = client.post(
+        "/v1/sessions", headers=_AUTH_HEADERS, json=_create_body(recent_events=events)
+    )
+
+    assert resp.status_code == 201
+    assert _stored_events(fake_redis) == events
+
+
+def test_create_session_persists_every_per_variant_event_field(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    """The whole point of the round trip: `protocol/schemas/app_event.v1
+    .json`'s per-type required fields must survive from the wire into
+    `ctx:{id}:events`, because that is what `ContextCompressor
+    ._render_event_line` renders from. `api_error`'s `status`/`code` is the
+    single highest-value diagnostic in the pre-call timeline — an agent that
+    loses it opens the call blind to the 402 the merchant just hit — and
+    `dialog.visible` is what distinguishes a dialog the merchant is staring
+    at from one they already dismissed.
+
+    The payload is `protocol/fixtures/session_create_request.json`'s own
+    `recent_events` array, so this test fails the moment the route stops
+    carrying what the frozen fixture ships.
+    """
+    events = _load_fixture("session_create_request")["recent_events"]
+    assert {event["type"] for event in events} == {"nav", "input", "tap", "api_error", "dialog"}
+
+    resp = client.post(
+        "/v1/sessions", headers=_AUTH_HEADERS, json=_create_body(recent_events=events)
+    )
+
+    assert resp.status_code == 201
+    stored = _stored_events(fake_redis)
+    assert stored == events  # every per-variant key, verbatim
+
+    api_error = next(event for event in stored if event["type"] == "api_error")
+    assert api_error["status"] == 402
+    assert api_error["code"] == "DAILY_LIMIT_EXCEEDED"
+    assert next(event for event in stored if event["type"] == "dialog")["visible"] is True
+    assert next(event for event in stored if event["type"] == "nav")["from"] == "DashboardScreen"
+
+
+def test_create_session_stores_recent_events_oldest_first(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    """`session_create_request.v1.json` pins `recent_events` oldest-first
+    and `EventLog.append` is RPUSH, so list position *is* chronological
+    order — the invariant `ContextCompressor.render_timeline_slot` relies on
+    when it slices `events[-15:]` for "the newest 15". Fed a ts-ascending
+    array, the stored list must come back ts-ascending too: nothing in the
+    route reverses, re-sorts, or otherwise second-guesses the client.
+    """
+    events = [
+        {"type": "tap", "name": f"e{n}", "ts": 1_784_536_440_000 + n * 1_000} for n in range(5)
+    ]
+
+    client.post("/v1/sessions", headers=_AUTH_HEADERS, json=_create_body(recent_events=events))
+
+    stored = _stored_events(fake_redis)
+    assert [event["name"] for event in stored] == ["e0", "e1", "e2", "e3", "e4"]
+    assert [event["ts"] for event in stored] == sorted(event["ts"] for event in stored)
+
+
+def test_create_session_survives_a_failure_while_persisting_recent_events(
+    client: TestClient,
+    session_manager: _FakeSessionManager,
+    fake_redis: FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same absolute rule `_ingest_initial_screen_context` is held to
+    (docs/08 §7: "the pipeline degrades context, never conversation"),
+    applied to the timeline write. `_persist_recent_events` runs after
+    `session_manager.create()` has already committed the `conversations`
+    row, so a Redis failure there must never turn an already-successful
+    session creation into a client-visible 500 — the merchant gets their
+    call with an empty slot-5 timeline, exactly as if they had sent
+    `recent_events: []`.
+    """
+
+    async def _fail(key: str, value: str) -> None:
+        raise RedisError("redis down")
+
+    monkeypatch.setattr(fake_redis, "rpush", _fail)
+
+    resp = client.post(
+        "/v1/sessions",
+        headers=_AUTH_HEADERS,
+        json=_create_body(
+            recent_events=[{"type": "tap", "name": "Pay Now", "ts": 1_784_536_440_000}]
+        ),
+    )
+
+    assert resp.status_code == 201
+    assert session_manager.calls[0]["user_id"] == _MERCHANT_ID
+    assert f"ctx:{_SESSION_ID}:events" not in fake_redis.lists
+
+
+def test_create_session_with_no_recent_events_writes_no_event_key(
+    client: TestClient, fake_redis: FakeRedis
+) -> None:
+    """The Phase-3 body (`recent_events: []`) must not create an empty
+    `ctx:{id}:events` key — an absent key and an empty list read back
+    identically through `EventLog.get_events`, and not writing keeps the
+    no-context path allocation-free."""
+    resp = client.post("/v1/sessions", headers=_AUTH_HEADERS, json=_create_body())
+
+    assert resp.status_code == 201
+    assert f"ctx:{_SESSION_ID}:events" not in fake_redis.lists
 
 
 def test_create_session_requires_auth(client: TestClient) -> None:
