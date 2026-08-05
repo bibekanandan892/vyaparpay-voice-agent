@@ -344,15 +344,33 @@ async def test_iterative_scan_recovers_the_principals_own_rows(
     assert KB_CONTENT in contents
 
 
-async def test_search_transports_no_foreign_row_into_the_process(
+async def test_search_returns_only_rows_the_principal_may_see(
     session: AsyncSession,
 ) -> None:
-    """The forbidden shortcut, checked against a real server: over-fetching
-    globally and filtering in Python would produce the same visible answer
-    as the scoped query while pulling 250 other merchants' summaries into
-    application memory. Only two rows in this corpus are visible to the
-    principal, so a correct implementation returns exactly two for k=3 —
-    never three, and never with a foreign row among them.
+    """**The scope holds against a real server**, on the hard corpus: 250
+    foreign summaries all strictly nearer the query vector than either
+    row the principal is allowed to see. Exactly two rows in this corpus
+    are visible to `usr_mine`, so a correct implementation returns two for
+    `k=3`, and every returned row is either the shared KB or owned by the
+    principal.
+
+    **This test was renamed, and the rename is the point.** It was called
+    `test_search_transports_no_foreign_row_into_the_process` and asserted
+    only `len(results) == 2`. A security review observed that an
+    implementation issuing an unscoped `LIMIT 300` and filtering in Python
+    returns 2 and passes — while transporting 250 merchants' summaries
+    into process memory, which is precisely what the old name forbade. A
+    test named after a property its assertions cannot observe is worse
+    than a narrow test, because the name is what a reader trusts.
+
+    So this now asserts what it *can* see from here — membership, which
+    the old version did not check either, despite its docstring promising
+    "never with a foreign row among them". The no-over-fetch property is
+    genuinely proven, one layer down, by
+    `test_search_does_not_over_fetch_beyond_k` in
+    `tests/data/repositories/test_semantic_repo.py`, which asserts the
+    compiled statement's `LIMIT` is `k` — the number of rows the server is
+    told to send is the number of rows that can cross the wire.
     """
     await _seed_corpus(session)
     await _force_index_scan(session)
@@ -360,6 +378,12 @@ async def test_search_transports_no_foreign_row_into_the_process(
     results = await SemanticRepo(session, _settings()).search(QUERY_VECTOR, MINE, k=3)
 
     assert len(results) == 2
+    assert {result.content for result in results} == {MY_SUMMARY, KB_CONTENT}
+    for result in results:
+        assert result.user_id in (None, MINE.user_id), (
+            f"row owned by {result.user_id!r} reached a search by {MINE.user_id!r}"
+        )
+        assert result.user_id != THEIRS
 
 
 # --------------------------------------------------------------------------

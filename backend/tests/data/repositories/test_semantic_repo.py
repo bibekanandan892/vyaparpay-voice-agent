@@ -33,11 +33,12 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import Select
+from sqlalchemy.sql import ColumnElement, Select
 
 from app.config import Settings
 from app.data.repositories.semantic_repo import SemanticRepo, _to_similarity
 from app.domain.types import EMBEDDING_DIM, MemoryKind, SessionUser
+from app.models.orm import memory_scope
 from tests.conftest import SettingsFactory
 
 # backend/tests/data/repositories/test_semantic_repo.py -> backend/
@@ -102,6 +103,17 @@ def bound_params(statement: Select[tuple[object, ...]]) -> dict[str, object]:
     return dict(statement.compile(dialect=postgresql.dialect()).params)
 
 
+def compiled_clause(clause: ColumnElement[bool]) -> str:
+    """Compile a boolean clause on its own, with bound values inlined.
+
+    `literal_binds=True` matters: without it both sides render as
+    `%(kind_1)s` placeholders and the comparison would pass for a scope
+    naming the wrong merchant. With it, the principal's id is *in* the
+    string being compared.
+    """
+    return str(clause.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+
+
 # --------------------------------------------------------------------------
 # The scoping predicate, checked against generated SQL
 # --------------------------------------------------------------------------
@@ -119,12 +131,37 @@ async def test_search_statement_carries_both_branches_of_the_scoping_predicate(
     Asserted on the compiled SQL and its bound parameters, not on a mock
     call, so it fails if the WHERE clause changes shape even when the
     Python still "calls memory_scope".
+
+    **The equality assertion is the load-bearing one, and it is here
+    because the presence checks below were not enough.** A security review
+    demonstrated two mutations that survived the entire suite:
+
+        .where(memory_scope(principal) | MemoryChunk.user_id.is_not(None))
+        .where(memory_scope(principal) | (MemoryChunk.kind == "call_summary"))
+
+    Both compile to a *superset* of the scope — `... OR user_id IS NOT
+    NULL` makes every merchant's call summaries readable by every
+    merchant — and both satisfy every "is this substring present"
+    assertion, because widening a predicate adds disjuncts without
+    removing any of the text being looked for. Presence checks can only
+    catch *narrowing* and *dropping*, never widening. Comparing the whole
+    `WHERE` clause to the composed predicate closes that class: a superset
+    is not equal to the scope, so it fails here.
+
+    The presence assertions are kept below the equality one, not replaced
+    by it. They name the two branches individually, so a failure says
+    which half went missing rather than only that two SQL strings differ.
     """
     session = make_session()
 
     await SemanticRepo(session, settings).search(_embedding(), PRINCIPAL, k=3)
 
     statement = executed_select(session)
+
+    where = statement.whereclause
+    assert where is not None
+    assert compiled_clause(where) == compiled_clause(memory_scope(PRINCIPAL))
+
     sql = compiled(statement)
     assert "memory_chunks.kind = " in sql
     assert " OR " in sql
@@ -269,6 +306,33 @@ async def test_search_rejects_an_unknown_iterative_scan_mode(
     with pytest.raises(ValueError, match="memory_hnsw_iterative_scan must be one of"):
         await SemanticRepo(session, settings).search(_embedding(), PRINCIPAL, k=3)
 
+    # No statement containing the payload is ever sent — the allowlist runs
+    # before interpolation, not after.
+    sent = " ".join(str(call.args[0]) for call in session.execute.await_args_list)
+    assert "DROP TABLE" not in sent
+
+
+async def test_an_invalid_mode_executes_nothing_at_all(
+    settings_factory: SettingsFactory,
+) -> None:
+    """Both HNSW values are validated before *either* is executed.
+
+    Previously the checks were interleaved with the statements — validate
+    `ef_search`, `SET` it, then validate `mode` — so an invalid mode raised
+    with one `SET LOCAL` already sent. Harmless in practice (`SET LOCAL`
+    dies with the transaction the caller rolls back) but it half-applied
+    config that had not finished being validated, which is not what
+    `_apply_hnsw_settings`'s docstring describes. This pins the ordering so
+    the interleaving cannot come back.
+    """
+    settings = settings_factory(memory_hnsw_iterative_scan="nonsense")
+    session = make_session()
+
+    with pytest.raises(ValueError, match="memory_hnsw_iterative_scan must be one of"):
+        await SemanticRepo(session, settings).search(_embedding(), PRINCIPAL, k=3)
+
+    session.execute.assert_not_awaited()
+
 
 @pytest.mark.parametrize("ef_search", [0, -1, 1001])
 async def test_search_rejects_an_out_of_range_ef_search(
@@ -401,6 +465,13 @@ def _docstring_nodes(tree: ast.Module) -> set[int]:
     return ids
 
 
+def _root_name(node: ast.expr) -> str | None:
+    """The leftmost identifier of a dotted expression: `a.b.c` -> `"a"`."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
 def test_semantic_repo_is_the_only_module_in_app_that_reaches_memory_chunks() -> None:
     """**Handoff 2, the structural half.** `SemanticMemoryProto`'s
     docstring asks for "`SemanticRepo` as the sole query path... so an
@@ -415,10 +486,24 @@ def test_semantic_repo_is_the_only_module_in_app_that_reaches_memory_chunks() ->
 
     **What this does not prove.** It is a lint over the source tree, not a
     proof about runtime. A module could reach the table through a
-    dynamically built string, through raw asyncpg, or by importing the
-    class under an alias this scan does not model. It closes the easy,
-    likely path — someone writing a second `select(MemoryChunk)` because
-    it is convenient — and nothing more. Two deliberate non-matches:
+    dynamically built string, through raw asyncpg, or by constructing the
+    attribute name at runtime (`getattr(orm, "Memory" + "Chunk")`). It
+    closes the easy, likely path — someone writing a second
+    `select(MemoryChunk)` because it is convenient — and nothing more.
+
+    A security review measured which evasions actually work, and the
+    earlier version of this list named the wrong ones. Aliasing (`from
+    app.models.orm import MemoryChunk as MC`) was listed as a gap but is
+    caught, because `ast.alias.name` holds the original name regardless of
+    `as`. What genuinely slipped past was module-attribute access —
+    `import app.models.orm` or `from app.models import orm`, then
+    `orm.MemoryChunk` — which is now caught below by binding module
+    aliases first and flagging attribute access through them. That two-step
+    is why the check is not a blanket "any attribute named MemoryChunk":
+    `app.domain.types` exports an unrelated Pydantic model of the same
+    name, and flagging `types.MemoryChunk` would be a false positive.
+
+    Two deliberate non-matches:
     `app.domain.types.MemoryChunk` (the unrelated write-side Pydantic
     model of the same name) is ignored because only imports from
     `app.models*` count; and a string merely *naming* the table is ignored
@@ -438,12 +523,37 @@ def test_semantic_repo_is_the_only_module_in_app_that_reaches_memory_chunks() ->
             continue
         reasons: list[str] = []
         docstrings = _docstring_nodes(tree)
+
+        # Local names bound to an `app.models` *module* (rather than to a
+        # name inside one): `import app.models.orm as m`, plain `import
+        # app.models.orm` (which binds `app`), and `from app.models import
+        # orm`. Attribute access through any of these is the evasion the
+        # name-based check below cannot see.
+        module_aliases: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("app.models"):
+                        module_aliases.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and (node.module or "") == "app.models":
+                for alias in node.names:
+                    module_aliases.add(alias.asname or alias.name)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("app.models"):
+                # `alias.name` is the original name even under `as`, so
+                # `import MemoryChunk as MC` is caught here.
                 names = {alias.name for alias in node.names}
                 leaked = names & {"MemoryChunk", "memory_scope"}
                 if leaked:
                     reasons.append(f"imports {sorted(leaked)} from {node.module}")
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in {"MemoryChunk", "memory_scope"}
+                and isinstance(node.value, ast.Name | ast.Attribute)
+                and _root_name(node.value) in module_aliases
+            ):
+                reasons.append(f"reaches {node.attr} through a module alias on line {node.lineno}")
             if (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
@@ -519,12 +629,25 @@ def test_search_exposes_no_parameter_that_could_widen_scope() -> None:
 
 
 def test_semantic_repo_exposes_no_other_query_method() -> None:
-    """`search()` is the only read path. `get`/`add`/`update` are inherited
-    from `SqlAlchemyRepository` and are not semantic searches — `get` is a
-    primary-key fetch and is NOT scoped by `memory_scope`, which is safe
-    only because nothing calls it. A new public method here is a new place
-    for an unscoped query to live, so adding one is a deliberate act that
-    fails this test first.
+    """`search()` is the only read path. A new public method here is a new
+    place for an unscoped query to live, so adding one is a deliberate act
+    that fails this test first.
+
+    **This is an allowlist, not a bare `== {"search"}`, and the difference
+    is not cosmetic.** The equality form asserted that `vars()` held
+    exactly `search` — which meant *overriding* an inherited method put a
+    second name in `vars()` and failed the test. A security review hit
+    this directly: `get()` is inherited as `session.get(MemoryChunk, id)`,
+    an unscoped cross-tenant read, and the natural hardening — override it
+    to raise — was blocked by the very test meant to keep unscoped queries
+    out. A guard that forbids the fix for the hole it is guarding is worse
+    than no guard. The allowlist names what each entry is for, so closing
+    an inherited hole is a one-line addition here with a reason attached,
+    while a genuinely new query method still fails.
+
+    `add`/`update` stay inherited and unlisted: they are write paths, not
+    reads, and `SemanticMemoryProto` assigns indexing to this repo, so a
+    later batch is expected to override them.
     """
     public = {
         name
@@ -532,4 +655,29 @@ def test_semantic_repo_exposes_no_other_query_method() -> None:
         if not name.startswith("_") and inspect.isfunction(value)
     }
 
-    assert public == {"search"}
+    allowed = {
+        # The scoped read path — the whole point of the class.
+        "search",
+        # Not a query: an override that refuses the inherited unscoped
+        # primary-key fetch. See SemanticRepo.get()'s docstring.
+        "get",
+    }
+    assert public == allowed
+
+
+async def test_get_refuses_rather_than_reading_across_merchants(
+    settings: Settings,
+) -> None:
+    """The inherited `get()` would issue `session.get(MemoryChunk, id)` —
+    no principal, no `memory_scope`, so a `call_summary` belonging to any
+    merchant comes back to whoever asks. This asserts the override is in
+    force *and* that it never reaches the session, so the refusal is not
+    merely a post-hoc error after the row was already fetched.
+    """
+    session = make_session()
+
+    with pytest.raises(NotImplementedError, match="memory_scope"):
+        await SemanticRepo(session, settings).get("7")
+
+    session.get.assert_not_called()
+    session.execute.assert_not_called()

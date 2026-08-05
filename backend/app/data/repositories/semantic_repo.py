@@ -72,6 +72,30 @@ class SemanticRepo(SqlAlchemyRepository[MemoryChunk]):
         super().__init__(session)
         self._settings = settings
 
+    async def get(self, id: str) -> MemoryChunk:
+        """Refused. The inherited implementation is
+        `session.get(MemoryChunk, id)` — a primary-key fetch with no
+        principal and no `memory_scope`, i.e. a cross-tenant read
+        primitive sitting on the one class that claims to be the only
+        scoped path to this table. It was unreachable only because
+        nothing in `app/` constructs this repo yet; a security review
+        pointed out that stops being true the moment a later batch wires
+        it, and "safe because nobody calls it" is not a property the code
+        enforces.
+
+        Raising rather than scoping is deliberate. A scoped keyed fetch
+        would need a `principal` argument, which changes the signature
+        the `Repository` Protocol pins and buys nothing today — no caller
+        wants one. If a later batch genuinely needs to fetch a chunk by
+        id, it should add a named method that takes a principal, which is
+        a visible new call site rather than a silently inherited one.
+        """
+        raise NotImplementedError(
+            "SemanticRepo.get() is not available: a primary-key fetch bypasses "
+            "memory_scope() and would read across merchants. Use search(), or add "
+            "a principal-scoped fetch method if one is genuinely needed."
+        )
+
     async def search(
         self, embedding: Embedding, principal: SessionUser, *, k: int
     ) -> list[RetrievedMemory]:
@@ -213,6 +237,12 @@ class SemanticRepo(SqlAlchemyRepository[MemoryChunk]):
         value fails at the first search with a message naming the field
         rather than as a Postgres error mid-transaction.
         """
+        # Both values are validated before either is executed. The
+        # interleaved order (check ef_search, SET it, then check mode) left
+        # one statement already sent when an invalid mode raised — harmless,
+        # since SET LOCAL dies with the transaction the caller rolls back,
+        # but it contradicted this docstring's "fails at the first search"
+        # framing by half-applying first. Validate, then act.
         ef_search = int(self._settings.memory_hnsw_ef_search)
         if not 1 <= ef_search <= 1000:
             raise ValueError(
@@ -220,7 +250,6 @@ class SemanticRepo(SqlAlchemyRepository[MemoryChunk]):
                 "that is pgvector's own range for hnsw.ef_search, and a value "
                 "outside it is rejected by Postgres mid-transaction"
             )
-        await self._session.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
 
         mode = self._settings.memory_hnsw_iterative_scan
         if mode not in _ITERATIVE_SCAN_MODES:
@@ -228,6 +257,8 @@ class SemanticRepo(SqlAlchemyRepository[MemoryChunk]):
                 f"memory_hnsw_iterative_scan must be one of "
                 f"{sorted(_ITERATIVE_SCAN_MODES)}, got {mode!r}"
             )
+
+        await self._session.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
         if mode:
             await self._session.execute(text(f"SET LOCAL hnsw.iterative_scan = {mode}"))
 
