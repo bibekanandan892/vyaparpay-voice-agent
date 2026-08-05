@@ -2,10 +2,19 @@
 tables (docs/12-data-models.md §3-4 — the business zone's `merchants`,
 `wallet_accounts`, `merchant_limits`, `transactions`, plus the agent
 zone's `conversations`, `conversation_turns`, `tool_invocations`,
-`call_costs`). The vector zone (`kb_articles`, `memory_chunks`) and the
-remaining business tables (`settlements`, `device_orders`, `complaints`,
-`cards`) are out of scope for Phase 2 (docs/17 §2.2) and are not modeled
-here.
+`call_costs`), plus the 4 Phase-5 memory tables added by migration 0002:
+`conversation_summaries` (docs/12 §4.3), `user_profiles` (docs/09 §5.1),
+and the vector zone's `kb_articles` + `memory_chunks` (docs/12 §5,
+docs/09 §6.1). The remaining business tables (`settlements`,
+`device_orders`, `complaints`, `cards`) are still unmodeled — no Phase-5
+task reads them.
+
+Four of these classes (`ConversationSummary`, `UserProfile`, `KbArticle`,
+`MemoryChunk`) share a name with a frozen pydantic value type in
+app/domain/types.py. That is deliberate — the row and its domain twin
+describe the same thing at different layers — but it means a module
+importing both must alias one (`from app.models.orm import UserProfile as
+UserProfileRow`); a plain double import silently shadows the first.
 
 Column names, types, defaults, CHECK constraints, and keys mirror the
 docs/12 DDL exactly; constraint *names* (e.g. `ck_merchants_kyc_status`)
@@ -25,10 +34,12 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     CHAR,
     BigInteger,
     CheckConstraint,
+    ColumnElement,
     Date,
     DateTime,
     ForeignKey,
@@ -44,6 +55,8 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from app.domain.types import EMBEDDING_DIM, MemoryKind, SessionUser
 
 # Named as `sa_text`, not `text`, deliberately: ConversationTurn below has a
 # column literally named `text` (docs/12 §4.2), and a class-scoped rebind of
@@ -346,4 +359,278 @@ class CallCost(Base):
     tts_chars: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ConversationSummary(Base):
+    """Mirrors `conversation_summaries` (docs/09 §8 owns the schema;
+    docs/12 §4.3 reproduces it and adds the FK to `conversations` plus
+    `idx_summaries_user`). Written once, post-call, by the agent-api
+    persistence pipeline.
+
+    `turn_count`/`duration_s`/`cost_usd` duplicate what `conversation_turns`
+    and `call_costs` can derive — deliberate, so the row renders into the
+    RAG slot self-contained without a three-way join on the retrieval path.
+    `cost_usd` is `NUMERIC(8,4)` here (the rounded display copy) against
+    `call_costs`'s `NUMERIC(10,6)` ledger precision — docs/12 §4.5 calls
+    that split out explicitly, so the narrower type is not a typo.
+
+    **No `embedding` column, by design.** The vector for this summary is a
+    `memory_chunks` row with `kind='call_summary'`, written by the same
+    pipeline stage. Vectors stay out of source-of-record tables so that
+    re-embedding (model swap, dimension change) rebuilds one derived
+    table instead of `ALTER`-ing every table that owns text (docs/12 §4.3).
+
+    Domain twin: `app.domain.types.ConversationSummary`.
+    """
+
+    __tablename__ = "conversation_summaries"
+    __table_args__ = (
+        CheckConstraint(
+            "resolution IN ('resolved', 'escalated', 'pending', 'abandoned')",
+            name="ck_conversation_summaries_resolution",
+        ),
+        Index("idx_summaries_user", "user_id", sa_text("created_at DESC")),
+    )
+
+    session_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("conversations.session_id"), primary_key=True
+    )
+    # No FK to merchants: docs/12 §4.3's DDL declares this as a plain
+    # NOT NULL TEXT. It is still the right-to-delete handle (docs/09 §10,
+    # `DELETE WHERE user_id = ?`), which is why it is indexed below.
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    resolution: Mapped[str] = mapped_column(Text, nullable=False)
+    intents: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    tools_used: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    turn_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_s: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class UserProfile(Base):
+    """Mirrors `user_profiles` (docs/09 §5.1 — the owning doc per canon
+    §11; docs/12 does not reproduce this DDL). Memory layer 5: durable,
+    merge-updated post-call, read once at call setup into the 200-token
+    profile slot.
+
+    **No FK on `user_id`.** docs/09 §5.1 declares `user_id TEXT PRIMARY
+    KEY` with no `REFERENCES merchants(merchant_id)`, and docs/09 wins for
+    this table. Noted because docs/12 §1's ER diagram draws
+    `merchants ||--|| user_profiles "profiled as"`, which reads as an
+    enforced 1:1 — neither doc's DDL enforces it, and this model does not
+    add it. Consequence, stated rather than hidden: a profile row can
+    outlive or precede its merchant row, and nothing at the DB level
+    prevents a profile for a merchant_id that never existed.
+
+    **The three JSONB columns are unvalidated at this layer.** docs/09
+    §5.2's closed extraction schema (`UserProfileFacts` /
+    `UserProfilePreferences` / `OpenIssue` in app/domain/types.py) is a
+    Pydantic-boundary control applied by the post-call merge; Postgres
+    will accept any JSON shape in these columns. docs/12 §6's JSONB policy
+    accepts that trade because these rows are read whole and never
+    filtered by inner fields on a hot path — but "validated by Pydantic"
+    is a property of the write path, not of this table.
+
+    Domain twin: `app.domain.types.UserProfile`.
+    """
+
+    __tablename__ = "user_profiles"
+
+    user_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    facts: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'{}'")
+    )
+    preferences: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'{}'")
+    )
+    open_issues: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'[]'")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_by_call: Mapped[str | None] = mapped_column(Text)
+
+
+# --------------------------------------------------------------------------
+# Vector zone (docs/12 §5, docs/09 §6.1)
+# --------------------------------------------------------------------------
+
+
+class KbArticle(Base):
+    """Mirrors `kb_articles` (docs/12 §5) — the **source of record** for
+    support knowledge, written by the seed script at deploy time.
+
+    **No `embedding` column, by design.** A ~40-article KB chunks into
+    ~180 heading-aware ~300-token pieces, and retrieval quality lives at
+    chunk granularity: one article-level vector averages away exactly the
+    section the query wanted. The derived vectors live in `memory_chunks`,
+    so re-chunking or re-embedding is `DELETE WHERE kind = 'kb_article'`
+    plus a re-run of the seed embedder — `kb_articles` itself never
+    changes (docs/12 §5).
+
+    Domain twin: `app.domain.types.KbArticle`.
+    """
+
+    __tablename__ = "kb_articles"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('limits', 'settlements', 'refunds', 'devices', 'kyc')",
+            name="ck_kb_articles_category",
+        ),
+    )
+
+    slug: Mapped[str] = mapped_column(Text, primary_key=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body_md: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MemoryChunk(Base):
+    """Mirrors `memory_chunks` (docs/09 §6.1 owns it per canon §11; docs/12
+    §5 reproduces it and names the index `idx_chunks_embedding`). The
+    **derived** embedding store for both KB chunks and call summaries,
+    discriminated by `kind`, sharing one table and one HNSW cosine index.
+
+    `source_id` is polymorphic — `kb_articles.slug` when `kind =
+    'kb_article'`, `conversations.session_id` when `kind = 'call_summary'`
+    — so it carries **no FK**: a column cannot reference two tables. Both
+    docs' DDL leave it unconstrained for the same reason. Consequence: a
+    dangling `source_id` is representable, and only the seed/post-call
+    writers keep it honest.
+
+    **`ck_memory_chunks_user_scope` is this file's addition, and it is the
+    important one.** Both docs annotate the column `-- NULL for KB;
+    REQUIRED for call_summary (scoping)`, but **neither doc's DDL declares
+    any constraint enforcing it** — the comment claimed more than the SQL
+    delivered. The retrieval predicate docs/09 §6.2 pins as a security
+    invariant is `kind = 'kb_article' OR user_id = :session_user`, and it
+    is only sound if the two halves of that comment actually hold, so the
+    biconditional is declared here rather than trusted:
+
+    - a `call_summary` with `user_id IS NULL` matches no merchant at all
+      (`NULL = 'usr_x'` is NULL, not true) — the summary is silently
+      unreachable by its own owner, memory loss that no error reports;
+    - a `kb_article` carrying a `user_id` is the mirror-image bug — a row
+      that is globally readable via the `kind` half of the predicate while
+      being labelled as if it were merchant-private.
+
+    The same biconditional is re-checked in
+    `app.domain.types.MemoryChunk`, so a bad row is rejected at whichever
+    boundary it reaches first. Neither check is the tenant-scoping control
+    itself — that is the WHERE clause in Batch 2's retriever. This one
+    only guarantees the data the WHERE clause reasons about is
+    well-formed.
+
+    **HNSW over ivfflat**: ivfflat needs training on a representative
+    sample and list-count retuning as the corpus grows — wrong assumptions
+    for a table starting at ~180 chunks and growing one row per call —
+    while HNSW builds incrementally with better recall at small/streaming
+    sizes. Its costs (slower writes, more memory) are irrelevant at one
+    insert per call. Honest caveat from docs/09 §6.1 and docs/12 §5: at
+    ~200 rows this index is decoration, a sequential scan is
+    sub-millisecond. It exists so the schema is production-shaped.
+
+    Domain twin: `app.domain.types.MemoryChunk`.
+    """
+
+    __tablename__ = "memory_chunks"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('kb_article', 'call_summary')",
+            name="ck_memory_chunks_kind",
+        ),
+        CheckConstraint(
+            "(kind = 'call_summary') = (user_id IS NOT NULL)",
+            name="ck_memory_chunks_user_scope",
+        ),
+        CheckConstraint(
+            # Separate on purpose. Folding `<> ''` into the biconditional
+            # does not preserve it: an inner-AND variant starts permitting a
+            # kb_article carrying '', and a btrim-replacement variant
+            # additionally permits a call_summary with a NULL user_id — the
+            # headline bug. An OR'd variant is worse still, permitting
+            # kb_article+user, call_summary+NULL and call_summary+''
+            # alike. An AND-appended variant is behaviourally equivalent to
+            # this pair but collapses two distinct invariants into one
+            # opaque violation, so you lose which one failed.
+            #
+            # (An earlier version of this comment claimed a folded variant
+            # would forbid a kb_article's legitimate NULL. It would not —
+            # every folding accepts that row. The decision is right; that
+            # reason was wrong.)
+            #
+            # Blank is its own failure: `user_id = ''` is not NULL, so it
+            # satisfies the biconditional while matching no principal,
+            # producing a call summary that looks scoped and is reachable
+            # by nobody. `~ '\\S'` rather than `btrim(...) <> ''` because
+            # one-argument btrim strips spaces only — a tab- or
+            # newline-only id would survive it.
+            r"user_id IS NULL OR user_id ~ '\S'",
+            name="ck_memory_chunks_user_id_not_blank",
+        ),
+        Index(
+            "idx_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[str | None] = mapped_column(Text)
+    source_id: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Any] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+def memory_scope(principal: SessionUser) -> ColumnElement[bool]:
+    """docs/09 §6.2's retrieval scoping predicate — `kind = 'kb_article'
+    OR user_id = :session_user` — as one composable clause.
+
+    It exists so the predicate has **one reviewable call site** instead of
+    being re-derived at each query. docs/09 §6.2 says the scoping "lives in
+    the one function that issues the query"; this is the smaller, testable
+    piece of that: a caller composes it with `.where(...)` rather than
+    hand-writing an OR whose second branch is easy to drop.
+
+    Requiring `SessionUser` (not a bare `user_id: str`) keeps it on the
+    same principal-injection path as the tool layer (docs/10 §1 invariant
+    3), so a scope cannot be assembled from an untrusted string at the
+    call site.
+
+    **What this is not.** Calling it is not enforced — a query that never
+    calls it is still valid Python and valid SQL, and nothing in this
+    module can detect one. Making it the *only* path to the table means
+    giving `SemanticRepo` sole ownership of `search()` (docs/04 §5); that
+    is Batch 2's to build, and this function is what it should compose.
+
+    **Index caveat for the caller.** `memory_chunks.user_id` is
+    unindexed, and pgvector's HNSW post-filters: an ANN scan collects
+    candidates by vector distance *first*, then this predicate removes the
+    ones that don't match. A merchant whose own summaries are all outside
+    the top `ef_search` candidates can therefore get zero of their own
+    rows back. The correct levers are raising `ef_search`, enabling
+    iterative index scans, or adding a partial index. Fetching a larger
+    top-k globally and filtering in Python is **not** an acceptable
+    workaround: it pulls other merchants' summaries into application
+    memory, which is the exact exposure the predicate exists to prevent.
+    Irrelevant at the demo's ~200 rows, where the planner picks a
+    sequential scan anyway; it matters the moment the corpus grows.
+    """
+    return (MemoryChunk.kind == MemoryKind.KB_ARTICLE.value) | (
+        MemoryChunk.user_id == principal.user_id
     )
