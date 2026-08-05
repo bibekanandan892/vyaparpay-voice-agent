@@ -91,15 +91,23 @@ pip install -e ".[dev]"
 
 pytest tests --ignore=tests/models --ignore=tests/e2e  # no Docker required
 pytest tests/models tests/e2e  # testcontainers-gated: need Docker (Postgres)
+pytest tests/e2e/test_voice_pipeline_e2e.py  # no Docker; needs `pip install -e ".[dev,voice]"`
 ruff check .
 mypy app
 ```
 
-Two test directories are testcontainers-gated (`tests/models/test_orm.py`,
+Two test *files* are testcontainers-gated (`tests/models/test_orm.py`,
 `tests/e2e/test_canonical_conversation.py`) and need a running Docker
 daemon — everything else runs against hand-rolled fakes
 (`tests/fakes.py`'s `FakeLLM`, `tests/support/fake_redis.py`'s
 `FakeRedis`) with no external services.
+
+`tests/e2e/test_voice_pipeline_e2e.py` is the exception inside a gated
+*directory*: it needs no container, only the `[voice]` extra, so it gets
+its own line above. The first command's blanket `--ignore=tests/e2e` skips
+it, and without the extra it `importorskip`s to a silent green skip — which
+is exactly how it went unrun for a whole phase (CI runs it explicitly in the
+`gates` job now; see `.github/workflows/ci.yml`).
 
 ## Configuration
 

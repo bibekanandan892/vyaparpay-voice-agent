@@ -51,6 +51,44 @@ class EventLog:
         await self._redis.raw.ltrim(key, -EVENTS_MAX_LEN, -1)
         await self._redis.raw.expire(key, CTX_TTL_SECONDS)
 
+    async def append_many(self, session_id: str, events: list[dict[str, Any]]) -> None:
+        """Review fix (MEDIUM, audit-MEDIUMs review of `_persist_recent_events`):
+        that caller loops [append] once per `POST /v1/sessions` `recent_events`
+        entry — up to `session_create_request.v1.json`'s `_MAX_RECENT_EVENTS`
+        (50) — and [append] is itself three sequential Redis round trips, so a
+        full-size batch was up to 150 sequential awaits blocking the `201`
+        response on exactly the "merchant is trying to start a support call"
+        path docs/13 §2.1 says the ergonomics matter for.
+
+        A single `redis.pipeline(transaction=True)` batches all of it into one
+        round trip — the same tool `enforce_rate` already uses
+        (`app/data/redis_client.py`) for the identical reason. One `RPUSH` with
+        every event as a variadic argument (not N single-value `RPUSH`s inside
+        the pipeline) keeps this a single command in the pipeline rather than
+        `len(events)` of them; `LTRIM`/`EXPIRE` still run once, after, exactly
+        as [append] does for one event.
+
+        No-ops on an empty list rather than pipelining zero commands — an
+        empty `RPUSH` is invalid, and "nothing to persist" needs no round
+        trip at all, matching the caller's own no-key-written behavior for
+        `recent_events: []` before this method existed.
+
+        [append] itself is untouched and still the right call for its one
+        other caller (`ContextDispatcher`, `app/voice/context_dispatch.py`):
+        an in-call `ctx.event` arrives one message at a time over the data
+        channel, so there is never a batch to pipeline there — the round-trip
+        cost this fix removes is a REST-body-shaped problem, not a per-event
+        one."""
+        if not events:
+            return
+        key = _ctx_events_key(session_id)
+        payloads = [orjson.dumps(event).decode() for event in events]
+        async with self._redis.raw.pipeline(transaction=True) as pipe:
+            pipe.rpush(key, *payloads)
+            pipe.ltrim(key, -EVENTS_MAX_LEN, -1)
+            pipe.expire(key, CTX_TTL_SECONDS)
+            await pipe.execute()
+
     async def get_events(
         self, session_id: str, *, limit: int | None = None
     ) -> list[dict[str, Any]]:

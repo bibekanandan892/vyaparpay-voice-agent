@@ -5,6 +5,8 @@ import com.vyaparpay.core.network.di.NetworkModule
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -100,7 +102,14 @@ class VyaparApiSessionsTest {
     }
 
     @Test
-    fun `recent events serialize with the three app_event fields the schema pins`() = runBlocking {
+    fun `every event variant serializes with exactly its app_event v1 field set`() = runBlocking {
+        // The docs/13 §2.1 canonical request's own timeline, verbatim from
+        // protocol/fixtures/session_create_request.json — one event per
+        // variant, in the fixture's oldest-first order. Each assertion is the
+        // schema's `required` list for that $def, and the KEY SET is the
+        // assertion that matters: it catches both a dropped per-variant field
+        // (the audit finding this test exists for) and a null leaking onto
+        // the wire for a variant that does not carry that field.
         server.enqueue(MockResponse().setResponseCode(201).setBody(CANONICAL_CREATE_RESPONSE))
 
         api.createSession(
@@ -108,7 +117,85 @@ class VyaparApiSessionsTest {
                 userId = "usr_rajesh01",
                 screenContext = null,
                 recentEvents = listOf(
-                    RecentEventDto(type = "tap", name = "Call Support", ts = 1_784_536_458_000L),
+                    RecentEventDto(
+                        type = "nav",
+                        name = "PaymentScreen",
+                        ts = 1_784_536_395_000L,
+                        from = "DashboardScreen",
+                    ),
+                    RecentEventDto(
+                        type = "input", name = "amount", ts = 1_784_536_417_000L, value = "₹245",
+                    ),
+                    RecentEventDto(
+                        type = "tap",
+                        name = "Pay Now",
+                        ts = 1_784_536_440_000L,
+                        screen = "PaymentScreen",
+                    ),
+                    RecentEventDto(
+                        type = "api_error",
+                        name = "POST /payments",
+                        ts = 1_784_536_440_820L,
+                        status = 402,
+                        code = "DAILY_LIMIT_EXCEEDED",
+                    ),
+                    RecentEventDto(
+                        type = "dialog",
+                        name = "Daily Limit Exceeded",
+                        ts = 1_784_536_440_900L,
+                        visible = true,
+                    ),
+                ),
+            ),
+        )
+
+        val body = json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+        val events = body.getValue("recent_events").jsonArray.map { it.jsonObject }
+        assertEquals(5, events.size)
+
+        val nav = events[0]
+        assertEquals(setOf("type", "name", "ts", "from"), nav.keys)
+        assertEquals("nav", nav.getValue("type").jsonPrimitive.content)
+        assertEquals("PaymentScreen", nav.getValue("name").jsonPrimitive.content)
+        assertEquals(1_784_536_395_000L, nav.getValue("ts").jsonPrimitive.long)
+        assertEquals("DashboardScreen", nav.getValue("from").jsonPrimitive.content)
+
+        val input = events[1]
+        assertEquals(setOf("type", "name", "ts", "value"), input.keys)
+        assertEquals("₹245", input.getValue("value").jsonPrimitive.content)
+
+        val tap = events[2]
+        assertEquals(setOf("type", "name", "ts", "screen"), tap.keys)
+        assertEquals("PaymentScreen", tap.getValue("screen").jsonPrimitive.content)
+
+        // The highest-value diagnostic in the whole timeline: which failure
+        // the merchant just hit. The old three-field projection dropped both.
+        val apiError = events[3]
+        assertEquals(setOf("type", "name", "ts", "status", "code"), apiError.keys)
+        assertEquals(402, apiError.getValue("status").jsonPrimitive.int)
+        assertEquals("DAILY_LIMIT_EXCEEDED", apiError.getValue("code").jsonPrimitive.content)
+
+        val dialog = events[4]
+        assertEquals(setOf("type", "name", "ts", "visible"), dialog.keys)
+        assertTrue(dialog.getValue("visible").jsonPrimitive.boolean)
+    }
+
+    @Test
+    fun `an input event omits value entirely rather than sending null`() = runBlocking {
+        // docs/08 §2.1: a sensitive field class makes the event "omit the
+        // value rather than sending [REDACTED]" — which app_event.v1.json
+        // states is "why value is optional here rather than required-and-
+        // nullable". This is the assertion that pins kotlinx's
+        // `encodeDefaults = false` (NetworkModule.provideJson) as part of the
+        // wire contract rather than an incidental default.
+        server.enqueue(MockResponse().setResponseCode(201).setBody(CANONICAL_CREATE_RESPONSE))
+
+        api.createSession(
+            SessionCreateRequestDto(
+                userId = "usr_rajesh01",
+                screenContext = null,
+                recentEvents = listOf(
+                    RecentEventDto(type = "input", name = "upi_pin", ts = 1_784_536_417_000L),
                 ),
             ),
         )
@@ -116,9 +203,36 @@ class VyaparApiSessionsTest {
         val body = json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
         val event = body.getValue("recent_events").jsonArray[0].jsonObject
         assertEquals(setOf("type", "name", "ts"), event.keys)
-        assertEquals("tap", event.getValue("type").jsonPrimitive.content)
-        assertEquals("Call Support", event.getValue("name").jsonPrimitive.content)
-        assertEquals(1_784_536_458_000L, event.getValue("ts").jsonPrimitive.long)
+    }
+
+    @Test
+    fun `recent events keep the order they were given, oldest first`() = runBlocking {
+        // session_create_request.v1.json pins oldest-first, the backend
+        // RPUSHes in array order, and ContextCompressor.render_timeline_slot
+        // slices `events[-15:]` for "the newest 15" — so the transport must
+        // not reorder. (The producer-side reversal of EventTracker's
+        // newest-first buffer is AppStateManagerTest's subject.)
+        server.enqueue(MockResponse().setResponseCode(201).setBody(CANONICAL_CREATE_RESPONSE))
+
+        api.createSession(
+            SessionCreateRequestDto(
+                userId = "usr_rajesh01",
+                screenContext = null,
+                recentEvents = (0..4).map {
+                    RecentEventDto(
+                        type = "tap",
+                        name = "e$it",
+                        ts = 1_784_536_440_000L + it * 1_000L,
+                        screen = "PaymentScreen",
+                    )
+                },
+            ),
+        )
+
+        val body = json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+        val names = body.getValue("recent_events").jsonArray
+            .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+        assertEquals(listOf("e0", "e1", "e2", "e3", "e4"), names)
     }
 
     // -- docs/13 §9: unknown fields must be ignored ---------------------------------

@@ -221,18 +221,42 @@ public class AppStateManager internal constructor(
      * only when no operational screen has ever been captured (the retained
      * IR is itself unavailable — e.g. a cold start landing directly on
      * `HelpScreen`); `recentEvents` maps the real [AppEvent] sealed hierarchy
-     * onto the wire's `{type, name, ts}` shape (docs/08 §2.1's three common
-     * fields — the DTO, like the `ctx_event_payload` envelope def, only
-     * carries those three; per-variant fields are a data-channel-only
-     * concern, see `ScreenContextPublisher.toJson`). [userId] is a plain
-     * passthrough — this class has no identity of its own.
+     * onto `protocol/schemas/app_event.v1.json`'s full per-variant shape (see
+     * [toRecentEventDto]). [userId] is a plain passthrough — this class has
+     * no identity of its own.
+     *
+     * **Audit fix (2026-08-05) — `asReversed()`, and why the reversal lives
+     * HERE.** `session_create_request.v1.json` pins `recent_events` as
+     * *oldest first* (and `protocol/fixtures/session_create_request.json` is
+     * ts-ascending), but [EventTracker.recent] is newest-first by its own
+     * documented contract — `RingBufferEventTracker` returns
+     * `buffer.asReversed().take(count)`. This mapping used to ship that
+     * order straight through, so the backend `RPUSH`ed the timeline
+     * backwards into `ctx:{id}:events` and `ContextCompressor
+     * .render_timeline_slot`'s `events[-15:]` "newest fifteen" slice would
+     * have selected the OLDEST fifteen and rendered them in reverse — the
+     * agent opening the call with the merchant's history read back to front.
+     *
+     * The reversal belongs at this one mapping, not in [EventTracker], and
+     * not in [AppContextState]: newest-first is what every OTHER consumer of
+     * that buffer wants and relies on — [EventTracker.lastAction] is
+     * literally "the most recent entry", `SemanticSnapshotBuilder` scans the
+     * same list front-to-back looking for the most recent `api_error` to
+     * populate `last_api`, and `AppContextState.recentEvents` is documented
+     * against the tracker's order. Flipping the shared contract to satisfy
+     * one wire format would break all of them silently. `sessionCreateBody`
+     * is the single place in the app that speaks `session_create_request/v1`,
+     * so it is the single place the wire's ordering convention applies.
+     *
+     * `asReversed()` is a *view*, not a copy — the `.map` immediately after
+     * it is what allocates, so this costs one list, not two.
      */
     public fun sessionCreateBody(userId: String): SessionCreateRequestDto {
         val current = state.value
         return SessionCreateRequestDto(
             userId = userId,
             screenContext = current.screen?.toJson(),
-            recentEvents = current.recentEvents.map { it.toRecentEventDto() },
+            recentEvents = current.recentEvents.asReversed().map { it.toRecentEventDto() },
         )
     }
 
@@ -252,14 +276,53 @@ public class AppStateManager internal constructor(
 }
 
 /**
- * `AppEvent` -> `RecentEventDto`'s three-field wire shape. Duplicates
- * `SemanticSnapshotBuilder.kt`'s private, file-scoped `AppEventType.
- * wireName()` (`name.lowercase()`) rather than reusing it — that extension
- * is `private` to its own file, and `AppEvent.kt` itself exposes no public
- * wire-name helper (confirmed: no such declaration exists in `:core:analytics`
- * today). A tiny, honest duplication, in the same spirit `ctx_delta.v1.json`'s
- * own file description accepts for its locally-duplicated `last_action`/
- * `last_api` defs.
+ * `AppEvent` -> `RecentEventDto`, the full `protocol/schemas/app_event.v1
+ * .json` shape: the `{type, name, ts}` canon every variant carries, plus
+ * that variant's own required fields from docs/08 §2.1's per-type table.
+ *
+ * **Audit fix (2026-08-05).** This used to project away every per-variant
+ * field, on the stated grounds that they were "a data-channel-only
+ * concern". They are not: `app_event.v1.json` names session-create's
+ * `recent_events` as one of the three places it is the shape authority for,
+ * and `protocol/fixtures/session_create_request.json` carries the full
+ * shape in all eight of its events. The projection cost the agent
+ * `api_error`'s `status`/`code` — the one fact that says *which* failure
+ * the merchant just hit, and the reason they are calling — and
+ * `dialog.visible`.
+ *
+ * Deliberately the same mapping as `ScreenContextPublisher.kt`'s
+ * `AppEvent.toWirePayload()`, which builds the identical five-variant shape
+ * for the `ctx.event` data channel — one schema, two encoders. They stay
+ * separate because they emit different types (a typed DTO here, a
+ * `JsonObject` there, since the data-channel envelope's payload is
+ * uninterpreted) and live in modules with different dependencies; that
+ * publisher's kdoc already documents and accepts the same duplication in
+ * the other direction. The exhaustive `when` over the sealed [AppEvent] is
+ * what keeps them from drifting apart *silently*: adding a sixth event type
+ * fails compilation in both files, which is exactly the closed-taxonomy
+ * guarantee docs/08 §2.1 asks for ("a new event type is a protocol version
+ * bump, not a config flag").
+ *
+ * The `type` string still comes from `type.name.lowercase()` — duplicating
+ * `SemanticSnapshotBuilder.kt`'s private, file-scoped `AppEventType
+ * .wireName()` rather than reusing it, since that extension is `private` to
+ * its own file and `:core:analytics` exposes no public wire-name helper.
+ * `API_ERROR.name.lowercase()` is `"api_error"`, matching the schema's enum
+ * exactly.
  */
-private fun AppEvent.toRecentEventDto(): RecentEventDto =
-    RecentEventDto(type = type.name.lowercase(), name = name, ts = ts)
+private fun AppEvent.toRecentEventDto(): RecentEventDto {
+    val wireType = type.name.lowercase()
+    return when (this) {
+        is AppEvent.Nav -> RecentEventDto(type = wireType, name = name, ts = ts, from = from)
+        is AppEvent.Tap -> RecentEventDto(type = wireType, name = name, ts = ts, screen = screen)
+        // `value` stays null for sensitive field classes, and a null default
+        // is *omitted* from the JSON rather than encoded (see RecentEventDto's
+        // kdoc) — docs/08 §2.1's "omit the value rather than sending
+        // [REDACTED]", which is why the schema makes it optional-not-nullable.
+        is AppEvent.Input -> RecentEventDto(type = wireType, name = name, ts = ts, value = value)
+        is AppEvent.ApiErrorEvent ->
+            RecentEventDto(type = wireType, name = name, ts = ts, status = status, code = code)
+        is AppEvent.Dialog ->
+            RecentEventDto(type = wireType, name = name, ts = ts, visible = visible)
+    }
+}

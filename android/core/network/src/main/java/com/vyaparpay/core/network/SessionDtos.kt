@@ -42,21 +42,97 @@ public data class SessionCreateRequestDto(
      * [JsonObject] is the honest carrier until then.
      */
     @SerialName("screen_context") val screenContext: JsonObject?,
-    /** The last ~15 `app_event/v1` timeline entries, oldest first; Phase 3 always sends `[]`. */
+    /**
+     * The last ~15 `app_event/v1` timeline entries, **oldest first**
+     * (`session_create_request.v1.json`); Phase 3 always sends `[]`.
+     *
+     * The ordering is a contract, not a formality: the backend `RPUSH`es
+     * this array into `ctx:{session_id}:events` in the order given, and
+     * `ContextCompressor.render_timeline_slot` takes "the newest 15" as
+     * `events[-15:]` — so a newest-first array would hand the agent the
+     * OLDEST fifteen actions, rendered backwards. `EventTracker.recent()`
+     * is newest-first by its own contract, so the producer
+     * (`AppStateManager.sessionCreateBody`) reverses on the way in here;
+     * see that function for why the reversal lives there and not in the
+     * tracker.
+     */
     @SerialName("recent_events") val recentEvents: List<RecentEventDto>,
 )
 
 /**
- * One `app_event/v1` timeline entry — the three fields every event variant
- * carries (the schema's own scope). Per-variant fields are docs/07/08
- * territory and arrive with Phase-4 capture.
+ * One `app_event/v1` timeline entry, field-for-field against
+ * `protocol/schemas/app_event.v1.json` — that file is explicit about being
+ * the shape authority for all three places an event appears, and
+ * session-create's `recent_events` is named as one of them.
+ *
+ * **Audit fix (2026-08-05) — this used to be a hard `{type, name, ts}`
+ * projection.** The kdoc justifying that projection claimed per-variant
+ * fields were "a data-channel-only concern"; the schema's own description
+ * says the opposite, and `protocol/fixtures/session_create_request.json`
+ * ships the full per-variant shape in every one of its eight events. The
+ * cost of the projection was concrete, not theoretical: `api_error`'s
+ * [status]/[code] — the single highest-value diagnostic the pre-call
+ * timeline carries, and the one fact that tells the agent *which* failure
+ * the merchant just hit — was dropped on the floor, along with
+ * [visible], which is the difference between a dialog the merchant is
+ * staring at and one they already dismissed.
+ *
+ * **Flat, with nullable per-variant fields, rather than a sealed hierarchy
+ * mirroring `AppEvent`'s.** `AppEvent` is a sealed interface for a stated
+ * reason ("a `NAV` event without `from` should not typecheck") and that
+ * reasoning is right *there* — at the point where events are constructed by
+ * hand all over the app. It does not transfer here: this DTO has exactly
+ * one producer (`AppStateManager.toRecentEventDto`, an exhaustive `when`
+ * over that same sealed hierarchy, so the compiler already guarantees every
+ * variant is mapped and mapped completely), and this file's stated job is
+ * to be "a photograph of the wire". A polymorphic DTO would additionally
+ * put kotlinx's class-discriminator machinery on the encode path of a body
+ * that `VoiceCallService` also round-trips through a plain `Json` as an
+ * Intent extra — real risk, in modules outside this one, for a type-safety
+ * guarantee already held one layer up.
+ *
+ * **Absent, not null, is the wire contract.** Every per-variant field
+ * defaults to `null` and kotlinx's `encodeDefaults` is `false` by default
+ * (`NetworkModule.provideJson` does not override it), so a field left at
+ * its default is *omitted from the JSON entirely* rather than serialized as
+ * `null`. That is exactly what `app_event.v1.json` requires — of [value]
+ * most sharply: docs/08 §2.1 has the event "omit the value rather than
+ * sending [REDACTED]" for sensitive field classes, "which is why value is
+ * optional here rather than required-and-nullable" (the schema's own
+ * words). `VyaparApiSessionsTest` asserts the exact emitted key set per
+ * variant through the production [Json], so a future `encodeDefaults = true`
+ * cannot quietly start leaking `"from": null` onto every `tap`.
  */
 @Serializable
 public data class RecentEventDto(
+    /** The closed docs/08 §2.1 taxonomy as a wire string: `nav`/`tap`/`input`/`api_error`/`dialog`. */
     @SerialName("type") val type: String,
+    /**
+     * Meaning depends on [type] (docs/08 §2.1's "name carries" column):
+     * destination route for `nav`, target label/testTag for `tap`, field
+     * testTag/label for `input`, `"METHOD path"` for `api_error`, dialog
+     * title for `dialog`.
+     */
     @SerialName("name") val name: String,
     /** Epoch milliseconds, on-device. */
     @SerialName("ts") val ts: Long,
+    /** `nav` only, required there: the previous route. */
+    @SerialName("from") val from: String? = null,
+    /** `tap` only, required there: the route the tap happened on. */
+    @SerialName("screen") val screen: String? = null,
+    /**
+     * `input` only, and **optional even there** — present for non-sensitive
+     * field classes, absent otherwise (docs/07 §5 rule 6's classification).
+     * The absence *is* the redaction; "the user edited the PIN field" is
+     * already the whole signal.
+     */
+    @SerialName("value") val value: String? = null,
+    /** `api_error` only, required there: the HTTP status code, e.g. `402`. */
+    @SerialName("status") val status: Int? = null,
+    /** `api_error` only, required there: the docs/13 §1.1 error-code vocabulary string. */
+    @SerialName("code") val code: String? = null,
+    /** `dialog` only, required there: `true` on attach, `false` on detach. */
+    @SerialName("visible") val visible: Boolean? = null,
 )
 
 /**

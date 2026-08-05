@@ -30,6 +30,11 @@ class FakePipeline:
     def __init__(self, store: FakeRedis) -> None:
         self._store = store
         self._ops: list[tuple[str, tuple[Any, ...]]] = []
+        # What the last `execute()` drained, retained so a test can assert
+        # on the exact command shape that was pipelined -- one variadic
+        # RPUSH vs. N single-value ones, say. `_ops` itself is cleared by
+        # `execute()`, mirroring the real client's one-shot semantics.
+        self.executed_ops: list[tuple[str, tuple[Any, ...]]] = []
 
     def zremrangebyscore(self, key: str, min_: Any, max_: Any) -> FakePipeline:
         self._ops.append(("zremrangebyscore", (key, min_, max_)))
@@ -47,7 +52,27 @@ class FakePipeline:
         self._ops.append(("expire", (key, seconds)))
         return self
 
+    def rpush(self, key: str, *values: str) -> FakePipeline:
+        # Audit fix, 2026-08-05: added alongside `ltrim` so `EventLog
+        # .append_many`'s pipeline (RPUSH all events, LTRIM, EXPIRE) has
+        # something to queue against -- this pipeline previously only ever
+        # carried `enforce_rate`'s zset ops.
+        self._ops.append(("rpush", (key, *values)))
+        return self
+
+    def ltrim(self, key: str, start: int, end: int) -> FakePipeline:
+        self._ops.append(("ltrim", (key, start, end)))
+        return self
+
     async def execute(self) -> list[Any]:
+        """Fidelity gap worth knowing before writing a failure-injection
+        test against this: real Redis `MULTI`/`EXEC` commits the queued
+        commands as a unit server-side, whereas this dispatches them one
+        at a time, so an injected mid-`execute` raise leaves the earlier
+        commands' mutations behind. Fine for the ordering and
+        command-shape assertions this fake exists for -- just not
+        evidence about real transactional atomicity."""
+        self.executed_ops = list(self._ops)
         results = [getattr(self._store, f"_{name}")(*args) for name, args in self._ops]
         self._ops.clear()
         return results
@@ -90,8 +115,15 @@ class FakeRedis:
         self.ttls[key] = seconds
 
     # -- list ----------------------------------------------------------
-    async def rpush(self, key: str, value: str) -> None:
-        self.lists.setdefault(key, []).append(value)
+    async def rpush(self, key: str, *values: str) -> None:
+        # Variadic (audit fix, 2026-08-05): real `RPUSH key v1 v2 ... vn` is
+        # variadic, and `EventLog.append_many` pipelines exactly one such
+        # call for a whole batch rather than N single-value RPUSHes -- the
+        # fake needs the same shape or that pipeline breaks under every test
+        # that exercises it. `EventLog.append`'s existing single-value call
+        # site still works unchanged: one positional argument is a
+        # one-element `values` tuple.
+        self.lists.setdefault(key, []).extend(values)
 
     async def lrange(self, key: str, start: int, end: int) -> list[str]:
         items = self.lists.get(key, [])
@@ -145,6 +177,16 @@ class FakeRedis:
 
     def _expire(self, key: str, seconds: int) -> bool:
         self.ttls[key] = seconds
+        return True
+
+    def _rpush(self, key: str, *values: str) -> int:
+        target = self.lists.setdefault(key, [])
+        target.extend(values)
+        return len(target)
+
+    def _ltrim(self, key: str, start: int, end: int) -> bool:
+        items = self.lists.get(key, [])
+        self.lists[key] = items[start:] if end == -1 else items[start : end + 1]
         return True
 
     def pipeline(self, transaction: bool = True) -> FakePipeline:

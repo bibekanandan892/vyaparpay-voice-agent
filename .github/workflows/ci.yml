@@ -4,13 +4,30 @@
 #
 # Two jobs on purpose:
 # - `gates` mirrors the local loop exactly (ruff, mypy, non-Docker pytest)
-#   and is the signal to watch on every PR.
+#   and is the signal to watch on every PR. It additionally runs the ONE
+#   tests/e2e file that needs no container (see its step below).
 # - `docker-gated` runs tests/models + tests/e2e via testcontainers
 #   (ubuntu-latest ships a Docker daemon). These suites were written with
 #   the Phase-2 build but have NEVER been executed anywhere — no local
 #   Docker was available — so this job is genuinely new coverage, not a
 #   re-run. It is a separate job so a testcontainers-specific failure is
 #   immediately distinguishable from a core-gate failure.
+#
+# Audit fix (2026-08-05) — tests/e2e/test_voice_pipeline_e2e.py had never
+# run in either job. `gates` ignored tests/e2e wholesale, and while
+# `docker-gated` does name tests/e2e, it installs only `.[dev]` — so that
+# file's `pytest.importorskip("aiortc")` turned it into a silent green
+# skip there. The fix routes it to `gates`, on the evidence rather than by
+# analogy with its neighbour: the file declares no fixture of its own and
+# tests/e2e has no conftest.py, so the testcontainers fixtures in
+# test_canonical_conversation.py (module-scoped, including its autouse
+# one) do not reach it; its Redis is tests/support/fake_redis, its VAD is
+# an in-test energy gate rather than the Silero ONNX model, and its own
+# docstring states it "needs no container of its own — only the [voice]
+# extra". `gates` is the only job that installs that extra, and installs
+# it precisely for this test. `docker-gated` still names tests/e2e as a
+# directory (so a future container-needing E2E is picked up automatically)
+# and simply skips this one there.
 name: CI
 
 on:
@@ -58,6 +75,19 @@ jobs:
         run: mypy app
       - name: Pytest (non-Docker suites)
         run: pytest tests -q --ignore=tests/models --ignore=tests/e2e
+      # Kept a separate step rather than folded into the line above so the
+      # step above stays byte-identical to the local gate command
+      # (backend/README.md "Development"), and so a failure here is
+      # immediately attributable to the integrated voice path.
+      #
+      # The import check is the point, not ceremony: the file guards itself
+      # with `pytest.importorskip("aiortc")`, so without the [voice] extra
+      # it reports a green skip — which is exactly how this test went unrun
+      # for a whole phase. A missing extra must fail the job loudly instead.
+      - name: Pytest (voice E2E — needs [voice], needs no container)
+        run: |
+          python -c "import aiortc, av, websockets"
+          pytest tests/e2e/test_voice_pipeline_e2e.py -q
 
   docker-gated:
     name: testcontainers suites (ORM + E2E)
@@ -86,5 +116,11 @@ jobs:
           cache-dependency-path: backend/pyproject.toml
       - name: Install
         run: pip install -e ".[dev]"
+      # Directories, not files, so a future container-needing suite is
+      # picked up without editing this line. `.[dev]` (no `voice`) is
+      # deliberate: the only tests/e2e file needing that extra is
+      # test_voice_pipeline_e2e.py, which needs no container and therefore
+      # runs in `gates` instead — it importorskips to a skip here, and that
+      # skip is expected, not a regression.
       - name: Pytest (Docker-gated suites)
         run: pytest tests/models tests/e2e -q
