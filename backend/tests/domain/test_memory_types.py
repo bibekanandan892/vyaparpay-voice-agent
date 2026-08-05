@@ -6,8 +6,9 @@ These run in the standard suite: they are pure Pydantic, no database.
 They cover the invariants this layer actually enforces — and, where a
 docstring claims something the type does *not* enforce, there is a test
 pinning that gap honestly rather than a test implying coverage that
-doesn't exist (see `test_user_profile_jsonb_shape_is_not_enforced_by_the_row`
-in tests/models/test_memory_orm.py for the DB-side counterpart).
+doesn't exist (see
+`test_user_profile_row_does_not_validate_its_jsonb_shape` in
+tests/models/test_memory_orm.py for the DB-side counterpart).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from app.domain.types import (
     OpenIssue,
     Resolution,
     RetrievedMemory,
+    SessionUser,
     UserProfile,
     UserProfileFacts,
     UserProfilePreferences,
@@ -173,6 +175,161 @@ def test_retrieved_memory_does_not_carry_the_vector() -> None:
     """ContextBuilder renders these into a ~300-token RAG slot and never
     needs the 1536-float geometry that produced them."""
     assert "embedding" not in RetrievedMemory.model_fields
+
+
+def test_retrieved_memory_identifies_the_owner_of_a_call_summary() -> None:
+    """Defense in depth: without `user_id` on the result, a leaked foreign
+    summary is undetectable downstream — the caller holds the text but
+    nothing that says whose it is, so no assertion is even expressible.
+
+    This is the check the field makes possible, written out as a caller
+    would: it holds whether or not the SQL that produced the results was
+    correctly scoped.
+    """
+    principal = SessionUser(user_id="usr_mine")
+    results = [
+        RetrievedMemory(
+            chunk_id=1,
+            kind=MemoryKind.KB_ARTICLE,
+            source_id="kb_daily_limits",
+            content="KB text",
+            similarity=0.9,
+        ),
+        RetrievedMemory(
+            chunk_id=2,
+            kind=MemoryKind.CALL_SUMMARY,
+            source_id="sess_mine",
+            content="my past call",
+            similarity=0.8,
+            user_id="usr_mine",
+        ),
+    ]
+
+    assert all(
+        r.kind is MemoryKind.KB_ARTICLE or r.user_id == principal.user_id for r in results
+    )
+
+    leaked = RetrievedMemory(
+        chunk_id=3,
+        kind=MemoryKind.CALL_SUMMARY,
+        source_id="sess_theirs",
+        content="another shop's history",
+        similarity=0.95,
+        user_id="usr_theirs",
+    )
+
+    assert not (leaked.kind is MemoryKind.KB_ARTICLE or leaked.user_id == principal.user_id)
+
+
+def test_retrieved_memory_cannot_represent_an_ownerless_call_summary() -> None:
+    """Mirrors `ck_memory_chunks_user_scope` on the read side, so a fake or
+    hand-built result cannot describe an ownership state the stored row
+    could never have been in."""
+    with pytest.raises(ValidationError, match="must be set for kind='call_summary'"):
+        RetrievedMemory(
+            chunk_id=1,
+            kind=MemoryKind.CALL_SUMMARY,
+            source_id="sess_x",
+            content="...",
+            similarity=0.8,
+        )
+
+
+def test_retrieved_memory_rejects_a_kb_article_with_an_owner() -> None:
+    with pytest.raises(ValidationError, match="NULL for kind='kb_article'"):
+        RetrievedMemory(
+            chunk_id=1,
+            kind=MemoryKind.KB_ARTICLE,
+            source_id="kb_daily_limits",
+            content="...",
+            similarity=0.8,
+            user_id="usr_rajesh01",
+        )
+
+
+# --------------------------------------------------------------------------
+# Blank-tenant states (representable-but-invalid, closed at the freeze)
+# --------------------------------------------------------------------------
+
+
+def test_session_user_rejects_a_blank_user_id() -> None:
+    """`SessionUser` is the tenant boundary for both tool authorization and
+    memory retrieval. app/api/deps.py already rejects a falsy JWT `sub`
+    before building one, so this is unreachable today — but a defence that
+    lives only in the caller is one refactor away from not existing."""
+    with pytest.raises(ValidationError):
+        SessionUser(user_id="")
+
+
+def test_memory_chunk_rejects_a_blank_user_id() -> None:
+    """`user_id=""` is not None, so it satisfies the kind/user
+    biconditional while matching no principal — a call summary that looks
+    scoped and is reachable by nobody. Paired with
+    `ck_memory_chunks_user_id_not_blank` at the DB boundary."""
+    with pytest.raises(ValidationError):
+        MemoryChunk(
+            kind=MemoryKind.CALL_SUMMARY,
+            source_id="a1f3c9",
+            content="...",
+            embedding=_vector(),
+            user_id="",
+        )
+
+
+def test_user_profile_rejects_a_blank_user_id() -> None:
+    with pytest.raises(ValidationError):
+        UserProfile(user_id="")
+
+
+# --------------------------------------------------------------------------
+# Size and cardinality bounds (docs/09 §5.2 caps keys, not values)
+# --------------------------------------------------------------------------
+
+
+def test_profile_facts_reject_an_oversized_value() -> None:
+    """The closed schema bounds *keys*; nothing bounded values. These
+    fields are merchant-influenced through voice -> STT -> Haiku
+    extraction and render into the 200-token profile slot, so an
+    unbounded `business_name` is both a slot-budget and a memory hazard."""
+    with pytest.raises(ValidationError):
+        UserProfileFacts(business_name="K" * 5000)
+
+
+def test_profile_facts_accept_a_realistic_value() -> None:
+    """The caps must not trim legitimate data — sized for headroom, not
+    for a tight fit."""
+    facts = UserProfileFacts(business_name="Kumar General Store", city="Jaipur")
+
+    assert facts.business_name == "Kumar General Store"
+
+
+def test_open_issues_cardinality_is_bounded() -> None:
+    """The merge is append-shaped with no doc-specified cap, so an
+    extractor opening an issue every call would crowd out the rest of the
+    profile slot."""
+    issue = OpenIssue(
+        id="iss_001",
+        summary="...",
+        status="pending",
+        opened_call="a1f3c9",
+        opened_at=datetime(2026, 7, 24, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValidationError):
+        UserProfile(user_id="usr_rajesh01", open_issues=tuple(issue for _ in range(21)))
+
+
+def test_memory_chunk_content_is_bounded() -> None:
+    """~300-token KB chunks and ≤250-token summaries (docs/09 §6.1); the
+    cap is ~6x headroom over both and exists to make a multi-megabyte blob
+    unrepresentable."""
+    with pytest.raises(ValidationError):
+        MemoryChunk(
+            kind=MemoryKind.KB_ARTICLE,
+            source_id="kb_daily_limits",
+            content="x" * 50_000,
+            embedding=_vector(),
+        )
 
 
 # --------------------------------------------------------------------------

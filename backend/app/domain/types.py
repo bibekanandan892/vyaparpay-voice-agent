@@ -24,7 +24,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _FROZEN = ConfigDict(frozen=True)
 
@@ -287,7 +287,12 @@ class SessionUser(BaseModel):
 
     model_config = _FROZEN
 
-    user_id: str  # merchant_id; the verified JWT `sub` claim
+    # min_length=1: a blank principal is a representable-but-invalid state,
+    # and this type is the tenant boundary for both tool authorization and
+    # memory retrieval. Unreachable today — app/api/deps.py rejects a falsy
+    # JWT `sub` before constructing one — but a defence that lives only in
+    # the caller is one refactor away from not existing.
+    user_id: str = Field(min_length=1)  # merchant_id; the verified JWT `sub` claim
     name: str | None = None
 
 
@@ -445,10 +450,16 @@ class OpenIssue(BaseModel):
 
     model_config = _FROZEN
 
-    id: str  # 'iss_071'
-    summary: str
-    status: str
-    opened_call: str  # session_id that opened it, for provenance
+    # Length caps throughout: these fields are merchant-influenced through
+    # voice -> STT -> Haiku extraction, and they render into the 200-token
+    # profile slot (canon §8). Nothing upstream bounds what the extractor
+    # can emit, so the cap lives at the validation boundary. Sizes are
+    # generous against that slot, not tight — they exist to make a
+    # pathological value unrepresentable, not to trim a normal one.
+    id: str = Field(max_length=64)  # 'iss_071'
+    summary: str = Field(max_length=300)
+    status: str = Field(max_length=32)
+    opened_call: str = Field(max_length=64)  # session_id that opened it, for provenance
     opened_at: datetime
 
 
@@ -485,10 +496,10 @@ class UserProfileFacts(BaseModel):
 
     model_config = _FROZEN
 
-    business_name: str | None = None
-    city: str | None = None
-    merchant_since: str | None = None
-    account_type: str | None = None
+    business_name: str | None = Field(default=None, max_length=200)
+    city: str | None = Field(default=None, max_length=100)
+    merchant_since: str | None = Field(default=None, max_length=32)
+    account_type: str | None = Field(default=None, max_length=64)
 
 
 class UserProfilePreferences(BaseModel):
@@ -499,7 +510,7 @@ class UserProfilePreferences(BaseModel):
 
     model_config = _FROZEN
 
-    language: str | None = None
+    language: str | None = Field(default=None, max_length=32)
 
 
 class UserProfile(BaseModel):
@@ -517,10 +528,14 @@ class UserProfile(BaseModel):
 
     model_config = _FROZEN
 
-    user_id: str
+    user_id: str = Field(min_length=1)
     facts: UserProfileFacts = UserProfileFacts()
     preferences: UserProfilePreferences = UserProfilePreferences()
-    open_issues: tuple[OpenIssue, ...] = ()
+    # Bounded cardinality as well as bounded strings: the merge is
+    # append-shaped (docs/09 §5.2) with no doc-specified cap, so an
+    # extractor that opens an issue every call would grow this without
+    # limit and crowd out the rest of the 200-token profile slot.
+    open_issues: tuple[OpenIssue, ...] = Field(default=(), max_length=20)
     updated_at: datetime | None = None  # server-assigned; None before first write
     updated_by_call: str | None = None  # session_id of last merge, for provenance
 
@@ -610,10 +625,17 @@ class MemoryChunk(BaseModel):
     model_config = _FROZEN
 
     kind: MemoryKind
-    source_id: str  # kb_articles.slug or conversations.session_id
-    content: str
+    source_id: str = Field(max_length=128)  # kb_articles.slug or conversations.session_id
+    # ~300-token KB chunks and ≤250-token summaries (docs/09 §6.1) — this
+    # cap is ~6x headroom over both, sized to make a pathological blob
+    # unrepresentable rather than to trim legitimate content.
+    content: str = Field(max_length=8000)
     embedding: Embedding
-    user_id: str | None = None  # NULL for KB, required for call_summary
+    # min_length=1 pairs with `ck_memory_chunks_user_id_not_blank`: without
+    # it, `user_id=""` satisfies the biconditional below (it is not None)
+    # while matching no real principal — a call summary that looks scoped
+    # and is reachable by nobody.
+    user_id: str | None = Field(default=None, min_length=1)
     id: int | None = None  # BIGSERIAL; None before insert
     created_at: datetime | None = None  # server-assigned; None before insert
 
@@ -662,6 +684,24 @@ class RetrievedMemory(BaseModel):
     renders these into a ~300-token RAG slot and never needs the geometry
     that produced them.
 
+    **`user_id` is carried on purpose, and it is defense in depth.** Every
+    other field describes *what* was retrieved; this one describes *whose*
+    it is. Without it a leaked foreign call summary is undetectable
+    downstream — the caller holds the text but nothing that identifies its
+    owner, so no assertion is even expressible. With it, a caller can
+    check the scoping outcome independently of whether the SQL that
+    produced it was correct:
+
+        assert all(
+            r.kind is MemoryKind.KB_ARTICLE or r.user_id == principal.user_id
+            for r in results
+        )
+
+    That turns "the WHERE clause must be correct" into "the WHERE clause
+    must be correct *and* someone must delete an assertion". It is not a
+    substitute for the predicate — nothing here runs that check
+    automatically, and this class cannot make a caller write it.
+
     `similarity` is **cosine similarity** (higher is better, 1.0 is
     identical), not the cosine *distance* that pgvector's `<=>` operator
     returns (lower is better). They are related by `similarity = 1 -
@@ -678,6 +718,21 @@ class RetrievedMemory(BaseModel):
     source_id: str
     content: str
     similarity: float
+    # NULL for a kb_article, the owning merchant for a call_summary — the
+    # same biconditional MemoryChunk enforces, re-checked below so a
+    # hand-built or faked result cannot describe an ownership state the
+    # stored row could never have been in.
+    user_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _check_user_scope(self) -> RetrievedMemory:
+        if (self.kind is MemoryKind.CALL_SUMMARY) != (self.user_id is not None):
+            raise ValueError(
+                "RetrievedMemory.user_id must be set for kind='call_summary' and "
+                "NULL for kind='kb_article' — mirrors ck_memory_chunks_user_scope, "
+                "so an owner-less call summary cannot be represented even in a fake"
+            )
+        return self
 
     @field_validator("similarity")
     @classmethod

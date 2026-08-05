@@ -46,8 +46,15 @@ from app.domain.types import (
     EMBEDDING_MODEL,
     RETRIEVAL_FLOOR,
     RETRIEVAL_TOP_K,
+    SessionUser,
 )
-from app.models.orm import ConversationSummary, KbArticle, MemoryChunk, UserProfile
+from app.models.orm import (
+    ConversationSummary,
+    KbArticle,
+    MemoryChunk,
+    UserProfile,
+    memory_scope,
+)
 
 # backend/tests/contract/test_memory_contract.py -> backend/
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -121,8 +128,6 @@ def test_retrieve_requires_a_principal() -> None:
     every merchant's call summaries become readable by every other
     merchant. This assertion is what fails first if that happens.
     """
-    from app.domain.types import SessionUser
-
     principal = _signature(SemanticMemoryProto.retrieve).parameters["principal"]
 
     assert principal.default is inspect.Parameter.empty, (
@@ -137,14 +142,31 @@ def test_retrieve_requires_a_principal() -> None:
 
 
 def test_retrieve_exposes_no_parameter_that_could_widen_scope() -> None:
-    """Freeze the whole parameter set, not just `principal`.
+    """Freeze the whole parameter set on the **contract**, not just
+    `principal`.
 
     A required `principal` is not sufficient on its own: an added
     `include_all_users: bool = False`, a `user_id: str | None = None`
     override, or a `kind` filter that accepts "any" would each reintroduce
     the unscoped query the required parameter was meant to make
     unreachable. Pinning the exact set means such a parameter cannot be
-    added without this test failing and forcing the discussion.
+    added *to this Protocol* without this test failing.
+
+    **What this does NOT prevent, measured rather than assumed.** This
+    test inspects `SemanticMemoryProto.retrieve` only. A concrete
+    implementation may legally add an extra defaulted keyword parameter
+    and still satisfy the Protocol — that is valid structural widening,
+    not a mypy error. Verified: a `LeakySemanticMemory` whose `retrieve`
+    takes `include_all_users: bool = False` type-checks clean against
+    `SemanticMemoryProto`, with this test still green. So the escape
+    hatch can be added in Batch 2 to the very class that owns the WHERE
+    clause, and neither guard here would notice.
+
+    Closing that requires a conformance check over the concrete class
+    (assert the implementation's own signature matches this one, or that
+    it exposes no scope-affecting parameter), which belongs with the
+    implementation in Batch 2 — it cannot be written here, because the
+    class does not exist yet.
 
     Signature is docs/05 §3.7's verbatim: `retrieve(query, principal, *,
     k=3, floor=0.70)`.
@@ -214,6 +236,64 @@ def test_memory_chunks_declares_the_kind_check() -> None:
     assert "CHECK (kind IN ('kb_article', 'call_summary'))" in ddl
 
 
+def test_memory_chunks_declares_the_blank_user_id_check_separately() -> None:
+    """Kept as its own CHECK rather than folded into the biconditional:
+    an AND'd variant would forbid a kb_article's legitimate NULL, and an
+    OR'd variant would let a kb_article carry ''. A blank `user_id`
+    satisfies the biconditional (it is not NULL) while matching no
+    principal — a call summary that looks scoped and is reachable by
+    nobody."""
+    ddl = _table_ddl(MemoryChunk)
+
+    assert "CHECK (user_id IS NULL OR btrim(user_id) <> '')" in ddl
+    # The two constraints must stay distinct, not merged.
+    assert "CHECK ((kind = 'call_summary') = (user_id IS NOT NULL))" in ddl
+
+
+# --------------------------------------------------------------------------
+# memory_scope() — the scoping predicate as one reviewable clause
+# --------------------------------------------------------------------------
+
+
+def _compiled_scope(user_id: str) -> str:
+    clause = memory_scope(SessionUser(user_id=user_id))
+    return str(
+        clause.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    )
+
+
+def test_memory_scope_emits_both_branches_of_the_docs_09_predicate() -> None:
+    """docs/09 §6.2: `kind = 'kb_article' OR user_id = :session_user`.
+    Both branches must be present — the KB branch alone makes retrieval
+    silently useless, and the user branch alone hides the shared KB. The
+    OR between them is what the whole scoping rule is."""
+    sql = _compiled_scope("usr_rajesh01")
+
+    assert "memory_chunks.kind = 'kb_article'" in sql
+    assert "memory_chunks.user_id = 'usr_rajesh01'" in sql
+    assert " OR " in sql
+
+
+def test_memory_scope_binds_the_principals_own_user_id() -> None:
+    """The clause must carry the passed principal's id, not a constant or
+    a stale capture — a scope that always names the same merchant is the
+    cross-tenant bug in its most direct form."""
+    assert "usr_theirs" not in _compiled_scope("usr_mine")
+    assert "memory_chunks.user_id = 'usr_theirs'" in _compiled_scope("usr_theirs")
+
+
+def test_memory_scope_requires_a_principal_not_a_bare_string() -> None:
+    """Same reasoning as `SemanticMemoryProto.retrieve`: taking
+    `SessionUser` keeps the scope on the principal-injection path
+    (docs/10 §1 invariant 3) instead of letting a call site assemble one
+    from an untrusted string."""
+    param = _signature(memory_scope).parameters["principal"]
+
+    assert param.default is inspect.Parameter.empty
+    assert param.annotation is SessionUser
+    assert list(_signature(memory_scope).parameters) == ["principal"]
+
+
 def test_memory_chunks_index_is_hnsw_cosine() -> None:
     """HNSW over ivfflat (docs/12 §5): ivfflat needs training and list
     retuning as the corpus grows; HNSW builds incrementally. `cosine`
@@ -277,6 +357,18 @@ def test_user_profiles_has_no_foreign_key_to_merchants() -> None:
 # --------------------------------------------------------------------------
 
 
+def _migration_0002_code() -> str:
+    """The revision's source with `#` comments and the module docstring
+    stripped, so an assertion sees only executable code — a constraint
+    merely *described* in prose must not satisfy a test that the revision
+    declares it."""
+    source = MIGRATION_0002.read_text(encoding="utf-8")
+    without_comments = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    return without_comments.split('"""')[-1]
+
+
 def _load_migration_0002() -> ModuleType:
     """Load the revision module by path: `0002_memory_subsystem` starts
     with a digit, so it is not importable as a dotted name (Alembic loads
@@ -306,10 +398,52 @@ def test_migration_0002_never_touches_the_pgvector_extension() -> None:
     Asserted against the source text because the statement would be an
     `op.execute` string that no metadata reflection would expose.
     """
-    source = MIGRATION_0002.read_text(encoding="utf-8")
-    code = "\n".join(
-        line for line in source.splitlines() if not line.strip().startswith("#")
-    ).split('"""')[-1]
+    code = _migration_0002_code()
 
     assert "CREATE EXTENSION" not in code.upper()
     assert "DROP EXTENSION" not in code.upper()
+
+
+def test_migration_0002_declares_the_user_scope_check_itself() -> None:
+    """Closes a real coverage hole: deleting `ck_memory_chunks_user_scope`
+    from **migration 0002 only**, leaving the ORM model intact, left the
+    whole standard suite green. The ORM-side assertion above passes
+    because it compiles `MemoryChunk.__table__`, and the migration — the
+    artifact that actually builds the production table — was checked
+    nowhere outside the Docker-gated tests that cannot run without a
+    daemon.
+
+    Asserted against source text for the same reason as the extension
+    rule: `op.create_table`'s constraints are not reachable by reflecting
+    anything importable, and executing the revision needs a live server.
+    """
+    code = _migration_0002_code()
+
+    assert "(kind = 'call_summary') = (user_id IS NOT NULL)" in code
+    assert "ck_memory_chunks_user_scope" in code
+
+
+def test_migration_0002_declares_the_blank_user_id_check_itself() -> None:
+    """Same hole, second constraint. A blank `user_id` is not NULL, so it
+    satisfies the biconditional above while matching no principal."""
+    code = _migration_0002_code()
+
+    assert "btrim(user_id) <> ''" in code
+    assert "ck_memory_chunks_user_id_not_blank" in code
+
+
+def test_migration_0002_pins_the_vector_width_as_a_literal() -> None:
+    """A migration is a frozen snapshot of one moment in schema history.
+    Importing `EMBEDDING_DIM` here would make a *historical* revision's
+    DDL mutable: after a model swap, databases that already ran 0002 would
+    hold `vector(1536)` while every freshly built one got the new width
+    from the same revision id, and a later re-embed migration would face a
+    column whose current type differs by environment.
+
+    (`app/models/orm.py` importing the constant is correct and unaffected
+    — it describes the schema as it is *now*, not as 0002 created it.)
+    """
+    code = _migration_0002_code()
+
+    assert "Vector(1536)" in code
+    assert "EMBEDDING_DIM" not in code

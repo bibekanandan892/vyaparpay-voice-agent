@@ -54,7 +54,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from testcontainers.postgres import PostgresContainer
 
-from app.domain.types import EMBEDDING_DIM
+from app.domain.types import EMBEDDING_DIM, SessionUser
 from app.models.orm import (
     Conversation,
     ConversationSummary,
@@ -62,6 +62,7 @@ from app.models.orm import (
     MemoryChunk,
     Merchant,
     UserProfile,
+    memory_scope,
 )
 
 # backend/tests/models/test_memory_orm.py -> backend/
@@ -400,6 +401,42 @@ async def test_kb_article_chunk_with_user_id_is_rejected(session: AsyncSession) 
         await session.flush()
 
 
+async def test_call_summary_chunk_with_blank_user_id_is_rejected(session: AsyncSession) -> None:
+    """`ck_memory_chunks_user_id_not_blank`, kept separate from the
+    biconditional. `''` is not NULL, so it satisfies
+    `ck_memory_chunks_user_scope` while matching no principal — a call
+    summary that looks scoped and is reachable by nobody."""
+    session.add(
+        MemoryChunk(
+            kind="call_summary",
+            source_id="a1f3c9",
+            content="...",
+            embedding=_embedding(),
+            user_id="",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+async def test_whitespace_only_user_id_is_rejected(session: AsyncSession) -> None:
+    """`btrim(...) <> ''` rather than `<> ''`: a space is not the empty
+    string, but it is not a merchant id either."""
+    session.add(
+        MemoryChunk(
+            kind="call_summary",
+            source_id="a1f3c9",
+            content="...",
+            embedding=_embedding(),
+            user_id="   ",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
 async def test_memory_chunk_rejects_unknown_kind(session: AsyncSession) -> None:
     """`ck_memory_chunks_kind` — only the two corpus kinds docs/09 §6.1
     defines share this table and index."""
@@ -459,11 +496,11 @@ async def test_scoping_predicate_hides_another_merchants_call_summary(
     )
     await session.flush()
 
+    # Uses the shared predicate, not a hand-written OR — if memory_scope()
+    # ever drops its user branch, this test fails against real rows.
     rows = (
         await session.execute(
-            select(MemoryChunk.content).where(
-                (MemoryChunk.kind == "kb_article") | (MemoryChunk.user_id == "usr_mine")
-            )
+            select(MemoryChunk.content).where(memory_scope(SessionUser(user_id="usr_mine")))
         )
     ).scalars()
     contents = set(rows)

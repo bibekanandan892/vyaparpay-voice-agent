@@ -289,6 +289,39 @@ class SemanticMemoryProto(Protocol):
     this is the read side only, so a later batch adding a write path adds
     it there rather than widening a retrieval interface that the scoping
     argument above depends on staying narrow.
+
+    ---
+    **Three things handed to Batch 2, named so they are a handoff and not
+    an omission:**
+
+    1. **`SemanticRepo` as the sole query path.** The strongest available
+       encoding is for `SemanticRepo` (docs/04 §5) to own `search()` and
+       be the only code that queries `memory_chunks`, so an unscoped query
+       has nowhere to live. That cannot be built here — the repo does not
+       exist yet — so what Batch 1 ships instead is
+       `app.models.orm.memory_scope(principal)`, the predicate as one
+       composable, unit-tested clause. Compose it; do not re-derive it.
+
+    2. **A conformance check on the concrete class.** A required
+       `principal` on this Protocol does not stop an implementation from
+       *adding* a defaulted `include_all_users`-style parameter — that is
+       legal structural widening and mypy accepts it (verified). The
+       contract-freeze test in tests/contract/ pins this signature only.
+       Batch 2 should assert its own class exposes no scope-affecting
+       parameter beyond these.
+
+    3. **HNSW post-filtering can silently return nothing.** pgvector's ANN
+       scan collects candidates by vector distance *first*, then the
+       scoping predicate removes non-matching ones, and
+       `memory_chunks.user_id` is unindexed. A merchant whose summaries
+       all fall outside the top `ef_search` candidates gets zero of their
+       own rows — a recall bug that looks like "no relevant memory". Fix
+       it with `ef_search`, iterative index scans, or a partial index.
+       **Fetching a larger top-k globally and filtering in Python is
+       forbidden**: it pulls other merchants' summaries into application
+       memory, which is precisely the exposure the predicate prevents.
+       Moot at the demo's ~200 rows (the planner scans sequentially);
+       real as soon as the corpus grows.
     """
 
     async def retrieve(

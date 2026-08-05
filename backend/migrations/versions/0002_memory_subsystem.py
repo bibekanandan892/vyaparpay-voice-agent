@@ -27,13 +27,19 @@ app/models/orm.py for why in each case (docs/09 declares no FK on
 `user_profiles.user_id`; `memory_chunks.source_id` is polymorphic across
 two tables and cannot reference either).
 
-One constraint here has no counterpart in either doc's DDL:
-`ck_memory_chunks_user_scope`. Both docs annotate `memory_chunks.user_id`
-as "NULL for KB; REQUIRED for call_summary (scoping)" but neither declares
-a constraint for it, leaving the annotation unenforced. docs/09 §6.2 makes
-the scoping predicate a security invariant, so this revision declares the
-biconditional the annotation describes. Rationale in full on
-`app.models.orm.MemoryChunk`.
+Two constraints here have no counterpart in either doc's DDL, both on
+`memory_chunks.user_id`, both because docs/09 §6.2 makes the scoping
+predicate a security invariant that only holds if the column is
+well-formed:
+
+- `ck_memory_chunks_user_scope` — both docs annotate the column "NULL for
+  KB; REQUIRED for call_summary (scoping)" but neither declares a
+  constraint, leaving the annotation unenforced. This revision declares
+  the biconditional the annotation describes.
+- `ck_memory_chunks_user_id_not_blank` — a blank `user_id` is not NULL, so
+  it satisfies the biconditional above while matching no principal.
+
+Rationale in full on `app.models.orm.MemoryChunk`.
 """
 
 from __future__ import annotations
@@ -45,7 +51,17 @@ from alembic import op
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects import postgresql
 
-from app.domain.types import EMBEDDING_DIM
+# NOTE: `app.domain.types.EMBEDDING_DIM` is deliberately NOT imported here,
+# even though it holds this same 1536 and app/models/orm.py rightly does
+# import it. A migration is a frozen snapshot of one moment in schema
+# history; a live constant makes a historical revision's DDL mutable. If a
+# future model swap changed EMBEDDING_DIM to 3072, this revision would
+# start creating vector(3072) — so every database that already ran 0002
+# would hold vector(1536) while every freshly built one (CI's docker-gated
+# job, a new dev machine, rebuilt staging) got vector(3072) from the same
+# revision id, and the 0003 re-embed migration would have to ALTER a column
+# whose current type differs by environment. The literal below is the
+# schema as of 0002 and must never track the constant.
 
 # revision identifiers, used by Alembic.
 revision: str = "0002"
@@ -136,7 +152,8 @@ def upgrade() -> None:
         # deliberately no FK, a column cannot reference two tables.
         sa.Column("source_id", sa.Text(), nullable=False),
         sa.Column("content", sa.Text(), nullable=False),
-        sa.Column("embedding", Vector(EMBEDDING_DIM), nullable=False),
+        # Literal, not EMBEDDING_DIM — see the import-block note above.
+        sa.Column("embedding", Vector(1536), nullable=False),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -153,6 +170,15 @@ def upgrade() -> None:
             # docstring and app.models.orm.MemoryChunk.
             "(kind = 'call_summary') = (user_id IS NOT NULL)",
             name="ck_memory_chunks_user_scope",
+        ),
+        sa.CheckConstraint(
+            # Separate from the biconditional deliberately: folding
+            # `<> ''` in would also forbid a kb_article's legitimate NULL,
+            # and an OR'd variant would let a kb_article carry ''. A blank
+            # user_id is not NULL, so it satisfies the biconditional while
+            # matching no principal.
+            "user_id IS NULL OR btrim(user_id) <> ''",
+            name="ck_memory_chunks_user_id_not_blank",
         ),
     )
     op.create_index(

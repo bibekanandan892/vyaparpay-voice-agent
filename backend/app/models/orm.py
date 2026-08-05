@@ -39,6 +39,7 @@ from sqlalchemy import (
     CHAR,
     BigInteger,
     CheckConstraint,
+    ColumnElement,
     Date,
     DateTime,
     ForeignKey,
@@ -55,7 +56,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from app.domain.types import EMBEDDING_DIM
+from app.domain.types import EMBEDDING_DIM, MemoryKind, SessionUser
 
 # Named as `sa_text`, not `text`, deliberately: ConversationTurn below has a
 # column literally named `text` (docs/12 §4.2), and a class-scoped rebind of
@@ -552,6 +553,17 @@ class MemoryChunk(Base):
             "(kind = 'call_summary') = (user_id IS NOT NULL)",
             name="ck_memory_chunks_user_scope",
         ),
+        CheckConstraint(
+            # Separate from the biconditional on purpose: folding
+            # `<> ''` into that one would also forbid a kb_article's
+            # legitimate NULL, and an OR'd variant would let a kb_article
+            # carry ''. Blank is its own failure — `user_id = ''` is not
+            # NULL, so it satisfies the biconditional while matching no
+            # principal, producing a call summary that looks scoped and is
+            # reachable by nobody.
+            "user_id IS NULL OR btrim(user_id) <> ''",
+            name="ck_memory_chunks_user_id_not_blank",
+        ),
         Index(
             "idx_chunks_embedding",
             "embedding",
@@ -568,4 +580,43 @@ class MemoryChunk(Base):
     embedding: Mapped[Any] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+def memory_scope(principal: SessionUser) -> ColumnElement[bool]:
+    """docs/09 §6.2's retrieval scoping predicate — `kind = 'kb_article'
+    OR user_id = :session_user` — as one composable clause.
+
+    It exists so the predicate has **one reviewable call site** instead of
+    being re-derived at each query. docs/09 §6.2 says the scoping "lives in
+    the one function that issues the query"; this is the smaller, testable
+    piece of that: a caller composes it with `.where(...)` rather than
+    hand-writing an OR whose second branch is easy to drop.
+
+    Requiring `SessionUser` (not a bare `user_id: str`) keeps it on the
+    same principal-injection path as the tool layer (docs/10 §1 invariant
+    3), so a scope cannot be assembled from an untrusted string at the
+    call site.
+
+    **What this is not.** Calling it is not enforced — a query that never
+    calls it is still valid Python and valid SQL, and nothing in this
+    module can detect one. Making it the *only* path to the table means
+    giving `SemanticRepo` sole ownership of `search()` (docs/04 §5); that
+    is Batch 2's to build, and this function is what it should compose.
+
+    **Index caveat for the caller.** `memory_chunks.user_id` is
+    unindexed, and pgvector's HNSW post-filters: an ANN scan collects
+    candidates by vector distance *first*, then this predicate removes the
+    ones that don't match. A merchant whose own summaries are all outside
+    the top `ef_search` candidates can therefore get zero of their own
+    rows back. The correct levers are raising `ef_search`, enabling
+    iterative index scans, or adding a partial index. Fetching a larger
+    top-k globally and filtering in Python is **not** an acceptable
+    workaround: it pulls other merchants' summaries into application
+    memory, which is the exact exposure the predicate exists to prevent.
+    Irrelevant at the demo's ~200 rows, where the planner picks a
+    sequential scan anyway; it matters the moment the corpus grows.
+    """
+    return (MemoryChunk.kind == MemoryKind.KB_ARTICLE.value) | (
+        MemoryChunk.user_id == principal.user_id
     )
