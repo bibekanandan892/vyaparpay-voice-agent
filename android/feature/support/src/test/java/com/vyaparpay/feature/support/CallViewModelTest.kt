@@ -113,6 +113,81 @@ class CallViewModelTest {
         assertEquals(1, launcher.unbindCount)
     }
 
+    // ---------------------------------------------------------------
+    // A refused foreground-service start — the second review's HIGH
+    // ---------------------------------------------------------------
+
+    @Test
+    fun `a refused foreground-service start ends the call instead of wedging on connecting`() {
+        // HIGH-fix regression (second independent review of T8c). The platform
+        // refuses a mic-typed FGS start whenever the process backgrounded
+        // between the tap and the asynchronously dispatched permission result.
+        // Before the fix startCall had ALREADY set phase=CONNECTING and armed
+        // attachAttemptsLeft, then threw past its own bind — leaving
+        // canHangUp=true forever with no callback, no retry, and both startCall
+        // and dismiss refused by their canHangUp gates.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        launcher.connect(null) // probe resolves: nothing running
+        launcher.startSucceeds = false
+
+        viewModel.startCall()
+
+        assertEquals(CallPhase.ENDED, viewModel.state.value.phase)
+        assertFalse("a failed start must not leave the surface un-dismissable", viewModel.state.value.canHangUp)
+    }
+
+    @Test
+    fun `a refused start does not bind, since there is no service to bind to`() {
+        // Binding anyway would use BIND_AUTO_CREATE to conjure the very
+        // service the platform just refused to let us start.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        launcher.connect(null)
+        launcher.startSucceeds = false
+        launcher.callLog.clear()
+
+        viewModel.startCall()
+
+        assertEquals(listOf("start"), launcher.callLog)
+        assertFalse(launcher.isBound)
+    }
+
+    @Test
+    fun `the surface recovers after a refused start - dismiss clears it and a retry works`() {
+        // The wedge, stated as the property that actually matters: the
+        // merchant is not stuck. Both gates that jammed before must pass now.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        launcher.connect(null)
+        launcher.startSucceeds = false
+        viewModel.startCall()
+
+        viewModel.dismiss()
+        assertEquals(CallUiState(), viewModel.state.value)
+
+        launcher.startSucceeds = true
+        viewModel.startCall()
+
+        assertEquals(CallPhase.CONNECTING, viewModel.state.value.phase)
+        assertTrue(launcher.isBound)
+        assertEquals(2, launcher.started.size)
+    }
+
+    @Test
+    fun `startCall starts the service before it binds to it`() {
+        // LOW-1: previously claimed in kdoc but unassertable — the fake now
+        // keeps one ordered log across both methods.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        launcher.connect(null)
+        launcher.callLog.clear() // drop the init probe's bind
+
+        viewModel.startCall()
+
+        assertEquals(listOf("start", "bind"), launcher.callLog)
+    }
+
     @Test
     fun `a call can still be started after the reconnaissance probe came back empty`() {
         val launcher = FakeVoiceCallLauncher()
@@ -611,6 +686,16 @@ internal class FakeVoiceCallLauncher : VoiceCallLauncher {
 
     val started = mutableListOf<String>()
 
+    /**
+     * One ordered record across `start` and `bind` (LOW-1, second independent
+     * review of T8c). Separate per-method counters made start-before-bind
+     * structurally unassertable — there was no shared sequence to compare.
+     */
+    val callLog = mutableListOf<String>()
+
+    /** Set false to simulate the platform refusing the foreground-service start. */
+    var startSucceeds: Boolean = true
+
     var bindCount: Int = 0
         private set
 
@@ -622,11 +707,14 @@ internal class FakeVoiceCallLauncher : VoiceCallLauncher {
 
     val isBound: Boolean get() = onBound != null
 
-    override fun start(sessionRequestJson: String) {
+    override fun start(sessionRequestJson: String): Boolean {
         started += sessionRequestJson
+        callLog += "start"
+        return startSucceeds
     }
 
     override fun bind(onBound: (BoundCall?) -> Unit, onUnbound: () -> Unit) {
+        callLog += "bind"
         if (this.onBound != null) return
         bindCount++
         this.onBound = onBound

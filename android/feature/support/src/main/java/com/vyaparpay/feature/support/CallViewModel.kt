@@ -35,13 +35,23 @@ import kotlinx.serialization.json.Json
  * §2.1), and the agent would open the call looking at `HelpScreen` rather than
  * at whatever the merchant was actually stuck on.
  *
- * **The sequence, and why it is start-then-bind.** `VoiceCallService` owns
- * every step after the request: it mints the session through
- * `CallController.mintSession`, opens signaling, and brings up media. This
- * class never touches `VyaparApi`. So the start intent has to land first (it
- * carries the request and is what creates the call), and the binding follows
- * purely to *observe* — a bind that preceded the start would connect to a
- * service with no controller.
+ * **The sequence.** `VoiceCallService` owns every step after the request: it
+ * mints the session through `CallController.mintSession`, opens signaling, and
+ * brings up media. This class never touches `VyaparApi`. Two distinct bindings
+ * follow from that, and only one of them is ordered against a start (LOW-2,
+ * second independent review of T8c — an earlier version of this paragraph
+ * claimed a bind never precedes a start, which the reconnaissance bind below
+ * contradicts):
+ *
+ * - **Within [startCall], start strictly precedes bind.** The start intent is
+ *   what *creates* the call, so binding first would find no controller to
+ *   observe. `CallViewModelTest` asserts that ordering against
+ *   `FakeVoiceCallLauncher`'s single `callLog`.
+ * - **The `init` reconnaissance bind has no start behind it, deliberately.**
+ *   It exists to *discover* a call this ViewModel did not start (see the
+ *   reconciliation paragraph below). A controller-less answer there is the
+ *   expected one, not a failure — which is exactly the distinction
+ *   [attachAttemptsLeft] encodes.
  *
  * **Threading.** [BoundCall.state] is a `StateFlow` fed from the service's own
  * confined dispatcher; the collector below runs on [viewModelScope] (main), so
@@ -100,18 +110,6 @@ public class CallViewModel internal constructor(
     private val _state = MutableStateFlow(CallUiState())
     public val state: StateFlow<CallUiState> = _state.asStateFlow()
 
-    init {
-        // Reconciliation with an already-running call — see the class kdoc's
-        // HIGH-fix paragraph. BIND_AUTO_CREATE means this also creates (and,
-        // via the controller-less branch, promptly releases) the service when
-        // nothing is running; that create/observe/destroy round trip is the
-        // deliberate price of never showing a blank panel over a live mic.
-        // The service is bound-only during it — never started — so no
-        // foreground-service obligations attach (VoiceCallService only takes
-        // those on through ACTION_START).
-        launcher.bind(onBound = ::onBound, onUnbound = ::onUnbound)
-    }
-
     /** The bound call, or `null` when not bound. Main-confined. */
     private var call: BoundCall? = null
 
@@ -140,6 +138,40 @@ public class CallViewModel internal constructor(
      * a real controller attaches. Main-confined like every other field here.
      */
     private var attachAttemptsLeft: Int = 0
+
+    /**
+     * **Placement is load-bearing — keep this block last (LOW-4, second
+     * independent review of T8c).**
+     *
+     * [launcher] `bind` can invoke [onBound] *synchronously*: the MEDIUM fix
+     * in [AndroidVoiceCallLauncher.bind] reports `onBound(null)` inline when
+     * `bindService` refuses. So this constructor can reach [onBound] — and
+     * through it write [call], [stateJob], [pendingHangUp] and
+     * [attachAttemptsLeft] — before construction finishes. Every one of those
+     * declarations must therefore be *above* this block, or its initializer
+     * would run afterwards and silently overwrite what the callback just
+     * wrote.
+     *
+     * That hazard is currently masked: Kotlin elides initializers that only
+     * store a JVM default (`null`/`false`/`0`), which is what all four happen
+     * to be, so a disassembly of this constructor shows no such writes today.
+     * Masked is not fixed — giving any of those fields a non-default initial
+     * value, or adding a new field [onBound] touches, brings the clobber
+     * straight back. Ordering makes it correct by construction instead of by
+     * coincidence.
+     *
+     * What the bind is *for*: reconciliation with an already-running call, per
+     * the class kdoc's HIGH-fix paragraph. `BIND_AUTO_CREATE` means it also
+     * creates (and, via the controller-less branch, promptly releases) the
+     * service when nothing is running; that create/observe/destroy round trip
+     * is the deliberate price of never showing a blank panel over a live mic.
+     * The service is bound-only throughout — never started — so no
+     * foreground-service obligations attach (`VoiceCallService` only takes
+     * those on through `ACTION_START`).
+     */
+    init {
+        launcher.bind(onBound = ::onBound, onUnbound = ::onUnbound)
+    }
 
     /**
      * Route a completed permission round trip (docs/03 §3.6).
@@ -183,11 +215,58 @@ public class CallViewModel internal constructor(
         // decodes with a bare `Json`, and the two must agree.
         // SessionCreateRequestDto has no defaulted fields, so
         // `encodeDefaults = false` cannot drop anything the server needs.
-        launcher.start(Json.encodeToString(SessionCreateRequestDto.serializer(), request))
+        val started = launcher.start(Json.encodeToString(SessionCreateRequestDto.serializer(), request))
+
+        if (!started) {
+            // HIGH fix (second independent review of T8c). The platform
+            // refused the foreground-service start — reachable whenever the
+            // process backgrounds between the tap and the asynchronously
+            // dispatched permission result (see AndroidVoiceCallLauncher.start).
+            //
+            // Two things had to be fixed here, not one. The launcher no longer
+            // lets the exception escape into the ActivityResult dispatch and
+            // crash the host app; this branch closes the other half, the
+            // wedge. The lines above have ALREADY moved the UI to CONNECTING
+            // and armed attachAttemptsLeft, and there is now no service to
+            // bind to — so returning without this would leave phase=CONNECTING
+            // with canHangUp=true forever: no callback to resolve it, the
+            // retry loop never armed (bind never ran), and both startCall and
+            // dismiss refused by their own canHangUp gates. Unrecoverable
+            // without killing the app, and precisely the "permanent
+            // Connecting…" the MEDIUM fix exists to eliminate.
+            //
+            // Returning before the bind is also required, not just tidy:
+            // binding now would use BIND_AUTO_CREATE to conjure the very
+            // service the platform just refused to let us start.
+            reportCallFailed()
+            return
+        }
+
         // A no-op when the init-block reconnaissance binding is still pending
         // (the launcher refuses a second connection) — that binding's callback
         // then serves this start, which is why both use the same ::onBound.
         launcher.bind(onBound = ::onBound, onUnbound = ::onUnbound)
+    }
+
+    /**
+     * The one terminal-failure path: release everything and report an honest
+     * ended call.
+     *
+     * Shared by the refused-start branch of [startCall] and the exhausted
+     * retries branch of [handleControllerlessBinding], so both failures leave
+     * identical, *recoverable* state — [releaseBinding] zeroes
+     * [attachAttemptsLeft], and [CallPhase.ENDED] has `canHangUp == false`,
+     * which is what lets [dismiss] clear the surface and a later [startCall]
+     * try again.
+     *
+     * `endReason` stays `null` rather than borrowing `EndReason.SETUP_FAILED`:
+     * these calls never reached `:voice`, so there is no reason it reported.
+     * `CallStatusPanel` already documents `null` as "something finished and we
+     * will not invent a cause".
+     */
+    private fun reportCallFailed() {
+        releaseBinding()
+        _state.update { it.copy(phase = CallPhase.ENDED, endReason = null) }
     }
 
     /** The merchant tapped End. */
@@ -271,8 +350,7 @@ public class CallViewModel internal constructor(
 
         attachAttemptsLeft--
         if (attachAttemptsLeft == 0) {
-            releaseBinding()
-            _state.update { it.copy(phase = CallPhase.ENDED, endReason = null) }
+            reportCallFailed()
             return
         }
 
@@ -378,13 +456,31 @@ public class CallViewModel internal constructor(
 
         /**
          * How many controller-less connects a start attempt tolerates before
-         * it is declared dead — see [handleControllerlessBinding]. With
-         * [CONTROLLER_ATTACH_RETRY_MILLIS] this budgets ~2 s, chosen against
-         * the slowest legitimate path: `handleStart`'s synchronous WebRTC
-         * native init (`System.loadLibrary` + `PeerConnectionFactory`
-         * bootstrap) on a cold low-end device. The reject path pays the same
-         * ~2 s before its honest "Call ended" — acceptable, since the UI
-         * shows "Connecting…" throughout either way.
+         * it is declared dead — see [handleControllerlessBinding].
+         *
+         * **What actually protects the slow path is main-thread
+         * serialization, not this budget (LOW-3, second independent review of
+         * T8c).** An earlier version of this comment justified ~2 s against
+         * `handleStart`'s synchronous WebRTC native init on a cold device.
+         * That reasoning was wrong in a way worth correcting, because a
+         * maintainer trusting it would believe a >2 s native init times out
+         * over a live call. It cannot: `:voice` declares no `android:process`,
+         * so `onStartCommand` runs on the main looper, and this retry's
+         * `delay` continuation resumes on `Dispatchers.Main` — while
+         * `handleStart` blocks the main thread, **no retry can run and no
+         * attempt is consumed**. The budget is therefore safer than that text
+         * claimed, and it is not racing native init at all.
+         *
+         * What the budget really counts is main-looper turnarounds while the
+         * `ACTION_START` message sits *undelivered* behind our
+         * `onServiceConnected` — the genuine ordering ambiguity. Each retry
+         * yields the thread for [CONTROLLER_ATTACH_RETRY_MILLIS], letting
+         * pending looper messages drain; in practice a queued start lands on
+         * the very first turnaround, so 10 is generous headroom rather than a
+         * tuned latency figure. Exhaustion means the reject path (the service
+         * refused the start and will never set a controller), where the ~2 s
+         * is spent under a "Connecting…" spinner before an honest "Call
+         * ended".
          */
         internal const val CONTROLLER_ATTACH_ATTEMPTS: Int = 10
 

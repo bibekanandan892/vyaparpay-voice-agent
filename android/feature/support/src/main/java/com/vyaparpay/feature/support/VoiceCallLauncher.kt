@@ -51,18 +51,27 @@ internal class ControllerBoundCall(private val controller: CallController) : Bou
  * testable policy (see that service's kdoc, "confine the framework, test the
  * policy"). Here the glue is `startForegroundService`/`bindService`/
  * `unbindService`, and confining it to [AndroidVoiceCallLauncher] is what lets
- * `CallViewModelTest` assert the ordering and lifecycle guarantees that
- * actually matter — start-before-bind, exactly one unbind, no unbind without a
- * bind — on a plain JVM, against a fake, with no Robolectric service
- * controller in the way.
+ * `CallViewModelTest` assert the lifecycle guarantees that actually matter —
+ * start-before-bind within a start attempt, exactly one unbind, no unbind
+ * without a bind — on a plain JVM, against a fake, with no Robolectric
+ * service controller in the way. `FakeVoiceCallLauncher` keeps a single
+ * ordered `callLog` across both methods so start-before-bind is a real
+ * assertion rather than a claim (LOW-1, second independent review of T8c:
+ * the fake previously tracked the two in separate, unordered fields, which
+ * made that guarantee structurally unassertable).
  */
 internal interface VoiceCallLauncher {
 
     /**
      * Starts [VoiceCallService] with `ACTION_START` and the JSON-encoded
      * `SessionCreateRequestDto` the caller built from `AppStateManager`.
+     *
+     * @return `false` if the platform refused the start — the caller must
+     *   treat that as a failed call and **must not** go on to bind, since
+     *   there is no service coming to bind to. See [AndroidVoiceCallLauncher.start]
+     *   for why a foreground-service start is genuinely refusable here.
      */
-    fun start(sessionRequestJson: String)
+    fun start(sessionRequestJson: String): Boolean
 
     /**
      * Binds to the service, creating it if need be.
@@ -103,6 +112,26 @@ internal class AndroidVoiceCallLauncher(
     private val bindServiceDelegate: (Intent, ServiceConnection, Int) -> Boolean = { intent, connection, flags ->
         context.bindService(intent, connection, flags)
     },
+    /**
+     * The one `unbindService` call. Injectable for the same reason as
+     * [bindServiceDelegate], plus one of its own: [unbind] deliberately
+     * swallows through `runCatching`, so without this seam a test could only
+     * observe that the internal handle was cleared — never that the framework
+     * was actually told to release the connection. That distinction *is* the
+     * leak (LOW-5, second independent review of T8c).
+     */
+    private val unbindServiceDelegate: (ServiceConnection) -> Unit = { connection ->
+        context.unbindService(connection)
+    },
+    /**
+     * The one `startForegroundService` call, injectable so the
+     * platform-refusal branch documented on [start] is reachable in a test —
+     * Robolectric will not throw `ForegroundServiceStartNotAllowedException`
+     * on demand.
+     */
+    private val startServiceDelegate: (Intent) -> Unit = { intent ->
+        ContextCompat.startForegroundService(context, intent)
+    },
 ) : VoiceCallLauncher {
 
     /**
@@ -115,19 +144,40 @@ internal class AndroidVoiceCallLauncher(
      */
     private var connection: ServiceConnection? = null
 
-    override fun start(sessionRequestJson: String) {
+    override fun start(sessionRequestJson: String): Boolean {
         val intent = Intent(context, VoiceCallService::class.java).apply {
             action = VoiceCallService.ACTION_START
             putExtra(VoiceCallService.EXTRA_SESSION_REQUEST_JSON, sessionRequestJson)
         }
+
         // startForegroundService, not startService: VoiceCallService is a
         // microphone-typed FGS and calls startForeground() synchronously in
-        // handleStart(). This is only ever reached from a permission-result
-        // callback while the merchant is looking at HelpScreen — i.e. from a
-        // guaranteed-foreground context with RECORD_AUDIO already granted,
-        // which is exactly the window docs/03 §3.3 requires an FGS start to
-        // happen in.
-        ContextCompat.startForegroundService(context, intent)
+        // handleStart() (docs/03 §3.3).
+        //
+        // **HIGH fix (second independent review of T8c) — this start is
+        // genuinely refusable, and the previous comment here claimed
+        // otherwise.** It said this is "only ever reached from a
+        // guaranteed-foreground context". That is false, and the falsifier is
+        // the permission plumbing itself: when RECORD_AUDIO is already granted
+        // (every call after the first), `RequestMultiplePermissions`
+        // short-circuits through `getSynchronousResult`, and
+        // `ActivityResultRegistry.launch` still dispatches that result via
+        // `Handler(Looper.getMainLooper()).post {}` — asynchronously. A
+        // merchant who taps Call Support and presses Home before that post
+        // drains lands us here with the process already backgrounded, which
+        // is precisely the state API 31+ answers with
+        // ForegroundServiceStartNotAllowedException (an IllegalStateException;
+        // API 26-30 throw the plain form).
+        //
+        // Uncaught, that exception unwinds through the ActivityResult dispatch
+        // and takes down the HOST APP — the same failure class
+        // VoiceCallService's own handleStart already carries two HIGH fixes
+        // for ("crashes the *host app*, not just this service"). Catching
+        // Throwable rather than Exception for the same reason that file gives:
+        // a platform/init failure surfaces as an Error at least as often.
+        // Returning false routes this into the caller's existing failed-call
+        // handling instead.
+        return runCatching { startServiceDelegate(intent) }.isSuccess
     }
 
     override fun bind(onBound: (BoundCall?) -> Unit, onUnbound: () -> Unit) {
@@ -190,6 +240,6 @@ internal class AndroidVoiceCallLauncher(
         // framework already tore the connection down (process death races
         // onCleared). Nothing is left to release in that case, which is the
         // outcome this call wanted anyway.
-        runCatching { context.unbindService(current) }
+        runCatching { unbindServiceDelegate(current) }
     }
 }
