@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import io
+import tokenize
 from pathlib import Path
 from types import ModuleType
 
@@ -237,15 +239,22 @@ def test_memory_chunks_declares_the_kind_check() -> None:
 
 
 def test_memory_chunks_declares_the_blank_user_id_check_separately() -> None:
-    """Kept as its own CHECK rather than folded into the biconditional:
-    an AND'd variant would forbid a kb_article's legitimate NULL, and an
-    OR'd variant would let a kb_article carry ''. A blank `user_id`
-    satisfies the biconditional (it is not NULL) while matching no
-    principal — a call summary that looks scoped and is reachable by
-    nobody."""
+    """Kept as its own CHECK rather than folded into the biconditional.
+    No folding preserves it — every variant accepts a kb_article's
+    legitimate NULL, but an inner-AND permits a kb_article carrying '', a
+    btrim-replacement additionally permits a call_summary with NULL
+    user_id, and an OR'd variant permits all three bad shapes. An
+    AND-appended variant is behaviourally equivalent but collapses two
+    invariants into one opaque violation.
+
+    A blank `user_id` satisfies the biconditional (it is not NULL) while
+    matching no principal — a call summary that looks scoped and is
+    reachable by nobody. The predicate is `~ '\\S'` rather than
+    `btrim(user_id) <> ''` because one-argument `btrim` strips spaces
+    only, so a tab- or newline-only id would survive it."""
     ddl = _table_ddl(MemoryChunk)
 
-    assert "CHECK (user_id IS NULL OR btrim(user_id) <> '')" in ddl
+    assert r"CHECK (user_id IS NULL OR user_id ~ '\S')" in ddl
     # The two constraints must stay distinct, not merged.
     assert "CHECK ((kind = 'call_summary') = (user_id IS NOT NULL))" in ddl
 
@@ -358,15 +367,23 @@ def test_user_profiles_has_no_foreign_key_to_merchants() -> None:
 
 
 def _migration_0002_code() -> str:
-    """The revision's source with `#` comments and the module docstring
+    """The revision's source with every comment and the module docstring
     stripped, so an assertion sees only executable code — a constraint
     merely *described* in prose must not satisfy a test that the revision
-    declares it."""
+    declares it.
+
+    Tokenizes rather than filtering lines. An earlier line-based version
+    dropped whole comment lines but left the comment portion of a code
+    line, so a trailing `# ... user_id ~ '\\S' ...` on any statement
+    satisfied the assertions with the constraint itself deleted — verified,
+    24 tests passed against a revision that declared nothing."""
     source = MIGRATION_0002.read_text(encoding="utf-8")
-    without_comments = "\n".join(
-        line for line in source.splitlines() if not line.strip().startswith("#")
-    )
-    return without_comments.split('"""')[-1]
+    tokens = [
+        token
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type != tokenize.COMMENT
+    ]
+    return tokenize.untokenize(tokens).split('"""')[-1]
 
 
 def _load_migration_0002() -> ModuleType:
@@ -428,7 +445,7 @@ def test_migration_0002_declares_the_blank_user_id_check_itself() -> None:
     satisfies the biconditional above while matching no principal."""
     code = _migration_0002_code()
 
-    assert "btrim(user_id) <> ''" in code
+    assert r"user_id ~ '\S'" in code
     assert "ck_memory_chunks_user_id_not_blank" in code
 
 

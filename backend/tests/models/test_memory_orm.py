@@ -421,8 +421,9 @@ async def test_call_summary_chunk_with_blank_user_id_is_rejected(session: AsyncS
 
 
 async def test_whitespace_only_user_id_is_rejected(session: AsyncSession) -> None:
-    """`btrim(...) <> ''` rather than `<> ''`: a space is not the empty
-    string, but it is not a merchant id either."""
+    """`~ '\\S'` rather than `<> ''`: a space is not the empty string, but
+    it is not a merchant id either. The regex form also covers tabs and
+    newlines, which one-argument `btrim` does not strip."""
     session.add(
         MemoryChunk(
             kind="call_summary",

@@ -554,14 +554,28 @@ class MemoryChunk(Base):
             name="ck_memory_chunks_user_scope",
         ),
         CheckConstraint(
-            # Separate from the biconditional on purpose: folding
-            # `<> ''` into that one would also forbid a kb_article's
-            # legitimate NULL, and an OR'd variant would let a kb_article
-            # carry ''. Blank is its own failure — `user_id = ''` is not
-            # NULL, so it satisfies the biconditional while matching no
-            # principal, producing a call summary that looks scoped and is
-            # reachable by nobody.
-            "user_id IS NULL OR btrim(user_id) <> ''",
+            # Separate on purpose. Folding `<> ''` into the biconditional
+            # does not preserve it: an inner-AND variant starts permitting a
+            # kb_article carrying '', and a btrim-replacement variant
+            # additionally permits a call_summary with a NULL user_id — the
+            # headline bug. An OR'd variant is worse still, permitting
+            # kb_article+user, call_summary+NULL and call_summary+''
+            # alike. An AND-appended variant is behaviourally equivalent to
+            # this pair but collapses two distinct invariants into one
+            # opaque violation, so you lose which one failed.
+            #
+            # (An earlier version of this comment claimed a folded variant
+            # would forbid a kb_article's legitimate NULL. It would not —
+            # every folding accepts that row. The decision is right; that
+            # reason was wrong.)
+            #
+            # Blank is its own failure: `user_id = ''` is not NULL, so it
+            # satisfies the biconditional while matching no principal,
+            # producing a call summary that looks scoped and is reachable
+            # by nobody. `~ '\\S'` rather than `btrim(...) <> ''` because
+            # one-argument btrim strips spaces only — a tab- or
+            # newline-only id would survive it.
+            r"user_id IS NULL OR user_id ~ '\S'",
             name="ck_memory_chunks_user_id_not_blank",
         ),
         Index(

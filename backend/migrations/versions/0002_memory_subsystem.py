@@ -172,12 +172,16 @@ def upgrade() -> None:
             name="ck_memory_chunks_user_scope",
         ),
         sa.CheckConstraint(
-            # Separate from the biconditional deliberately: folding
-            # `<> ''` in would also forbid a kb_article's legitimate NULL,
-            # and an OR'd variant would let a kb_article carry ''. A blank
-            # user_id is not NULL, so it satisfies the biconditional while
-            # matching no principal.
-            "user_id IS NULL OR btrim(user_id) <> ''",
+            # Separate from the biconditional deliberately. No folding
+            # preserves it: an inner-AND variant permits a kb_article
+            # carrying '', a btrim-replacement variant additionally permits
+            # a call_summary with NULL user_id, and an OR'd variant permits
+            # all three bad shapes. An AND-appended variant behaves the same
+            # as this pair but collapses two invariants into one opaque
+            # violation. A blank user_id is not NULL, so it satisfies the
+            # biconditional while matching no principal. `~ '\\S'` rather
+            # than one-argument `btrim`, which strips spaces only.
+            r"user_id IS NULL OR user_id ~ '\S'",
             name="ck_memory_chunks_user_id_not_blank",
         ),
     )
