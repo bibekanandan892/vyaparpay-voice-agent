@@ -144,10 +144,14 @@ private fun CallUiState.statusLine(): String = when (phase) {
 }
 
 /**
- * `null` covers the ends `:voice` reports without a reason reaching this
- * layer — a dead service process, or a service that was bound but never had a
- * call (see `CallViewModel.onBound`). "Call ended" is the honest thing to say
- * about all of them: something finished, and we will not invent a cause.
+ * `null` covers one case: the service process died, so `:voice` never reported
+ * why (`CallViewModel.onUnbound`). "Call ended" is the honest thing to say
+ * about it — something finished, and we will not invent a cause.
+ *
+ * It used to cover two more, and covers neither now. A bind that finds no call
+ * leaves the surface idle rather than ending it, and a setup failure reports
+ * [EndReason.SETUP_FAILED] — because "Call ended" for a call that never began
+ * is inventing a cause, not withholding one.
  */
 private fun EndReason?.endedLine(): String = when (this) {
     EndReason.USER_HUNG_UP -> "Call ended"

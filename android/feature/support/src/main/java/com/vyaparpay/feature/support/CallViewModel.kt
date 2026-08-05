@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.vyaparpay.core.network.SessionCreateRequestDto
 import com.vyaparpay.core.screencontext.AppStateManager
 import com.vyaparpay.voice.CallState
+import com.vyaparpay.voice.EndReason
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -235,9 +236,15 @@ public class CallViewModel internal constructor(
             // without killing the app, and precisely the "permanent
             // Connecting…" the MEDIUM fix exists to eliminate.
             //
-            // Returning before the bind is also required, not just tidy:
-            // binding now would use BIND_AUTO_CREATE to conjure the very
-            // service the platform just refused to let us start.
+            // Returning before the bind avoids a pointless bound-only
+            // create/observe/destroy round trip for a call already reported
+            // failed. Not a correctness requirement: an earlier draft claimed
+            // binding here would "conjure the very service the platform just
+            // refused to start", which conflates a refused FOREGROUND start
+            // with a plain bound creation — the init-block probe below does
+            // exactly the latter on every screen visit, deliberately and
+            // obligation-free. Removing this return fails only the test that
+            // pins the behaviour; recovery and connection parity both hold.
             reportCallFailed()
             return
         }
@@ -259,14 +266,26 @@ public class CallViewModel internal constructor(
      * which is what lets [dismiss] clear the surface and a later [startCall]
      * try again.
      *
-     * `endReason` stays `null` rather than borrowing `EndReason.SETUP_FAILED`:
-     * these calls never reached `:voice`, so there is no reason it reported.
-     * `CallStatusPanel` already documents `null` as "something finished and we
-     * will not invent a cause".
+     * Reports [EndReason.SETUP_FAILED], so the merchant reads "Couldn't
+     * connect to support" rather than "Call ended". An earlier draft left this
+     * `null` on the grounds that `:voice` never reported a reason — but `null`
+     * is not the absence of a decision, it is a decision that renders "Call
+     * ended", and saying that about a call which never began invents a
+     * narrative rather than declining to. That is the opposite of what the
+     * `null` branch protects, and of docs/03 §7's "end the call honestly".
+     *
+     * `SETUP_FAILED`'s own definition is "setup never completed" — the three
+     * causes its kdoc names are `:voice`'s instances of that, not its
+     * boundaries, and `CallStateMachine` already maps five structurally
+     * different failures onto it. A refused foreground-service start and an
+     * exhausted controller attach are two more. Constructing one here is no
+     * layering breach either: this module already decides `endReason` values
+     * `:voice` never sent (see [onUnbound] and [startCall]), across the one
+     * whitelisted `:feature:support -> :voice` edge.
      */
     private fun reportCallFailed() {
         releaseBinding()
-        _state.update { it.copy(phase = CallPhase.ENDED, endReason = null) }
+        _state.update { it.copy(phase = CallPhase.ENDED, endReason = EndReason.SETUP_FAILED) }
     }
 
     /** The merchant tapped End. */

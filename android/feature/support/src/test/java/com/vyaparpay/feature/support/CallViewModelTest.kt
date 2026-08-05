@@ -138,9 +138,27 @@ class CallViewModelTest {
     }
 
     @Test
+    fun `a call that never started is reported as a setup failure, not as an ended call`() {
+        // MEDIUM-fix regression (second independent review of T8c). Both
+        // terminal-failure paths used to leave endReason null, which
+        // CallStatusPanel renders as "Call ended" — telling the merchant
+        // something finished when nothing ever began. SETUP_FAILED renders
+        // "Couldn't connect to support", which is true and actionable.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        launcher.connect(null)
+        launcher.startSucceeds = false
+
+        viewModel.startCall()
+
+        assertEquals(EndReason.SETUP_FAILED, viewModel.state.value.endReason)
+    }
+
+    @Test
     fun `a refused start does not bind, since there is no service to bind to`() {
-        // Binding anyway would use BIND_AUTO_CREATE to conjure the very
-        // service the platform just refused to let us start.
+        // Binding anyway would spin up a bound-only instance of a service we
+        // have already reported as failed — a pointless create/observe/destroy
+        // round trip. (Not a correctness requirement: see startCall's comment.)
         val launcher = FakeVoiceCallLauncher()
         val viewModel = newViewModel(launcher)
         launcher.connect(null)
@@ -584,6 +602,9 @@ class CallViewModelTest {
         assertEquals(CallViewModel.CONTROLLER_ATTACH_ATTEMPTS, rounds)
         assertEquals(CallPhase.ENDED, viewModel.state.value.phase)
         assertFalse(launcher.isBound)
+        // Setup never completed here either, so this must not degrade to the
+        // bare "Call ended" line — same reasoning as the refused-start path.
+        assertEquals(EndReason.SETUP_FAILED, viewModel.state.value.endReason)
     }
 
     @Test
