@@ -74,7 +74,7 @@ is the built-in diagnostic described above.
 
 | Panel | Query source | Reference line | Notes |
 |---|---|---|---|
-| Turn stage latency p95, stacked | `stt.final`, `context.build`, `llm.total`, `tts.first_byte`, `tool.exec.*` span **durations** | docs/06 §4 per-stage p95 | `llm.ttft` is excluded — it is a *child* of `llm.total`, and stacking both double-counts the same wall time |
+| Turn stage latency p95, stacked | `stt.final`, `context.build`, `llm.ttft`, `tts.first_byte`, `tool.exec.*` span **durations** | docs/06 §4 per-stage p95 | Stacks exactly the four spans §4.1 gives a budget row to. `llm.total` is excluded — [see below](#why-llmtotal-is-not-in-the-stack) |
 | Full turn duration p50/p95 | outer `turn` span duration | p50 ≤ 1.0 s, p95 ≤ 2.0 s (docs/15 §7) | Selected by `span.turn_ms != nil` — see [the two `turn` spans](#the-two-turn-spans) |
 | LLM time-to-first-token | `llm.ttft` span duration, grouped by `span.tier` | 450 ms p50 / 900 ms p95 (docs/06 §4) | The p50 budget assumes a **warm** cached prefix; docs/06 says a cold prefix roughly doubles it |
 | Tool execution p95 by tool | `tool.exec.*` span durations | 2,000 ms hard ceiling (docs/10) | Seeded tools really run 5–15 ms (reads) / ~40 ms (writes), so anything near the line is an outlier |
@@ -91,20 +91,70 @@ Deliberate. docs/04 §7.2's span table lists `ctx_ms`, `ttft_ms` and
 recorded by the SDK, so it is the only reliable timing source for those
 stages.
 
+### Why `llm.total` is not in the stack
+
+It is tempting — it is the span that wraps the LLM call — but it is not a
+stage of the budget the panel is read against, and stacking it is wrong
+twice over:
+
+- docs/06 §4 defines the turn as **"user stops speaking → agent audio
+  starts."** `llm_router.py:395` holds `total_span` open across the entire
+  generation (it wraps `_forward_events`), which by design keeps running
+  *after* audio starts — that is the whole point of sentence-level dispatch
+  (docs/06 §4.2, and §4.1's TTS row: "later sentences overlap generation").
+  So it measures a longer window than the thing it would be compared to.
+- Because of that same overlap it double-counts wall time already
+  attributed to `tts.first_byte`.
+- docs/06 §4.1 maps the 450/900 row to the **`llm.ttft` span**, explicitly.
+  There is no docs/06 budget for total generation time.
+
+Left in, the stack would overshoot on a perfectly healthy turn while the
+full-turn panel sat comfortably inside 2.0 s — two panels disagreeing, with
+the header telling the operator to trust the stack.
+`test_waterfall_stacks_exactly_the_stages_that_emit_a_span` now enforces
+1:1 correspondence with §4.1's span-mapped rows.
+
 ### The waterfall cannot reach the ~1,900 ms p95 total
 
-Two of docs/06 §4's seven budgeted stages emit no span at all:
+**Three** of docs/06 §4's seven budgeted stages emit no span:
 
 - **VAD endpoint detection** (250/400 ms) — it is the `endpoint_ms`
   *attribute* on the outer `turn` span, not a span of its own.
+- **First sentence chunked → TTS dispatch** (10/20 ms) — docs/06 §4.1 marks
+  it "span-adjacent; measured as the gap between first token and first TTS
+  request".
 - **Opus encode + network + jitter buffer** (75/140 ms) — `docs/06:188`
   states this is measured client-side from WebRTC `getStats` and is never a
   Tempo span.
 
-So expect the span-derived stack to land near **575 ms p50 / 1,360 ms p95**.
-That gap is expected. The full-turn-duration panel is the one to read
-against the 1.0 s / 2.0 s SLO, because the outer `turn` span *does* span the
-whole thing.
+So the stack is exactly the four remaining stages, and should land near
+**665 ms p50 / 1,340 ms p95** — that is 80+15+450+120 and 150+40+900+250,
+which together with the three above reconcile to §4's ~1,000 / ~1,900
+totals. That gap is expected. The full-turn-duration panel is the one to
+read against the 1.0 s / 2.0 s SLO, because the outer `turn` span *does*
+span the whole thing.
+
+These figures are no longer prose-only:
+`test_documented_expected_stack_equals_the_budget_sum` recomputes them from
+a transcription of docs/06 §4 and fails if this document or the on-board
+header drifts from the arithmetic.
+
+### A tool turn runs some of these stages more than once
+
+The same multi-round fact that pushed cost to Postgres applies to latency,
+and is easier to miss. `_run_tool_loop`'s `while True:`
+(`conversation_manager.py:306`) opens a fresh LLM round per tool round, so
+**`llm.ttft` and `tool.exec.*` occur several times within a single turn** —
+docs/06 §4.3 walks through exactly this for the canonical Rajesh Turn 3
+(two parallel read tools, then "a short LLM continuation to reason over the
+results").
+
+A per-span p95 renders one bar each regardless of how many times the stage
+ran. So on tool turns the stack **understates** real serial LLM time by
+roughly a full round, and an operator reading it sees headroom that is not
+there. When the question is "did this turn fit the SLO", read the
+full-turn-duration panel, which measures the outer `turn` span and therefore
+includes every round.
 
 ### The two `turn` spans
 
@@ -140,14 +190,14 @@ that used a tool undercounts.
 `call_costs` has no such problem: `CostTracker.finalize()` writes
 `input_tokens=sum(t.input_tokens for t in self._turns)` and the analogous
 cost sums (`cost_tracker.py:240-271`), and the `ck_call_costs_total_usd`
-CHECK constraint (`app/models/orm.py:322`) forces the component columns to
+CHECK constraint (`app/models/orm.py:323-326`) forces the component columns to
 agree with `total_usd`. That is the table docs/16 §5's ≈$0.30 figure is
 about.
 
 ### ⚠ The cost panels cannot hit $0.30 today
 
 `CostTracker.finalize()` hardcodes **five of the six cost components to
-zero** (`cost_tracker.py:260-269`, "Judgment call #6: Phase 2 is
+zero** (`cost_tracker.py:261-271`, "Judgment call #6: Phase 2 is
 text-only"):
 
 | Component | docs/16 §5 budget (cached) | Written today |
@@ -170,7 +220,10 @@ mislead.
 for a dashboard "matching the ≈$0.30 (~₹25) canonical figure". The board can
 *draw* the $0.30 and $0.35 lines and does; the data cannot reach them until
 whichever batch owns STT/TTS/embeddings cost attribution fills those
-columns in. That is application work, not dashboard work.
+columns in. That is application work, not dashboard work, and it **is
+tracked as its own task** — it is owned, not merely noted here. This section
+stays so an operator reading a $0.10 total knows why, not as the defect's
+only record.
 
 ### Panels
 
@@ -255,15 +308,21 @@ attributed to the wrong span. The dashboards query none of the phantoms.
 | `llm.total` carries `llm_ms`, `input_tokens`, `output_tokens`, `cost_usd` | `llm_ms` never emitted; the token/cost trio lands on the **`turn`** span, because `conversation_manager.py:413` passes the turn span into `record_turn()` |
 | `tool.exec.<name>` carries `tier` | not emitted there; only `llm.ttft`/`llm.total` carry `tier` |
 
-This document does not fix docs/04 — that is a doc change outside this
-batch's scope — but the boards are built against the code, not against that
-table.
+**The same drift appears a second time**, at `docs/06-voice-pipeline.md:183`
+— §4.1's LLM-TTFT row names "`llm.ttft` span; `cache_hit` attribute" as its
+instrument, and `cache_hit` is the never-emitted key above. Anyone
+correcting docs/04 §7.2 should fix this line in the same pass, or the claim
+survives in the doc that latency work is most likely to be read from.
+
+This document does not fix either — that is a doc change outside this
+batch's scope — but the boards are built against the code, not against those
+tables.
 
 ---
 
 ## The guard against silent drift
 
-[`tests/obs/test_dashboards.py`](tests/obs/test_dashboards.py) — 17 tests,
+[`tests/obs/test_dashboards.py`](tests/obs/test_dashboards.py) — 21 tests,
 in the normal `pytest tests` gate.
 
 A panel querying a span or attribute nothing emits does **not** fail. It
@@ -285,13 +344,24 @@ tests turn that into a loud CI failure:
   dashboard provider's path against the compose mount;
 - `tempo.yaml`'s two traps (`filter_server_spans`, the
   `local_blocks`/`local-blocks` spelling split) and its retention-vs-window
-  relationship are asserted.
+  relationship are asserted;
+- **the waterfall's relationship to the docs/06 §4 budget** is asserted
+  rather than left to prose: docs/06 §4's table is transcribed into the
+  test (and the transcription is itself reconciled against the table's own
+  ~1,000 / ~1,900 stated totals, so a typo cannot pass), then the stacked
+  span set must equal exactly the stages §4.1 maps to a span, and the
+  expected stack height quoted here and on the board must equal those
+  stages' budget sums. Prose-only versions of these three facts were wrong
+  in the first version of this document.
 
 Each test was proven non-vacuous by breaking the thing it covers and
 confirming exactly that test failed: renaming `SPAN_TURN`, renaming the
 `tool.exec.` prefix, deleting the `cost_usd` emission site, flipping
 `filter_server_spans` back to `true`, changing the compose mount target,
-renaming a SQL column, and pointing a panel at an unprovisioned datasource.
+renaming a SQL column, pointing a panel at an unprovisioned datasource,
+adding `llm.total` back into the stack, restoring the wrong 575 ms figure,
+restoring the wrong "two of seven" stage count, and mistyping a budget
+number in the docs/06 transcription.
 
 ---
 
@@ -326,21 +396,36 @@ test here can catch:
    grouping by an *intrinsic* rather than an attribute is the least
    certain piece of syntax on the boards. If it is rejected, the stacked
    waterfall and the tool-latency panel are the ones that break.
-4. **The unit of `quantile_over_time(span:duration, …)`.** Panels assume
+4. **`quantile_over_time(span.input_tokens, .95)` and
+   `max_over_time(span.output_tokens)`** — aggregating over a **numeric
+   span attribute** is a different signature from the `span:duration`
+   intrinsic every latency panel uses, and it is the entire basis of both
+   token-budget panels. If the attribute form is unsupported or coerces
+   differently, those two panels are empty or wrong while every latency
+   panel is fine, so it will not be caught by checking the other board.
+   The raw-span "Recent turns - tokens, model and cost" table is the
+   fallback and needs no metrics generator.
+5. **The unit of `quantile_over_time(span:duration, …)`.** Panels assume
    **seconds** (`"unit": "s"`, thresholds written as `0.45`/`0.9`/`1`/`2`).
    If Tempo returns nanoseconds, every threshold line on the latency board
    is off by 10⁹ — the graphs will still draw, just uselessly. **Check this
    first.**
-5. **That `filter_server_spans: false` actually admits INTERNAL child
+6. **That `filter_server_spans: false` actually admits INTERNAL child
    spans.** This was derived from reading Tempo's `filterBatches()` source,
    not from a doc that states the INTERNAL case.
-6. **The Postgres datasource connecting**, and `$__timeFilter` behaving on
+7. **The Postgres datasource connecting**, and `$__timeFilter` behaving on
    `created_at`.
-7. **Whether the metrics generator starts cleanly** with
+8. **Whether the metrics generator starts cleanly** with
    `storage.remote_write` absent.
-8. **`docker compose config -q`.** CI's `docker-gated` job runs it on every
+9. **`docker compose config -q`.** CI's `docker-gated` job runs it on every
    PR, so this is covered *there*, just never locally. The
    `depends_on`-shape change on `grafana` (short list → map form, needed to
    add a `service_healthy` condition) is the part worth watching.
 
-Items 1–7 belong on the project's needs-human ledger.
+Items 1–8 belong on the project's needs-human ledger.
+
+Note what is **not** on this list: the expected stack height, the stage
+count, and the set of spans the waterfall stacks. Those were prose-only
+assertions in the first version of this document and two of them were
+wrong; they are now recomputed from a transcription of docs/06 §4 by
+`tests/obs/test_dashboards.py` and fail the gate on drift.

@@ -69,9 +69,19 @@ _PROVIDER_FILE = _GRAFANA / "provisioning" / "dashboards" / "dashboards.yaml"
 _TEMPO_CONFIG = _REPO / "infra" / "docker" / "tempo" / "tempo.yaml"
 _COMPOSE = _REPO / "docker-compose.yml"
 
-# `safe_set_attribute(<span var>, "<key>", ...)` — the ONLY sanctioned way
-# to attach a span attribute in this codebase (app/obs/tracing.py), which is
-# what makes this scan a complete inventory rather than a sample.
+# `safe_set_attribute(<span var>, "<key>", ...)` — the allowlisted path from
+# app/obs/tracing.py, and the source of every attribute these boards query.
+#
+# It is NOT the only way a span attribute is set in this codebase:
+# app/api/middleware.py:114-118 calls plain `span.set_attribute` for
+# `http.method` / `http.target` / `http.status_code`, with a documented
+# rationale (standard OTel semantic-convention keys, outside the allowlist's
+# business-data domain). So this scan deliberately UNDER-reports. That
+# direction is safe: a key it misses can only make a test false-FAIL —
+# demanding a panel be removed — never false-pass a panel querying something
+# nothing emits, which is the failure this file exists to prevent. If a
+# board ever needs an `http.*` attribute, widen the scan rather than
+# loosening the assertion.
 _EMIT_CALL = re.compile(r"safe_set_attribute\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*\"([^\"]+)\"")
 
 # TraceQL surface. `span:name` is Tempo 2.9's scoped intrinsic form; the
@@ -470,6 +480,116 @@ def test_tempo_block_retention_covers_the_dashboard_time_windows() -> None:
 
     assert hours >= widest, (
         f"tempo block_retention is {hours}h but a dashboard defaults to a {widest}h window"
+    )
+
+
+# ----------------------------------------------------------------------
+# The docs/06 §4 latency budget the waterfall is read against
+# ----------------------------------------------------------------------
+
+# docs/06 §4's budget table, with the span mapping from §4.1's "OTel span /
+# instrument" column. `None` means the stage is real but emits NO span, so
+# it cannot appear in the stack:
+#   - VAD endpoint  -> an `endpoint_ms` ATTRIBUTE on the outer `turn` span
+#   - chunk/dispatch-> §4.1 marks it "span-adjacent"
+#   - Opus/network  -> §4.1 says client-side WebRTC getStats, never a span
+# docs/06 §4 is canon §7 and states it is "the only place [this] is derived",
+# so this is a transcription of it, not a second source of truth. The first
+# test below proves the transcription is faithful by reconciling it against
+# the table's own stated totals.
+_DOCS06_STAGES: dict[str, tuple[int, int, str | None]] = {
+    "VAD endpoint detection": (250, 400, None),
+    "STT finalization": (80, 150, SPAN_STT_FINAL),
+    "Context assembly + prompt build": (15, 40, SPAN_CONTEXT_BUILD),
+    "LLM time-to-first-token": (450, 900, SPAN_LLM_TTFT),
+    "First sentence chunked -> TTS dispatch": (10, 20, None),
+    "ElevenLabs Flash TTFB": (120, 250, SPAN_TTS_FIRST_BYTE),
+    "Opus encode + network + jitter buffer": (75, 140, None),
+}
+_DOCS06_STATED_TOTAL_P50 = 1000
+_DOCS06_STATED_TOTAL_P95 = 1900
+
+_WATERFALL_PANEL = "Turn stage latency p95, stacked (the waterfall)"
+# "665 ms p50 / 1,340 ms p95" wherever the expected stack is quoted.
+_STATED_STACK = re.compile(r"\*\*([\d,]+) ms p50 / ([\d,]+) ms p95\*\*")
+
+
+def _spanned_stage_budgets() -> tuple[set[str], int, int]:
+    """The stages that DO emit a span, and their p50/p95 sums."""
+    spanned = {s for _, _, s in _DOCS06_STAGES.values() if s is not None}
+    p50 = sum(v[0] for v in _DOCS06_STAGES.values() if v[2] is not None)
+    p95 = sum(v[1] for v in _DOCS06_STAGES.values() if v[2] is not None)
+    return spanned, p50, p95
+
+
+def _find_panel(title: str) -> dict[str, Any]:
+    for _, dashboard in _dashboards():
+        for panel in dashboard["panels"]:
+            if panel.get("title") == title:
+                return panel
+    raise AssertionError(f"no panel titled {title!r} on any board")
+
+
+def test_docs06_budget_transcription_reconciles_to_its_stated_totals() -> None:
+    """Guards the transcription above, so the tests that depend on it are
+    not building on a mistyped number."""
+    assert sum(v[0] for v in _DOCS06_STAGES.values()) == _DOCS06_STATED_TOTAL_P50
+    assert sum(v[1] for v in _DOCS06_STAGES.values()) == _DOCS06_STATED_TOTAL_P95
+
+
+def test_waterfall_stacks_exactly_the_stages_that_emit_a_span() -> None:
+    """A stacked panel is only meaningful if its bars partition the thing
+    being measured. Adding a span with no docs/06 budget row — `llm.total`
+    is the tempting one, since it wraps the whole generation and by design
+    runs past the 'agent audio starts' boundary the budget ends at — makes
+    the stack both double-count (it overlaps `tts.first_byte`) and measure
+    a longer window than the budget it is compared against."""
+    panel = _find_panel(_WATERFALL_PANEL)
+    stage_target = panel["targets"][0]
+    patterns = _TRACEQL_NAME_RE.findall(stage_target["query"])
+    assert len(patterns) == 1, f"expected one span-name regex, got {patterns}"
+
+    stacked = {branch.replace("\\.", ".") for branch in patterns[0].split("|")}
+    spanned, _, _ = _spanned_stage_budgets()
+    assert stacked == spanned, (
+        f"the waterfall stacks {sorted(stacked)} but docs/06 §4.1 gives a budget row to "
+        f"exactly {sorted(spanned)}. Every stacked span must map 1:1 to a budgeted stage."
+    )
+
+
+def test_documented_expected_stack_equals_the_budget_sum() -> None:
+    """Both the on-board header and DASHBOARDS.md quote the height the
+    stack should reach. If that number is not the sum of the stacked
+    stages' budgets, a healthy system reads as a regression — the exact
+    failure this board exists to prevent, inverted."""
+    _, expected_p50, expected_p95 = _spanned_stage_budgets()
+
+    sources = {
+        "dashboard header panel": _find_panel("How to read this board")["options"]["content"],
+        "DASHBOARDS.md": (_BACKEND / "DASHBOARDS.md").read_text(encoding="utf-8"),
+    }
+    for where, text in sources.items():
+        matches = _STATED_STACK.findall(text)
+        assert matches, f"{where}: no '<p50> ms p50 / <p95> ms p95' figure found"
+        for stated_p50, stated_p95 in matches:
+            assert int(stated_p50.replace(",", "")) == expected_p50, (
+                f"{where}: states {stated_p50} ms p50, but the stacked stages sum to "
+                f"{expected_p50} ms"
+            )
+            assert int(stated_p95.replace(",", "")) == expected_p95, (
+                f"{where}: states {stated_p95} ms p95, but the stacked stages sum to "
+                f"{expected_p95} ms"
+            )
+
+
+def test_documented_unspanned_stage_count_is_right() -> None:
+    """The header says how many budgeted stages emit no span. Getting that
+    count wrong is how the arithmetic above drifts in the first place."""
+    unspanned = sum(1 for v in _DOCS06_STAGES.values() if v[2] is None)
+    content = _find_panel("How to read this board")["options"]["content"]
+    assert f"{'THREE' if unspanned == 3 else unspanned} of the seven" in content, (
+        f"{unspanned} of the seven budgeted stages emit no span; the header panel does not "
+        "say so"
     )
 
 

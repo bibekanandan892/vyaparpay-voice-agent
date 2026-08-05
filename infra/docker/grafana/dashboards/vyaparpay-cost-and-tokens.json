@@ -19,7 +19,7 @@
       "type": "timeseries",
       "id": 2,
       "title": "Cost per call vs the canon line",
-      "description": "docs/16 §5 owns the canonical figure: ≈$0.30 (~₹25) per 5-minute call WITH prompt caching, ≈$0.35 without. Both are drawn as threshold bands. IMPORTANT: today's rows cannot reach either line - CostTracker.finalize() hardcodes stt_usd/tts_usd/embeddings_usd to zero (backend/app/agent/cost_tracker.py:260-269, 'Judgment call #6: Phase 2 is text-only'), so total_usd currently carries LLM dialogue + utility ONLY, roughly $0.10 of the $0.30. A low reading here is a MISSING-COMPONENT signal, not an under-budget win. See the 'Cost components' panel below, which makes the zeros visible.",
+      "description": "docs/16 §5 owns the canonical figure: ≈$0.30 (~₹25) per 5-minute call WITH prompt caching, ≈$0.35 without. Both are drawn as threshold bands. IMPORTANT: today's rows cannot reach either line - CostTracker.finalize() hardcodes stt_usd/tts_usd/embeddings_usd to zero (backend/app/agent/cost_tracker.py:261-271, 'Judgment call #6: Phase 2 is text-only'), so total_usd currently carries LLM dialogue + utility ONLY, roughly $0.10 of the $0.30. A low reading here is a MISSING-COMPONENT signal, not an under-budget win. See the 'Cost components' panel below, which makes the zeros visible.",
       "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 1 },
       "fieldConfig": {
@@ -64,7 +64,7 @@
       "type": "timeseries",
       "id": 3,
       "title": "Cost components per call (stacked)",
-      "description": "The six NUMERIC(10,6) component columns of call_costs, which the ck_call_costs_total_usd CHECK constraint (backend/app/models/orm.py:322) forces to sum to total_usd. This panel exists to make the Phase-2 zero-fill obvious: stt_usd, embeddings_usd and tts_usd are written as literal zero by CostTracker.finalize(), and turn_infra_usd is not passed at all (it falls to the column's server_default of 0). docs/16 §5 expects TTS alone to be ~50% of a real call's cost, so a stack that is 100% LLM is the current, known-incomplete state.",
+      "description": "The six NUMERIC(10,6) component columns of call_costs, which the ck_call_costs_total_usd CHECK constraint (backend/app/models/orm.py:323-326) forces to sum to total_usd. This panel exists to make the Phase-2 zero-fill obvious: stt_usd, embeddings_usd and tts_usd are written as literal zero by CostTracker.finalize(), and turn_infra_usd is not passed at all (it falls to the column's server_default of 0). docs/16 §5 expects TTS alone to be ~50% of a real call's cost, so a stack that is 100% LLM is the current, known-incomplete state.",
       "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 1 },
       "fieldConfig": {

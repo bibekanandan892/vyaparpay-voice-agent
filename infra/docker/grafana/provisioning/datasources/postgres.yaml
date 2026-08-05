@@ -20,7 +20,7 @@
 # `input_tokens=sum(t.input_tokens for t in self._turns)` and the analogous
 # cost sums (backend/app/agent/cost_tracker.py:240-271), i.e. a true
 # per-call total, and the `ck_call_costs_total_usd` CHECK constraint
-# (backend/app/models/orm.py:322) guarantees the component columns and
+# (backend/app/models/orm.py:323-326) guarantees the component columns and
 # `total_usd` agree. That is the table docs/16 §5's ≈$0.30 figure is about.
 #
 # Read-only by intent: `vyapar` is the dev superuser (compose ships one
