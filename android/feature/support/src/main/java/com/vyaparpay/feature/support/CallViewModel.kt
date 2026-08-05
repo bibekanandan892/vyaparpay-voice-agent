@@ -241,7 +241,7 @@ public class CallViewModel internal constructor(
             // failed. Not a correctness requirement: an earlier draft claimed
             // binding here would "conjure the very service the platform just
             // refused to start", which conflates a refused FOREGROUND start
-            // with a plain bound creation — the init-block probe below does
+            // with a plain bound creation — the init-block probe above does
             // exactly the latter on every screen visit, deliberately and
             // obligation-free. Removing this return fails only the test that
             // pins the behaviour; recovery and connection parity both hold.
@@ -276,7 +276,7 @@ public class CallViewModel internal constructor(
      *
      * `SETUP_FAILED`'s own definition is "setup never completed" — the three
      * causes its kdoc names are `:voice`'s instances of that, not its
-     * boundaries, and `CallStateMachine` already maps five structurally
+     * boundaries, and `CallStateMachine` already maps six structurally
      * different failures onto it. A refused foreground-service start and an
      * exhausted controller attach are two more. Constructing one here is no
      * layering breach either: this module already decides `endReason` values
