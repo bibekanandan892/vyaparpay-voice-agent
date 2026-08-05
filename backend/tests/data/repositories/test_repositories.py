@@ -945,6 +945,8 @@ async def test_user_profile_repo_upsert_binds_every_column() -> None:
 
 
 async def test_user_profile_repo_get_delegates_to_session_get() -> None:
+    """Unlocked by default — this is the call-setup prefetch (docs/02
+    §3.1), which reads and computes nothing."""
     session = make_session()
     row = UserProfileRow(user_id="usr_rajesh01")
     session.get.return_value = row
@@ -952,8 +954,23 @@ async def test_user_profile_repo_get_delegates_to_session_get() -> None:
 
     result = await repo.get("usr_rajesh01")
 
-    session.get.assert_awaited_once_with(UserProfileRow, "usr_rajesh01")
+    session.get.assert_awaited_once_with(UserProfileRow, "usr_rajesh01", with_for_update=False)
     assert result is row
+
+
+async def test_user_profile_repo_get_can_lock_the_row() -> None:
+    """`UserProfileMemory.merge_post_call` is a read-modify-write over the
+    whole row, so its read takes `SELECT ... FOR UPDATE` — without it two
+    concurrent merges for one merchant both read the pre-state and the
+    second upsert discards the first entirely. Same opt-in shape as
+    `PaymentRepo.check_daily_limit` and `WalletRepo.debit_if_sufficient`.
+    """
+    session = make_session()
+    repo = UserProfileRepo(session)
+
+    await repo.get("usr_rajesh01", with_for_update=True)
+
+    session.get.assert_awaited_once_with(UserProfileRow, "usr_rajesh01", with_for_update=True)
 
 
 async def test_user_profile_repo_get_returns_none_when_absent() -> None:

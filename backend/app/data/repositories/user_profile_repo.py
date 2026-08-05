@@ -42,6 +42,35 @@ class UserProfileRepo(SqlAlchemyRepository[UserProfileRow]):
 
     model = UserProfileRow
 
+    async def get(  # noqa: A002 — `id` is the inherited base signature's name
+        self, id: str, *, with_for_update: bool = False
+    ) -> UserProfileRow | None:
+        """The base `get`, plus an opt-in row lock.
+
+        `UserProfileMemory.merge_post_call` is a read-modify-write over the
+        whole row: it loads the profile, folds this call's extraction and
+        issue changes onto it, and upserts the result. Without `SELECT ...
+        FOR UPDATE` on the read, two concurrent merges for one merchant
+        both read the pre-state and the second upsert overwrites the first
+        entirely — not a lost field, a lost merge. `LimitRepo.submit`,
+        `PaymentRepo.check_daily_limit` and `WalletRepo.debit_if_sufficient`
+        all take the same lock against the same shape of race, and this
+        follows that precedent rather than inventing an optimistic version
+        column for one table.
+
+        Opt-in, defaulting `False`, for the same reason it is opt-in on
+        those siblings: the call-setup prefetch (docs/02 §3.1) only reads,
+        and has no business holding a row lock for the length of a request.
+
+        The bound worth stating, because a lock is easy to over-read: this
+        serializes merges against an **existing** row. A row that does not
+        exist cannot be locked, so two concurrent first-ever merges for one
+        merchant can both see `None` and the second `upsert` still wins.
+        `ON CONFLICT DO UPDATE` keeps that from erroring, not from losing
+        the first merge's facts.
+        """
+        return await self._session.get(self.model, id, with_for_update=with_for_update)
+
     async def upsert(
         self,
         user_id: str,
