@@ -55,6 +55,7 @@ from app.data.repositories.wallet_repo import WalletRepo
 from app.models.orm import (
     CallCost,
     Conversation,
+    ConversationSummary,
     ConversationTurn,
     Merchant,
     MerchantLimit,
@@ -877,6 +878,126 @@ async def test_cost_repo_get_returns_none_when_absent() -> None:
     repo = CostRepo(session)
 
     assert await repo.get("sess_missing") is None
+
+
+# --------------------------------------------------------------------------
+# ConversationRepo — conversation_summaries (docs/09 §8, docs/12 §4.3)
+# --------------------------------------------------------------------------
+
+
+def _summary_kwargs() -> dict[str, object]:
+    return dict(
+        user_id="usr_rajesh01",
+        summary="Rajesh's ₹245 payment declined; limit ₹24,890 of ₹25,000 used.",
+        resolution="pending",
+        intents=["payment_failure", "limit_increase"],
+        tools_used=["get_wallet_balance", "request_limit_increase"],
+        turn_count=15,
+        duration_s=283,
+        cost_usd=Decimal("0.2977"),
+    )
+
+
+async def test_conversation_repo_upsert_summary_is_an_insert_on_conflict() -> None:
+    """docs/09 §8 requires the post-call pipeline to be retryable whole,
+    which means this write must be safe to repeat. A plain INSERT would
+    raise on the second attempt and make the documented retry
+    impossible."""
+    session = make_session()
+    repo = ConversationRepo(session)
+
+    await repo.upsert_summary("a1f3c9", **_summary_kwargs())
+
+    session.execute.assert_awaited_once()
+    stmt = session.execute.await_args.args[0]
+    compiled = str(stmt.compile(dialect=postgresql.dialect()))
+    assert "INSERT INTO conversation_summaries" in compiled
+    assert "ON CONFLICT (session_id) DO UPDATE SET" in compiled
+    session.flush.assert_awaited_once()
+
+
+async def test_conversation_repo_upsert_summary_binds_every_documented_column() -> None:
+    session = make_session()
+    repo = ConversationRepo(session)
+
+    await repo.upsert_summary("a1f3c9", **_summary_kwargs())
+
+    params = session.execute.await_args.args[0].compile(dialect=postgresql.dialect()).params
+    assert params["session_id"] == "a1f3c9"
+    assert params["user_id"] == "usr_rajesh01"
+    assert params["resolution"] == "pending"
+    assert params["intents"] == ["payment_failure", "limit_increase"]
+    assert params["tools_used"] == ["get_wallet_balance", "request_limit_increase"]
+    assert params["turn_count"] == 15
+    assert params["duration_s"] == 283
+    assert params["cost_usd"] == Decimal("0.2977")
+
+
+async def test_conversation_repo_upsert_summary_does_not_overwrite_created_at() -> None:
+    """`created_at` is server-assigned; leaving it out of the update set
+    means a pipeline retry keeps the row's original timestamp rather than
+    drifting it to the retry's clock."""
+    session = make_session()
+    repo = ConversationRepo(session)
+
+    await repo.upsert_summary("a1f3c9", **_summary_kwargs())
+
+    compiled = str(session.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+    update_clause = compiled.split("DO UPDATE SET", 1)[1]
+    assert "created_at" not in update_clause
+
+
+async def test_conversation_repo_get_summary_is_keyed_on_the_summary_row() -> None:
+    """Not `self.get`, which is typed for `Conversation` — a repo managing
+    more than one entity has to name the model explicitly."""
+    session = make_session()
+    row = ConversationSummary(session_id="a1f3c9", **_summary_kwargs())
+    session.get.return_value = row
+    repo = ConversationRepo(session)
+
+    result = await repo.get_summary("a1f3c9")
+
+    session.get.assert_awaited_once_with(ConversationSummary, "a1f3c9")
+    assert result is row
+
+
+async def test_conversation_repo_get_summary_returns_none_when_absent() -> None:
+    session = make_session()
+    session.get.return_value = None
+    repo = ConversationRepo(session)
+
+    assert await repo.get_summary("sess_missing") is None
+
+
+async def test_conversation_repo_list_summaries_scopes_by_user_and_orders_newest_first() -> None:
+    """docs/09 §6.2 makes cross-merchant reachability a security
+    invariant, and docs/12 §4.3's `idx_summaries_user` is
+    `(user_id, created_at DESC)` — the query has to match the index it was
+    created for."""
+    session = make_session()
+    session.execute.return_value = scalars_result([])
+    repo = ConversationRepo(session)
+
+    await repo.list_summaries_for_user("usr_rajesh01", limit=3)
+
+    stmt = session.execute.await_args.args[0]
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "FROM conversation_summaries" in sql
+    assert "WHERE conversation_summaries.user_id =" in sql
+    assert "ORDER BY conversation_summaries.created_at DESC" in sql
+    assert "LIMIT" in sql
+    assert compiled.params["user_id_1"] == "usr_rajesh01"
+    assert compiled.params["param_1"] == 3
+
+
+async def test_conversation_repo_list_summaries_returns_the_rows_it_read() -> None:
+    session = make_session()
+    row = ConversationSummary(session_id="a1f3c9", **_summary_kwargs())
+    session.execute.return_value = scalars_result([row])
+    repo = ConversationRepo(session)
+
+    assert await repo.list_summaries_for_user("usr_rajesh01", limit=3) == [row]
 
 
 # --------------------------------------------------------------------------

@@ -105,8 +105,33 @@ class FakeRedis:
     async def hget(self, key: str, field: str) -> str | None:
         return self.hashes.get(key, {}).get(field)
 
-    async def hset(self, key: str, field: str, value: str) -> None:
-        self.hashes.setdefault(key, {})[field] = value
+    async def hset(
+        self,
+        key: str,
+        field: str | None = None,
+        value: str | None = None,
+        *,
+        mapping: dict[str, str] | None = None,
+    ) -> None:
+        # `mapping=` arm (Phase-5 Batch 2b review): real `HSET key f1 v1 f2 v2`
+        # sets every field in ONE command, which is what makes
+        # `RedisClient.set_summary`'s summary/summary_thru_turn pair
+        # untearable. redis-py spells that `hset(name, mapping={...})`, so the
+        # fake needs the same shape or that call writes nothing. The
+        # positional single-field form every other call site uses is
+        # unchanged.
+        target = self.hashes.setdefault(key, {})
+        if field is not None:
+            target[field] = value if value is not None else ""
+        if mapping:
+            target.update(mapping)
+
+    async def hmget(self, key: str, fields: list[str]) -> list[str | None]:
+        # One command reading N fields — the read side of the same
+        # atomicity property: `get_summary` must not see fold N's text
+        # beside fold N+1's boundary.
+        stored = self.hashes.get(key, {})
+        return [stored.get(field) for field in fields]
 
     async def hdel(self, key: str, field: str) -> None:
         self.hashes.get(key, {}).pop(field, None)

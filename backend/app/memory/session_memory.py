@@ -59,14 +59,29 @@ from decimal import Decimal
 from typing import Any
 
 from app.data.redis_client import RedisClient
-from app.domain.types import Message, PendingConfirm, ToolResult
+from app.domain.types import Message, PendingConfirm, RollingSummary, ToolResult
 
 # docs/09 §3: "`transcript` is capped at the last 8 turns" — the same
 # 6-8 the conversation-window prompt slot renders at 600 tokens (docs/11
-# §1). Eviction is drop-oldest/FIFO: turns older than the cap are not
-# archived here, they exist only inside the rolling summary (docs/09
-# §4), which is Phase 5 scope (docs/17-roadmap.md §1.3) and out of reach
-# of this module.
+# §1). Eviction is drop-oldest/FIFO: turns older than the cap are simply
+# dropped from this field.
+#
+# docs/09 §3 says such turns "exist only inside `summary`". That is the
+# steady state, not the state at the moment of eviction, and the gap is
+# worth naming: before the first fold at turn 9 there IS no summary, and
+# after that there is always a stretch of evicted-but-not-yet-folded
+# turns. Those live only in `Summarizer`'s in-process buffer, which is
+# never persisted to Redis — so a worker crash between an eviction and
+# the next fold loses them outright.
+#
+# Consequence worth stating, because it shapes the Summarizer's design:
+# this cap is on *messages* (each `append_message` call is one entry),
+# while docs/09 §4's algorithm is stated in *turns*. A turn is at least
+# two messages (user + assistant) and more when tools run, so by the time
+# the Summarizer needs turns `1..N-6` they are long gone from this
+# window. `Summarizer` therefore buffers the turns it will fold in its
+# own per-call state rather than reading them back from here — see its
+# module docstring, judgment call #2.
 _MAX_TRANSCRIPT_TURNS = 8
 
 # docs/10 §2's format stage caps each *rendered* tool result at ~120
@@ -83,8 +98,9 @@ class SessionMemory:
     (docs/09 §3): the transcript window cap and its round-trip to
     `Message` domain objects, running-cost accumulation, and (narrowly,
     see module docstring) tool-result digest formatting. `pending_confirm`
-    is a thin pass-through — `RedisClient` already speaks `PendingConfirm`
-    end to end, so there is no business shape left for this layer to add.
+    and the rolling `summary` pair are thin pass-throughs — `RedisClient`
+    already speaks `PendingConfirm`/`RollingSummary` end to end, so there
+    is no business shape left for this layer to add.
     """
 
     def __init__(self, redis: RedisClient) -> None:
@@ -126,6 +142,20 @@ class SessionMemory:
 
     async def set_pending_confirm(self, session_id: str, pending: PendingConfirm | None) -> None:
         await self._redis.set_pending_confirm(session_id, pending)
+
+    # ------------------------------------------------------------------
+    # Rolling summary (docs/09 §3, §4) — thin pass-through, same shape as
+    # `pending_confirm` above: `RedisClient` speaks `RollingSummary` end
+    # to end, and the *algorithm* that decides when to fold and what
+    # `thru_turn` to write lives in `app/memory/summarizer.py`, not here.
+    # This layer adds no business shape, so it adds no code.
+    # ------------------------------------------------------------------
+
+    async def get_summary(self, session_id: str) -> RollingSummary | None:
+        return await self._redis.get_summary(session_id)
+
+    async def set_summary(self, session_id: str, summary: RollingSummary) -> None:
+        await self._redis.set_summary(session_id, summary)
 
     # ------------------------------------------------------------------
     # Running cost (docs/05-agent-architecture.md §3.8's

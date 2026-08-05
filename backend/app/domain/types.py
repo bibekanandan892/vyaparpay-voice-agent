@@ -309,6 +309,37 @@ class PendingConfirm(BaseModel):
     invocation_id: str
 
 
+class RollingSummary(BaseModel):
+    """The in-call rolling conversation summary and the turn boundary it
+    covers — the `summary` / `summary_thru_turn` pair of the `session:{id}`
+    hash (docs/09 §3, §4.1). Memory layer 3, written by `Summarizer` off
+    the turn path. It is *intended* to be read by `ContextBuilder` into
+    the 250-token `<memory_summary>` slot — that wiring does not exist
+    yet (`ContextBuilder`'s own docstring still lists the slot as Phase-5
+    scope, and nothing in `app/agent/` references this type), so today
+    this value is written and never read on the turn path.
+
+    The two fields are one value on purpose: `text` without `thru_turn` is
+    unusable, because the window renderer needs the boundary to know which
+    turns the summary already covers (`text` covers turns `1..thru_turn`;
+    the verbatim window starts at `thru_turn + 1`). Storing them as one
+    type means a reader cannot get a summary without its boundary, which is
+    the overlap/gap bug this pairing exists to make unrepresentable **at
+    this layer** — the two Redis hash fields behind it are still written by
+    two `HSET`s, so a crash between them is not excluded (see
+    `RedisClient.set_summary`).
+
+    `thru_turn` is 1-based and inclusive; `thru_turn = 0` would mean "covers
+    nothing", which is spelled as the absence of the whole value instead
+    (docs/09 §4.1 rule 1: while `turn_count <= 8` no summary exists).
+    """
+
+    model_config = _FROZEN
+
+    text: str
+    thru_turn: int = Field(gt=0)
+
+
 class SafetyVerdict(BaseModel):
     """Result of SafetyLayer.screen_output() — the no-hallucinated-amounts
     and PII-mask check on the assistant's draft reply (docs/05 §3.6)."""

@@ -66,6 +66,14 @@ SPAN_LLM_TOTAL = "llm.total"
 # time-to-first-byte. Added by the voice contract freeze (Phase-3 T1.1).
 SPAN_STT_FINAL = "stt.final"
 SPAN_TTS_FIRST_BYTE = "tts.first_byte"
+# Phase-5 rolling-summary fold (docs/09 §4.1). Flagged rather than slipped
+# in: docs/04 §7.2's span table does NOT list this span — that table was
+# written for the turn path, and this is the one piece of work docs/09 §4.1
+# requires to run *off* it. docs/09 §11's summary-drift row asks for "fold
+# count per call as a span attribute", which needs a span to hang it on;
+# this is that span. It is not part of the frozen turn-latency waterfall
+# and no Grafana panel queries it.
+SPAN_SUMMARY_FOLD = "summary.fold"
 
 # Attribute keys later batches are known to need (docs/04 §7.2's canon
 # attribute list) — the allowlist `safe_set_attribute` enforces. Deliberately
@@ -118,6 +126,15 @@ _SAFE_SPAN_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
         "interrupted",
         "is_endpoint",
         "turn_ms",
+        # Phase-5 summary-fold attributes (docs/09 §11's drift row: "fold
+        # count per call as a span attribute"). `fold_no` is this call's
+        # 1-based fold sequence, `summary_thru_turn` the coverage boundary
+        # the fold wrote, `summary_tokens` the chars/3.5 estimate of the
+        # produced summary against its 250-token budget. Three small
+        # integers — no transcript text, no amount, no id.
+        "fold_no",
+        "summary_thru_turn",
+        "summary_tokens",
     }
 )
 
