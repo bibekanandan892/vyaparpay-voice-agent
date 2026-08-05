@@ -159,7 +159,11 @@ class MainActivityDialogWindowCaptureTest {
 
     /**
      * The teardown half of the same leak. `UiTreeCollector` is an app-lifetime
-     * `@Singleton` (`ScreenContextModule`), so it outlives every
+     * `@Singleton` — from the annotation on the class itself, not from a module
+     * binding; `ScreenContextModule` provides only the `CoroutineScope` it
+     * takes, and this parenthetical used to miscredit it (corrected in Phase-4
+     * T8e, which is also when the annotation the sentence assumed was actually
+     * added). It therefore outlives every
      * [MainActivity] instance a configuration change destroys and recreates —
      * a tracker that walked away while a dialog was still up would leave that
      * dialog's dead window in the singleton's `attachedRoots`, and the next

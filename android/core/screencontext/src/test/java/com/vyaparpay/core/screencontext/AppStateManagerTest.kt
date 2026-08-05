@@ -404,4 +404,53 @@ class AppStateManagerTest {
 
         assertEquals(listOf(tap), received)
     }
+
+    /**
+     * The drift guard between the two hand-maintained support-route tables
+     * (Phase-4 T8e). [AppStateManager.EXCLUDED_ROUTES]' own comment states it
+     * duplicates `NavigationTracker`'s route table by hand; this is the
+     * automated check that they still agree.
+     *
+     * Both are `internal` to this module and [NavigationTracker.flowFor] is
+     * already exercised directly by `NavigationTrackerTest`, so no production
+     * visibility had to be widened for this.
+     *
+     * **What it catches that the behavioural sweep cannot.**
+     * `FullChainScreenContextCanaryTest` (`:app`) walks every route in the real
+     * nav graph and checks each is captured or excluded exactly as its feature
+     * declares — but `ConversationOverlay` is not a nav destination and has no
+     * `AppRoute` entry, so that sweep is structurally blind to it. Pre-existing
+     * `NavigationTrackerTest` cases also pin that row, so this test is not the
+     * only thing that fails if it changes; its unique contribution is checking
+     * the two tables AGREE, which nothing else does.
+     *
+     * **What it does not catch, stated plainly.** `isExcludedFromCapture` is
+     * `route in EXCLUDED_ROUTES || flow == EXCLUDED_FLOW`, so a route dropped
+     * from one table alone is still excluded by the other — verified by
+     * mutation, and the reason this assertion is about the two tables agreeing
+     * rather than about exclusion breaking. A support surface missing from both
+     * tables is caught by the `:app` sweep instead, via the feature's own
+     * `IS_CAPTURED` declaration.
+     */
+    @Test
+    fun `every excluded route still resolves to the support flow in NavigationTracker`() {
+        val tracker = NavigationTracker(FakeEventTracker())
+
+        // Without this, emptying EXCLUDED_ROUTES would make the loop below
+        // iterate zero times and pass for the worst possible reason.
+        assertTrue(
+            "EXCLUDED_ROUTES must not be empty -- capture exclusion would be off entirely",
+            AppStateManager.EXCLUDED_ROUTES.isNotEmpty(),
+        )
+
+        AppStateManager.EXCLUDED_ROUTES.forEach { route ->
+            assertEquals(
+                "'$route' is excluded from capture by AppStateManager but NavigationTracker no " +
+                    "longer maps it to the '${AppStateManager.EXCLUDED_FLOW}' flow -- the two " +
+                    "hand-maintained tables have drifted (docs/07 §2.1)",
+                AppStateManager.EXCLUDED_FLOW,
+                tracker.flowFor(route),
+            )
+        }
+    }
 }
