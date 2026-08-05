@@ -39,7 +39,7 @@ from redis.asyncio import Redis
 
 from app.api.errors import RateLimitedError
 from app.config import Settings
-from app.domain.types import PendingConfirm
+from app.domain.types import PendingConfirm, RollingSummary
 
 # docs/12 §7: idempotency:{key} TTL is 24h — the demo's same-day replay
 # window, independent of the session TTL (SESSION_TTL_SECONDS) it happens
@@ -151,10 +151,12 @@ class RedisClient:
         await self._redis.aclose()
 
     # ----------------------------------------------------------------
-    # session:{id} hash (docs/09 §3) — this task's scope covers the
-    # transcript window, pending_confirm, and running cost fields;
-    # SessionMemory (Batch 3.4) owns the rest of the hash's business
-    # shape (summary, tool_results digests, turn_count, ...).
+    # session:{id} hash (docs/09 §3) — the transcript window,
+    # pending_confirm, and running cost fields (Batch 2.1), plus the
+    # rolling-summary pair added by Phase-5 Batch 2b. SessionMemory owns
+    # the business shape on top of these; the remaining documented fields
+    # (tool_results digests, turn_count, state, ...) still have no
+    # accessor here — see SessionMemory's module docstring.
     # ----------------------------------------------------------------
 
     async def get_transcript_window(self, session_id: str) -> list[dict[str, Any]]:
@@ -184,6 +186,47 @@ class RedisClient:
             await self._redis.hdel(key, "pending_confirm")
             return
         await self._redis.hset(key, "pending_confirm", pending.model_dump_json())
+        await self._redis.expire(key, self._session_ttl_seconds)
+
+    async def get_summary(self, session_id: str) -> RollingSummary | None:
+        """The rolling summary and its coverage boundary (docs/09 §3's
+        `summary` / `summary_thru_turn` fields), or `None` when no fold has
+        landed yet — the state every call is in until turn 9 (docs/09
+        §4.1 rule 1).
+
+        A half-written pair (one field present, the other missing) is a
+        `None` too, not a partial summary: `set_summary` writes the two
+        fields as two `HSET`s, so a crash between them is possible, and a
+        summary whose boundary is unknown cannot be rendered without
+        risking an overlap or a gap against the verbatim window. Losing
+        one fold's compression is the cheap failure; double-narrating
+        three turns to a merchant is not.
+        """
+        key = _session_key(session_id)
+        text = _as_str(await self._redis.hget(key, "summary"))
+        thru = _as_str(await self._redis.hget(key, "summary_thru_turn"))
+        if not text or not thru:
+            return None
+        return RollingSummary(text=text, thru_turn=int(thru))
+
+    async def set_summary(self, session_id: str, summary: RollingSummary) -> None:
+        """Write both halves of the pair. There is deliberately no
+        `summary=None` clear arm (unlike `set_pending_confirm`): nothing
+        in docs/09 §4 un-summarizes a call.
+
+        **This method enforces no ordering.** It `HSET`s whatever
+        `thru_turn` it is handed, with no compare against the stored
+        value, so it cannot stop an older boundary being written after a
+        newer one. That monotonicity is caller-side discipline in
+        `Summarizer` — its already-covered check and its single-flight
+        guard — and that discipline only covers folds routed through
+        `Summarizer.kick()`; concurrent direct `fold_pending()` calls
+        would bypass it. Enforcing it here would need a Lua CAS on the
+        two fields, which no caller has asked for.
+        """
+        key = _session_key(session_id)
+        await self._redis.hset(key, "summary", summary.text)
+        await self._redis.hset(key, "summary_thru_turn", str(summary.thru_turn))
         await self._redis.expire(key, self._session_ttl_seconds)
 
     async def get_running_cost(self, session_id: str) -> Decimal:

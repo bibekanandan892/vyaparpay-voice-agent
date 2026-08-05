@@ -16,7 +16,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.data.redis_client import RedisClient
-from app.domain.types import Message, PendingConfirm, Role, ToolInvocationStatus, ToolResult
+from app.domain.types import (
+    Message,
+    PendingConfirm,
+    Role,
+    RollingSummary,
+    ToolInvocationStatus,
+    ToolResult,
+)
 from app.memory.session_memory import _MAX_DIGEST_CHARS, _MAX_TRANSCRIPT_TURNS, SessionMemory
 
 
@@ -318,3 +325,42 @@ def test_format_tool_digest_truncates_long_payloads() -> None:
 
     assert len(digest["digest"]) <= _MAX_DIGEST_CHARS + len("…(truncated)")
     assert digest["digest"].endswith("…(truncated)")
+
+
+# --------------------------------------------------------------------------
+# rolling summary — thin pass-through (docs/09 §3, §4). The fold ALGORITHM
+# lives in app/memory/summarizer.py; this layer adds no business shape, so
+# these tests assert exactly that and no more.
+# --------------------------------------------------------------------------
+
+
+async def test_get_summary_passes_through(
+    memory: SessionMemory, redis_client: AsyncMock
+) -> None:
+    summary = RollingSummary(text="covers turns 1-3", thru_turn=3)
+    redis_client.get_summary.return_value = summary
+
+    result = await memory.get_summary("sess_1")
+
+    redis_client.get_summary.assert_awaited_once_with("sess_1")
+    assert result == summary
+
+
+async def test_get_summary_passes_through_none(
+    memory: SessionMemory, redis_client: AsyncMock
+) -> None:
+    """docs/09 §4.1 rule 1's state: no fold has landed, so the window
+    still holds every turn verbatim."""
+    redis_client.get_summary.return_value = None
+
+    assert await memory.get_summary("sess_1") is None
+
+
+async def test_set_summary_passes_through(
+    memory: SessionMemory, redis_client: AsyncMock
+) -> None:
+    summary = RollingSummary(text="covers turns 1-9", thru_turn=9)
+
+    await memory.set_summary("sess_1", summary)
+
+    redis_client.set_summary.assert_awaited_once_with("sess_1", summary)
