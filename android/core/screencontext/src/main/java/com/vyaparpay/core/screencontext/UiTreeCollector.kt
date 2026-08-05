@@ -14,6 +14,7 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.state.ToggleableState
 import javax.inject.Inject
+import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -101,9 +102,33 @@ import kotlinx.coroutines.launch
  * kdoc for the full lifecycle wiring (`start`/`stop` against
  * `onCreate`/`onDestroy`).
  *
+ * **`@Singleton` (Phase-4 T8e) — its absence was a silent, total outage.**
+ * This class has two injection points: `MainActivity`'s field (the instance
+ * that gets [start], [attachRoot] and a `ChildWindowTracker`) and
+ * `AppStateManager`'s `@Inject` constructor. Unscoped, Hilt built one for each,
+ * so `AppStateManager` combined over a collector that was never started and had
+ * no root attached. Its `_tree` stayed `null`, `combine` waits for every source,
+ * and so `AppStateManager.state` never advanced past its `AppContextState()`
+ * seed — `sessionCreateBody` shipped `screen_context: null`, and
+ * `ScreenContextPublisher.publishScreenState`'s `state.screen ?: return`
+ * returned every time: **no `ctx.snapshot` or `ctx.delta` was ever published, on
+ * any call.** Only `ctx.event` frames flowed, off the genuinely-`@Singleton`
+ * `RingBufferEventTracker`.
+ *
+ * Nothing could see it: every unit test builds its own collector directly, and
+ * `MainActivityScreenContextTest` asserts only against
+ * `activity.uiTreeCollector` — the one instance that did work. Meanwhile
+ * `MainActivity.kt:110`, `ChildWindowTracker.kt:151` and
+ * `MainActivityDialogWindowCaptureTest.kt:161` each already described this class
+ * as an app-lifetime `@Singleton`, the last crediting `ScreenContextModule` with
+ * a binding it never had. `FullChainScreenContextCanaryTest` (`:app`) is the
+ * regression test — the first to read `AppStateManager` and `MainActivity` in
+ * the same breath, and all four of its cases fail without this annotation.
+ *
  * @param scope UI-thread-confined; see the threading contract above.
  * @param debounceMillis docs/07 §2.1's 300 ms trailing-edge debounce, no longer defaulted -- see the [@Inject] secondary constructor's own kdoc for why.
  */
+@Singleton
 public class UiTreeCollector(
     private val scope: CoroutineScope,
     private val debounceMillis: Long,
