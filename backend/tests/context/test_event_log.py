@@ -124,9 +124,10 @@ async def test_append_many_queues_one_variadic_rpush_in_one_pipeline(
     first version of this test got wrong. Verified 2026-08-05 by mutating
     `append_many` to queue a single-value `RPUSH` per event into the same
     pipeline: `pipeline()` is still called exactly once, so that weaker
-    assertion (and the whole 55-test suite around it) stayed green while
-    the regression it names was live. Asserting the queued command shape
-    is what actually catches it."""
+    assertion stayed green while the regression it names was live -- as
+    did every test in the two files covering this path (this one and
+    `tests/api/test_session_routes.py`, 55 between them at the time).
+    Asserting the queued command shape is what actually catches it."""
     real_pipeline = fake_redis.pipeline
     pipelines: list[FakePipeline] = []
 
