@@ -50,6 +50,7 @@ from app.data.repositories.limit_repo import LimitRepo, _generate_request_id
 from app.data.repositories.merchant_repo import MerchantRepo
 from app.data.repositories.payment_repo import PaymentRepo, _midnight_ist_after
 from app.data.repositories.tool_audit_repo import ToolAuditRepo
+from app.data.repositories.user_profile_repo import UserProfileRepo
 from app.data.repositories.wallet_repo import WalletRepo
 from app.models.orm import (
     CallCost,
@@ -61,6 +62,7 @@ from app.models.orm import (
     Transaction,
     WalletAccount,
 )
+from app.models.orm import UserProfile as UserProfileRow
 
 _REQUEST_ID_RE = re.compile(r"^LMT-\d{4}-\d{4}-\d{4}$")
 
@@ -878,6 +880,91 @@ async def test_cost_repo_get_returns_none_when_absent() -> None:
 
 
 # --------------------------------------------------------------------------
+# UserProfileRepo (docs/09-memory-architecture.md §5.1)
+# --------------------------------------------------------------------------
+
+
+def _profile_kwargs() -> dict[str, object]:
+    return dict(
+        facts={"business_name": "Kumar General Store", "city": "Jaipur"},
+        preferences={"language": "English"},
+        open_issues=[{"id": "iss_071", "status": "pending"}],
+        updated_at=datetime(2026, 7, 24, 14, 29, tzinfo=UTC),
+        updated_by_call="a1f3c9",
+    )
+
+
+async def test_user_profile_repo_upsert_executes_insert_on_conflict() -> None:
+    session = make_session()
+    repo = UserProfileRepo(session)
+
+    await repo.upsert("usr_rajesh01", **_profile_kwargs())
+
+    session.execute.assert_awaited_once()
+    compiled = str(
+        session.execute.await_args.args[0].compile(dialect=postgresql.dialect())
+    )
+    assert "INSERT INTO user_profiles" in compiled
+    assert "ON CONFLICT (user_id) DO UPDATE SET" in compiled
+    session.flush.assert_awaited_once()
+
+
+async def test_user_profile_repo_upsert_refreshes_updated_at_on_conflict() -> None:
+    """The DO UPDATE set-clause must carry `updated_at`.
+
+    `user_profiles.updated_at` has `server_default now()` and no
+    `onupdate` (app/models/orm.py), so a set-clause that omitted it would
+    leave the timestamp frozen at row creation while `updated_by_call`
+    advanced — two provenance columns disagreeing about the same write.
+    """
+    session = make_session()
+    repo = UserProfileRepo(session)
+
+    await repo.upsert("usr_rajesh01", **_profile_kwargs())
+
+    compiled = str(
+        session.execute.await_args.args[0].compile(dialect=postgresql.dialect())
+    )
+    set_clause = compiled.split("DO UPDATE SET", 1)[1]
+    for column in ("facts", "preferences", "open_issues", "updated_at", "updated_by_call"):
+        assert f"{column} = excluded.{column}" in set_clause
+
+
+async def test_user_profile_repo_upsert_binds_every_column() -> None:
+    session = make_session()
+    repo = UserProfileRepo(session)
+
+    await repo.upsert("usr_rajesh01", **_profile_kwargs())
+
+    params = session.execute.await_args.args[0].compile(dialect=postgresql.dialect()).params
+    assert params["user_id"] == "usr_rajesh01"
+    assert params["facts"] == {"business_name": "Kumar General Store", "city": "Jaipur"}
+    assert params["preferences"] == {"language": "English"}
+    assert params["open_issues"] == [{"id": "iss_071", "status": "pending"}]
+    assert params["updated_by_call"] == "a1f3c9"
+
+
+async def test_user_profile_repo_get_delegates_to_session_get() -> None:
+    session = make_session()
+    row = UserProfileRow(user_id="usr_rajesh01")
+    session.get.return_value = row
+    repo = UserProfileRepo(session)
+
+    result = await repo.get("usr_rajesh01")
+
+    session.get.assert_awaited_once_with(UserProfileRow, "usr_rajesh01")
+    assert result is row
+
+
+async def test_user_profile_repo_get_returns_none_when_absent() -> None:
+    session = make_session()
+    session.get.return_value = None
+    repo = UserProfileRepo(session)
+
+    assert await repo.get("usr_nobody") is None
+
+
+# --------------------------------------------------------------------------
 # Sanity: every repo only ever receives a pre-built AsyncSession — none
 # constructs its own engine/session (docs/04 §4 DI split).
 # --------------------------------------------------------------------------
@@ -885,7 +972,16 @@ async def test_cost_repo_get_returns_none_when_absent() -> None:
 
 @pytest.mark.parametrize(
     "repo_cls",
-    [MerchantRepo, WalletRepo, PaymentRepo, LimitRepo, ConversationRepo, ToolAuditRepo, CostRepo],
+    [
+        MerchantRepo,
+        WalletRepo,
+        PaymentRepo,
+        LimitRepo,
+        ConversationRepo,
+        ToolAuditRepo,
+        CostRepo,
+        UserProfileRepo,
+    ],
 )
 def test_repo_constructor_takes_only_a_session(repo_cls: type) -> None:
     session = make_session()
