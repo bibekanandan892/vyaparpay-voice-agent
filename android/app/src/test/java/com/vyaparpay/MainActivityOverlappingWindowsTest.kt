@@ -182,7 +182,7 @@ class MainActivityOverlappingWindowsTest {
         assertTrue(
             "documented gap: support-surface components reach the published IR, not just the raw " +
                 "tree -- labels were $labels",
-            SUPPORT_CTA_LABEL in labels,
+            SUPPORT_ONLY_LABEL in labels,
         )
     }
 
@@ -201,10 +201,22 @@ class MainActivityOverlappingWindowsTest {
 }
 
 /**
- * The support surface's own CTA label, as `HelpScreen` renders it
- * (`HelpScreen.kt:117`). Duplicated rather than imported because it is a
- * literal there, not a constant -- if that ever changes, the KNOWN GAP
- * assertion above stops proving anything and should be re-pointed at whatever
- * replaces it.
+ * A label only the support surface emits, used as the marker that support
+ * content reached the published IR.
+ *
+ * **Deliberately the chat fallback, not "Call Support".** The obvious choice
+ * is fragile in a direction that would defeat the assertion silently: docs/03
+ * §3.1 puts a floating `SupportButton` on operational screens, and
+ * `DashboardDestination` already anticipates hosting one. The day that ships
+ * with `label = "Call Support"`, the marker becomes satisfiable from the
+ * INCOMING activity's own legitimately-captured dashboard window, and this
+ * test would keep passing while proving nothing -- the exact defect class it
+ * exists to catch. "Chat with us instead" is the text-chat fallback, is not
+ * part of the floating-button design, and so has no reason to migrate onto an
+ * operational screen.
+ *
+ * Duplicated rather than imported because `HelpScreen.kt` has it as a literal,
+ * not a constant. If that literal changes, this assertion stops proving
+ * anything and must be re-pointed at whatever replaces it.
  */
-private const val SUPPORT_CTA_LABEL = "Call Support"
+private const val SUPPORT_ONLY_LABEL = "Chat with us instead"
