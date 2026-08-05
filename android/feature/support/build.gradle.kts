@@ -47,6 +47,15 @@ dependencies {
     implementation(project(":core:ui"))
     implementation(project(":core:network"))
 
+    // Phase-4 T8c: CallViewModel injects AppStateManager and calls
+    // sessionCreateBody() -- the production injection point that finally makes
+    // the aggregation half of the capture pipeline reachable. Declared
+    // directly rather than leaned on transitively through :voice's
+    // `api(project(":core:screencontext"))`: this module names the type
+    // itself, and :feature:* -> :core:* is a first-class permitted edge
+    // (docs/03 §1), so an implicit dependency would only obscure that.
+    implementation(project(":core:screencontext"))
+
     // Phase-4 T8a: HelpViewModel is now @HiltViewModel, and SupportRoute
     // resolves it via hiltViewModel() (androidx-hilt-navigation-compose)
     // instead of the old DI-free viewModel() factory.
@@ -56,6 +65,21 @@ dependencies {
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
     implementation(libs.androidx.hilt.lifecycle.viewmodel.compose)
+
+    // Phase-4 T8c, the call trigger:
+    //  - activity-compose: rememberLauncherForActivityResult, so the runtime
+    //    permission flow is composable-scoped and needs no MainActivity hook
+    //    (see rememberCallPermissionGate's kdoc).
+    //  - core-ktx: ContextCompat.startForegroundService and
+    //    ActivityCompat.shouldShowRequestPermissionRationale -- the same
+    //    AndroidX shims :voice already uses to keep SDK_INT branching out of
+    //    call-start code.
+    //  - serialization-json: the ACTION_START extra is a JSON-encoded
+    //    SessionCreateRequestDto, and VoiceCallService decodes it with the
+    //    matching bare Json.
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit)
 
