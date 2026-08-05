@@ -11,6 +11,8 @@ double:
   the `_settings(**overrides)` helper already used locally in
   tests/obs/test_logging.py; hoisted here so it isn't reinvented a third
   time.
+- `openai_embeddings_route` — the same, for `OpenAIEmbeddings.embed()`'s
+  `{openai_base_url}/embeddings` call (docs/09 §6.1).
 - `openrouter_route` — a respx route pre-matched to `settings`'s
   `{openrouter_base_url}/chat/completions`, the one HTTP call
   `OpenRouterLLM.stream()` makes (docs/04 §4) and the one later
@@ -71,6 +73,14 @@ def settings_factory() -> SettingsFactory:
             "database_url": "postgresql+asyncpg://test:test@localhost/test",
             "openrouter_api_key": "test-openrouter-key",
             "openrouter_base_url": "https://openrouter.test/api/v1",
+            # Phase-5 embeddings (docs/09 §6.1). `openai_api_key` defaults
+            # to None in Settings and OpenAIEmbeddings fail-fasts on it, so
+            # a value belongs in the shared defaults the same way the
+            # OpenRouter key does. The base URL is a test host for the same
+            # hermeticity reason as openrouter_base_url — respx matches on
+            # it, and an unmocked call cannot reach api.openai.com.
+            "openai_api_key": "test-openai-key",
+            "openai_base_url": "https://openai.test/v1",
         }
         defaults.update(overrides)
         return Settings(**defaults)  # type: ignore[arg-type]
@@ -165,6 +175,19 @@ def openrouter_route(respx_mock: respx.MockRouter, settings: Settings) -> respx.
     default rather than silently reaching the real network.
     """
     return respx_mock.post(f"{settings.openrouter_base_url}/chat/completions")
+
+
+@pytest.fixture
+def openai_embeddings_route(respx_mock: respx.MockRouter, settings: Settings) -> respx.Route:
+    """Pre-registered POST route for `OpenAIEmbeddings.embed`'s one HTTP
+    call (`{openai_base_url}/embeddings`). Same contract as
+    `openrouter_route`: nothing stubbed by default, so an un-configured
+    call fails loudly via respx's `assert_all_mocked` rather than reaching
+    the real network — which matters more here than usual, since there is
+    no OpenAI key on the development machine and a silent passthrough
+    would look like an auth failure instead of a missing stub.
+    """
+    return respx_mock.post(f"{settings.openai_base_url}/embeddings")
 
 
 @pytest.fixture

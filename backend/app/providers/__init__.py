@@ -1,6 +1,6 @@
 """Provider implementations — the outbound HTTP/WS boundary to third-party
-services (OpenRouter, Deepgram, ElevenLabs; OpenAI-embeddings joins in a
-later phase, docs/04-backend-architecture.md §4). Downstream code depends
+services (OpenRouter, Deepgram, ElevenLabs, OpenAI embeddings —
+docs/04-backend-architecture.md §4). Downstream code depends
 on the `Protocol` in `app.domain.interfaces` / `app.domain.voice`, never on
 a concrete class directly — the app lifespan (app/main.py, a later batch)
 is the one place that imports from here to build the process-singleton and
@@ -17,6 +17,7 @@ modules directly.
 
 from __future__ import annotations
 
+from app.providers.openai_embeddings import OpenAIEmbeddings
 from app.providers.openrouter import OpenRouterLLM
 
-__all__ = ["OpenRouterLLM"]
+__all__ = ["OpenAIEmbeddings", "OpenRouterLLM"]

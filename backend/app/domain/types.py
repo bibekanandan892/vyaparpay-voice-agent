@@ -517,7 +517,10 @@ class UserProfileFacts(BaseModel):
     the post-call merge to validate before writing, and the `facts` column
     is plain JSONB that will accept any shape. The merge path calling
     `UserProfileFacts.model_validate(...)` is what makes the allowlist
-    real, and that path is Batch 3's to write and to test.
+    real: that path is `app.memory.user_profile.UserProfileMemory`, which
+    validates on both the read and the write side precisely because the
+    column does not. It remains true that a *different* writer reaching
+    `user_profiles` directly bypasses all of this.
 
     `merchant_since` is `str`, not `date`: docs/09 §5.1's canonical row
     stores `"2022"` — a stated year, not a calendar date. (The typed
