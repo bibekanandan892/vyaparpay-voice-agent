@@ -44,11 +44,15 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.cost_tracker import CostTracker
 from app.agent.llm_router import LLMRouter
 from app.config import Settings
+from app.context.token_estimate import estimate_tokens
 from app.data.redis_client import RedisClient
 from app.domain.interfaces import LLMProvider, LLMRouterProto
 from app.domain.types import (
@@ -62,6 +66,7 @@ from app.domain.types import (
     ToolCall,
     UsageEvent,
 )
+from app.memory import summarizer as summarizer_module
 from app.memory.session_memory import SessionMemory
 from app.memory.summarizer import (
     FIRST_FOLD_TURN,
@@ -75,6 +80,7 @@ from app.memory.summarizer import (
     summary_thru_turn,
     window_start_turn,
 )
+from app.obs.tracing import SPAN_SUMMARY_FOLD
 from tests.fakes import FakeLLM
 
 # backend/tests/memory/test_summarizer.py -> backend/
@@ -95,6 +101,13 @@ CANONICAL_SUMMARY_THRU_9 = (
 
 _USAGE = {"prompt_tokens": 1000, "completion_tokens": 250}
 
+# `LLMRouterProto.stream`'s own default (app/domain/interfaces.py), which is
+# also `LLMRouter`'s — the turn-path deadline judgment call #6 says the fold
+# must NOT inherit, because its one retry would double a fold's cost with
+# nobody waiting on the stream. Named here so the test asserting the fold's
+# deadline can show what it is being contrasted against.
+_PROTO_DEFAULT_TTFT_DEADLINE_S = 1.5
+
 
 # --------------------------------------------------------------------------
 # Local doubles
@@ -112,6 +125,10 @@ class _BlockingRouter:
         self.started = asyncio.Event()
         self.calls: list[list[Message]] = []
         self.tiers: list[ModelTier] = []
+        # Recorded, not just accepted: judgment call #6's whole point is
+        # that the fold does NOT take the turn path's deadline, and a
+        # double that swallows the kwarg cannot tell the two apart.
+        self.ttft_deadlines: list[float] = []
         self.fail_with: BaseException | None = None
         self._reply = reply
 
@@ -124,10 +141,11 @@ class _BlockingRouter:
         *,
         tier: ModelTier,
         tools: list[dict[str, Any]] | None = None,
-        ttft_deadline_s: float = 1.5,
+        ttft_deadline_s: float = _PROTO_DEFAULT_TTFT_DEADLINE_S,
     ) -> AsyncIterator[LLMEvent]:
         self.calls.append(messages)
         self.tiers.append(tier)
+        self.ttft_deadlines.append(ttft_deadline_s)
         return self._events()
 
     async def _events(self) -> AsyncIterator[LLMEvent]:
@@ -197,6 +215,37 @@ def cost_tracker(settings: Settings) -> CostTracker:
 @pytest.fixture
 def task_factory() -> _ManualTaskFactory:
     return _ManualTaskFactory()
+
+
+@pytest.fixture
+def fold_span_exporter(monkeypatch: pytest.MonkeyPatch) -> InMemorySpanExporter:
+    """A test-local tracer monkeypatched over this module's `tracer` seam.
+
+    Deliberately NOT conftest's shared `span_exporter`, following
+    `tests/providers/test_elevenlabs.py`'s `tts_span_exporter` rather than
+    the session-wide fixture. Reason, reproduced rather than assumed:
+    `tests/obs/test_tracing.py` resets the global `_TRACER_PROVIDER` (and
+    its `Once()` guard) to `None` after each of its tests, and under the
+    suite's random ordering that can land before this module. The shared
+    fixture then calls `force_flush()` on the API's bare
+    `ProxyTracerProvider`, which has no such method — an outright setup
+    `AttributeError`, green in isolation and red in the full suite.
+    Confirmed here by forcing the order
+    `test_context_builder.py -> test_tracing.py -> this file`.
+
+    A module-seam monkeypatch touches no global tracer state, so it cannot
+    be perturbed by, or perturb, any other file's provider handling, and
+    `SimpleSpanProcessor` exports synchronously so no flush is needed.
+    """
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(summarizer_module, "tracer", provider.get_tracer("test-summary-fold"))
+    return exporter
+
+
+def _fold_spans(exporter: InMemorySpanExporter) -> list[Any]:
+    return [s for s in exporter.get_finished_spans() if s.name == SPAN_SUMMARY_FOLD]
 
 
 def _turn(turn_no: int, user: str, agent: str) -> BufferedTurn:
@@ -527,6 +576,61 @@ async def test_a_failed_fold_keeps_its_turns_so_the_next_fold_covers_them(
     sent = router.calls[-1][0].content or ""
     assert "customer line 1" in sent
     assert "customer line 9" in sent
+
+
+async def test_the_buffer_is_shed_only_after_the_store_write_lands(
+    session_memory: AsyncMock, cost_tracker: CostTracker, task_factory: _ManualTaskFactory
+) -> None:
+    """Judgment call #3's ordering, pinned against the one failure that
+    can distinguish it: **the store write**, not the model call.
+
+    The sibling test above fails the model, which precedes the shed under
+    either ordering, so it cannot tell them apart — moving
+    `self._buffer = ...` one line above `await set_summary(...)` keeps it
+    green. This one fails `set_summary` after a successful completion,
+    which is the only window where the two orderings differ.
+
+    What the reorder would cost, concretely: turns 1-3 shed, the write
+    fails, `_summary` stays None, and the next fold at N=15 sees only
+    turns 4-9 buffered but still writes `thru_turn=9` from `turn_count`.
+    The stored boundary would then claim coverage of 1..9 while the text
+    covers 4..9 — and because the window renders from `thru+1`, turns 1-3
+    would be in neither half, with the boundary asserting otherwise.
+    That is the silent-hole failure the whole boundary discipline exists
+    to prevent, so it gets its own test rather than riding on a sibling's.
+    """
+    router = _BlockingRouter()
+    router.gate.set()
+    # First fold: the model answers, the store write fails.
+    session_memory.set_summary.side_effect = [ConnectionError("redis down"), None]
+    summarizer = Summarizer(
+        cast("LLMRouterProto", router),
+        cast("SessionMemory", session_memory),
+        cost_tracker=cost_tracker,
+        task_factory=task_factory,
+    )
+    _observe(summarizer, 1, 9)
+
+    summarizer.kick("sess_1", 9)
+    await asyncio.wait_for(summarizer.drain(), timeout=5.0)
+
+    assert isinstance(summarizer.last_error, ConnectionError)
+    assert summarizer.summary is None
+    assert summarizer.fold_count == 0
+    # The turns the failed write would have covered are still buffered.
+    assert [t.turn_no for t in summarizer.pending_turns] == list(range(1, 10))
+
+    # The recovery fold must therefore still be able to see turn 1.
+    _observe(summarizer, 10, 15)
+    summarizer.kick("sess_1", 15)
+    await asyncio.wait_for(summarizer.drain(), timeout=5.0)
+
+    assert summarizer.summary is not None
+    assert summarizer.summary.thru_turn == 9
+    recovery_prompt = router.calls[-1][0].content or ""
+    assert "[turn 1]" in recovery_prompt
+    assert "[turn 9]" in recovery_prompt
+    assert [t.turn_no for t in summarizer.pending_turns] == list(range(10, 16))
 
 
 async def test_drain_is_a_no_op_when_nothing_is_in_flight(
@@ -882,15 +986,179 @@ async def test_a_fold_that_fails_mid_stream_still_bills_what_the_model_returned(
 
 
 # --------------------------------------------------------------------------
+# Judgment call #6's two bounds
+# --------------------------------------------------------------------------
+
+
+async def test_the_fold_overrides_the_turn_paths_ttft_deadline(
+    session_memory: AsyncMock, cost_tracker: CostTracker
+) -> None:
+    """Judgment call #6: the fold must not inherit `LLMRouter`'s 1.5 s
+    first-token deadline, because that deadline comes with one retry —
+    and a retry buys nothing when nobody is waiting on the stream, it just
+    doubles the fold's cost.
+
+    Dropping `ttft_deadline_s=` from the `stream()` call is a silent
+    revert to exactly that: the kwarg has a default, so nothing raises and
+    nothing else in this suite notices. Hence an explicit assertion on the
+    value that reaches the router."""
+    router = _BlockingRouter()
+    router.gate.set()
+    summarizer = Summarizer(
+        cast("LLMRouterProto", router),
+        cast("SessionMemory", session_memory),
+        cost_tracker=cost_tracker,
+    )
+    _observe(summarizer, 1, 9)
+
+    await summarizer.fold_pending("sess_1", thru_turn=3)
+
+    assert router.ttft_deadlines == [15.0]
+    assert router.ttft_deadlines[0] == summarizer_module._FOLD_TTFT_DEADLINE_S
+    assert router.ttft_deadlines[0] != _PROTO_DEFAULT_TTFT_DEADLINE_S
+
+
+async def test_a_hung_fold_is_bounded_rather_than_blocking_every_later_fold(
+    session_memory: AsyncMock,
+    cost_tracker: CostTracker,
+    task_factory: _ManualTaskFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Judgment call #6 calls `_FOLD_TIMEOUT_S` "the real bound", because
+    "a fold that hangs forever would block every later fold behind the
+    single-flight guard" — `kick()` refuses to start a fold while
+    `_in_flight` is not done, so one wedged fold silently ends
+    summarization for the rest of the call.
+
+    The timeout is shortened rather than waited out; what is under test is
+    that the bound exists and fires, not its 45 s value. The router's gate
+    is never released, so the fold hangs exactly as a wedged provider
+    would.
+
+    Deliberately bounded by `wait_for` and converted to a `fail()`:
+    without the timeout this test would HANG the suite rather than go red,
+    and a hang reports nothing and blocks CI — the same reasoning
+    `_started` above documents."""
+    monkeypatch.setattr(summarizer_module, "_FOLD_TIMEOUT_S", 0.05)
+    router = _BlockingRouter()  # gate never set: the model never answers
+    summarizer = Summarizer(
+        cast("LLMRouterProto", router),
+        cast("SessionMemory", session_memory),
+        cost_tracker=cost_tracker,
+        task_factory=task_factory,
+    )
+    _observe(summarizer, 1, 9)
+
+    assert summarizer.kick("sess_1", 9) is True
+    try:
+        await asyncio.wait_for(summarizer.drain(), timeout=2.0)
+    except TimeoutError:
+        pytest.fail(
+            "the fold outlived a 2 s deadline against a 0.05 s _FOLD_TIMEOUT_S — "
+            "it is not bounded, so a wedged provider would hold the single-flight "
+            "guard and silently end summarization for the rest of the call"
+        )
+
+    assert isinstance(summarizer.last_error, TimeoutError)
+    assert summarizer.summary is None
+    session_memory.set_summary.assert_not_awaited()
+    # The guard is clear again, so the next fold point can still fire.
+    _observe(summarizer, 10, 15)
+    router.gate.set()
+    assert summarizer.kick("sess_1", 15) is True
+
+
+# --------------------------------------------------------------------------
+# The `summary.fold` span (docs/09 §11's drift row)
+# --------------------------------------------------------------------------
+
+
+async def test_the_fold_span_carries_its_number_boundary_and_token_estimate(
+    session_memory: AsyncMock,
+    cost_tracker: CostTracker,
+    fake_llm: FakeLLM,
+    settings: Settings,
+    fold_span_exporter: InMemorySpanExporter,
+) -> None:
+    """docs/09 §11's summary-drift row asks for "fold count per call as a
+    span attribute", and `app/obs/tracing.py` spends three allowlist
+    entries on `fold_no` / `summary_thru_turn` / `summary_tokens`. An
+    allowlist entry with no emitter is a permanently empty Grafana panel —
+    the shape P5-B5 already paid for once, when Tempo's
+    `filter_server_spans` silently dropped every span — so the emission is
+    asserted against real exported spans, not assumed from the call site.
+    """
+    text = "turns 1-3 summarized"
+    fake_llm.script_turn(
+        TokenEvent(delta={"content": text}),
+        UsageEvent(model=settings.openrouter_utility_model, usage=dict(_USAGE)),
+    )
+    summarizer = Summarizer(
+        _real_router(fake_llm, settings),
+        cast("SessionMemory", session_memory),
+        cost_tracker=cost_tracker,
+    )
+    _observe(summarizer, 1, 9)
+
+    await summarizer.fold_pending("sess_1", thru_turn=3)
+
+    folds = _fold_spans(fold_span_exporter)
+    assert len(folds) == 1
+    attributes = folds[0].attributes
+    assert attributes is not None
+    assert attributes.get("fold_no") == 1
+    assert attributes.get("summary_thru_turn") == 3
+    assert attributes.get("summary_tokens") == estimate_tokens(text)
+
+
+async def test_fold_no_counts_attempts_at_a_boundary_not_completed_folds(
+    session_memory: AsyncMock,
+    cost_tracker: CostTracker,
+    task_factory: _ManualTaskFactory,
+    fold_span_exporter: InMemorySpanExporter,
+) -> None:
+    """`fold_no` is stamped at attempt time as `fold_count + 1`, so two
+    consecutive failures both emit `fold_no=1` and neither becomes a
+    `fold_count`. Pinned because the `fold_count` property documents
+    exactly this divergence, and because anyone reading `fold_no` off a
+    span as "folds completed" would over-count a call that is failing."""
+    router = _BlockingRouter()
+    router.fail_with = RuntimeError("haiku is down")
+    router.gate.set()
+    summarizer = Summarizer(
+        cast("LLMRouterProto", router),
+        cast("SessionMemory", session_memory),
+        cost_tracker=cost_tracker,
+        task_factory=task_factory,
+    )
+    _observe(summarizer, 1, 9)
+    summarizer.kick("sess_1", 9)
+    await asyncio.wait_for(summarizer.drain(), timeout=5.0)
+    _observe(summarizer, 10, 15)
+    summarizer.kick("sess_1", 15)
+    await asyncio.wait_for(summarizer.drain(), timeout=5.0)
+
+    folds = _fold_spans(fold_span_exporter)
+    assert len(folds) == 2
+    assert [s.attributes.get("fold_no") for s in folds if s.attributes] == [1, 1]
+    # The boundaries still differ — the two attempts covered different ranges.
+    assert [s.attributes.get("summary_thru_turn") for s in folds if s.attributes] == [3, 9]
+    assert summarizer.fold_count == 0
+
+
+# --------------------------------------------------------------------------
 # The pending-turn buffer
 # --------------------------------------------------------------------------
 
 
-def test_observe_turn_rejects_a_repeated_turn_number(
+def test_a_repeated_turn_number_replaces_the_earlier_attempt(
     session_memory: AsyncMock, cost_tracker: CostTracker
 ) -> None:
-    """A repeat would put the same turn in the fold's input twice and make
-    the coverage range a lie — fail loudly rather than guess."""
+    """A retried turn is idempotent here, matching `kick()`'s
+    already-covered arm, which names "a retried turn" as exactly the case
+    it tolerates. Latest wins: the retry's messages are the authoritative
+    ones, and keeping both would put the same turn in the fold's input
+    twice."""
     summarizer = Summarizer(
         cast("LLMRouterProto", _BlockingRouter()),
         cast("SessionMemory", session_memory),
@@ -898,13 +1166,20 @@ def test_observe_turn_rejects_a_repeated_turn_number(
     )
     summarizer.observe_turn(1, [Message(role=Role.USER, content="hi")])
 
-    with pytest.raises(ValueError, match="must strictly increase"):
-        summarizer.observe_turn(1, [Message(role=Role.USER, content="hi again")])
+    summarizer.observe_turn(1, [Message(role=Role.USER, content="hi again")])
+
+    assert [t.turn_no for t in summarizer.pending_turns] == [1]
+    assert summarizer.pending_turns[0].messages[0].content == "hi again"
+    assert summarizer.rewound_turns == 1
 
 
-def test_observe_turn_rejects_a_regressing_turn_number(
+def test_a_regressing_turn_number_drops_the_turns_it_supersedes(
     session_memory: AsyncMock, cost_tracker: CostTracker
 ) -> None:
+    """The buffer's strictly-increasing invariant is maintained by
+    construction rather than asserted: everything at or after the incoming
+    number goes, so the buffer is still sorted and still has no duplicate
+    turn number afterwards."""
     summarizer = Summarizer(
         cast("LLMRouterProto", _BlockingRouter()),
         cast("SessionMemory", session_memory),
@@ -912,8 +1187,43 @@ def test_observe_turn_rejects_a_regressing_turn_number(
     )
     _observe(summarizer, 1, 5)
 
-    with pytest.raises(ValueError, match="must strictly increase"):
-        summarizer.observe_turn(3, [Message(role=Role.USER, content="back in time")])
+    summarizer.observe_turn(3, [Message(role=Role.USER, content="back in time")])
+
+    kept = [t.turn_no for t in summarizer.pending_turns]
+    assert kept == [1, 2, 3]
+    assert kept == sorted(set(kept))
+    assert summarizer.pending_turns[-1].messages[0].content == "back in time"
+    # Turns 3, 4 and 5 were superseded.
+    assert summarizer.rewound_turns == 3
+
+
+def test_an_eviction_rebuild_restarting_turn_count_does_not_raise_on_the_turn_path(
+    session_memory: AsyncMock, cost_tracker: CostTracker
+) -> None:
+    """docs/09 §11's eviction row rebuilds a session **in place** —
+    "audio and tools keep working" — and restarts `turn_count`. Nothing
+    constructs a fresh `Summarizer` for that rebuild, so the first
+    `observe_turn(1, ...)` afterwards lands on an instance whose buffer
+    still holds the pre-rebuild turns.
+
+    `observe_turn` runs inside a live voice turn, so a raise here would
+    drop a merchant's call to protect a compression nicety — the exact
+    trade the buffer-overflow arm already refuses to make. The rebuilt
+    call must keep summarizing under the new numbering instead."""
+    summarizer = Summarizer(
+        cast("LLMRouterProto", _BlockingRouter()),
+        cast("SessionMemory", session_memory),
+        cost_tracker=cost_tracker,
+    )
+    _observe(summarizer, 1, 12)
+
+    _observe(summarizer, 1, 4)  # rebuild: turn_count restarted
+
+    assert [t.turn_no for t in summarizer.pending_turns] == [1, 2, 3, 4]
+    assert summarizer.rewound_turns == 12
+    # The post-rebuild turns are the ones that survive, not the stale
+    # high-numbered ones: a fold now covers the rebuilt call.
+    assert summarizer.pending_turns[0].messages[0].content == "customer line 1"
 
 
 def test_buffer_overflow_drops_the_oldest_turns_and_counts_them(

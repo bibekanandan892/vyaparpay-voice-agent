@@ -194,17 +194,33 @@ class RedisClient:
         landed yet — the state every call is in until turn 9 (docs/09
         §4.1 rule 1).
 
-        A half-written pair (one field present, the other missing) is a
-        `None` too, not a partial summary: `set_summary` writes the two
-        fields as two `HSET`s, so a crash between them is possible, and a
-        summary whose boundary is unknown cannot be rendered without
-        risking an overlap or a gap against the verbatim window. Losing
-        one fold's compression is the cheap failure; double-narrating
-        three turns to a merchant is not.
+        One `HMGET`, not two `HGET`s, and that is correctness rather than
+        round-trip thrift: two reads can straddle a concurrent
+        `set_summary` and return fold N's text beside fold N+1's
+        boundary — a pair that never existed, and one whose boundary is
+        wrong for its text in the direction that makes the renderer skip
+        turns. `HMGET` is one command, so it sees one snapshot. The saved
+        round trip matters too, since `ContextBuilder` reads this inside
+        docs/06's 40 ms `context.build` budget.
+
+        A half-written pair (one field present, the other missing) reads
+        as `None`, not as a partial summary. This is no longer a defense
+        against a torn write — `set_summary` writes both fields in one
+        `HSET`, so the pair cannot be torn by a crash, and no caller
+        deletes either field. It survives as the total-function guard the
+        unpacking needs regardless: the ordinary pre-fold state is *both*
+        fields absent (docs/09 §4.1 rule 1), `int(None)` would raise, and
+        a field written outside this class should degrade to "no summary"
+        rather than to a boundary that cannot be trusted against the
+        verbatim window. Losing one fold's compression is the cheap
+        failure; double-narrating three turns to a merchant is not.
         """
-        key = _session_key(session_id)
-        text = _as_str(await self._redis.hget(key, "summary"))
-        thru = _as_str(await self._redis.hget(key, "summary_thru_turn"))
+        text, thru = (
+            _as_str(value)
+            for value in await self._redis.hmget(
+                _session_key(session_id), ["summary", "summary_thru_turn"]
+            )
+        )
         if not text or not thru:
             return None
         return RollingSummary(text=text, thru_turn=int(thru))
@@ -214,19 +230,30 @@ class RedisClient:
         `summary=None` clear arm (unlike `set_pending_confirm`): nothing
         in docs/09 §4 un-summarizes a call.
 
-        **This method enforces no ordering.** It `HSET`s whatever
-        `thru_turn` it is handed, with no compare against the stored
-        value, so it cannot stop an older boundary being written after a
-        newer one. That monotonicity is caller-side discipline in
-        `Summarizer` — its already-covered check and its single-flight
-        guard — and that discipline only covers folds routed through
-        `Summarizer.kick()`; concurrent direct `fold_pending()` calls
-        would bypass it. Enforcing it here would need a Lua CAS on the
-        two fields, which no caller has asked for.
+        **The pair is written by one `HSET`**, not two. Redis applies a
+        multi-field `HSET` as a single command, so the two fields land
+        together or not at all: there is no window in which a crash, or a
+        concurrent `get_summary`, can observe fold N's text beside fold
+        N-1's boundary. This is the whole reason the pair is worth
+        keeping in one command — a summary is unrenderable without a
+        boundary it agrees with.
+
+        **What this still does NOT enforce is ordering.** It `HSET`s
+        whatever `thru_turn` it is handed, with no compare against the
+        stored value, so it cannot stop an older boundary being written
+        after a newer one — atomicity is not monotonicity. That
+        monotonicity is caller-side discipline in `Summarizer` — its
+        already-covered check and its single-flight guard — and that
+        discipline only covers folds routed through `Summarizer.kick()`;
+        concurrent direct `fold_pending()` calls would bypass it.
+        Enforcing it here would need a Lua CAS on the two fields, which
+        no caller has asked for.
         """
         key = _session_key(session_id)
-        await self._redis.hset(key, "summary", summary.text)
-        await self._redis.hset(key, "summary_thru_turn", str(summary.thru_turn))
+        await self._redis.hset(
+            key,
+            mapping={"summary": summary.text, "summary_thru_turn": str(summary.thru_turn)},
+        )
         await self._redis.expire(key, self._session_ttl_seconds)
 
     async def get_running_cost(self, session_id: str) -> Decimal:

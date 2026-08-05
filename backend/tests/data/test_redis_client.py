@@ -166,10 +166,16 @@ async def test_summary_round_trip_preserves_rupee_amounts_verbatim(
 async def test_get_summary_is_none_when_the_boundary_field_is_missing(
     client: RedisClient, fake_redis: _FakeRedis
 ) -> None:
-    """A half-written pair reads as absent, not as a partial summary.
-    `set_summary` writes two HSETs, so a crash between them is possible —
-    and a summary whose coverage boundary is unknown would make the window
-    renderer either repeat turns to the merchant or skip them."""
+    """A field written directly, bypassing `set_summary`, reads as absent
+    rather than as a partial summary.
+
+    Note what this no longer claims: `set_summary` writes the pair in one
+    `HSET`, so a torn write is not the scenario here — this test now pins
+    the guard against the only way a half pair can still arise, a writer
+    that is not `set_summary`. It stays because the guard it covers is
+    load-bearing regardless: without it `int(None)` raises, and a summary
+    whose coverage boundary is unknown would make the window renderer
+    either repeat turns to the merchant or skip them."""
     await fake_redis.hset("session:sess_1", "summary", CANONICAL_SUMMARY)
 
     assert await client.get_summary("sess_1") is None
@@ -184,13 +190,65 @@ async def test_get_summary_is_none_when_the_text_field_is_missing(
 
 
 async def test_a_later_fold_overwrites_the_boundary(client: RedisClient) -> None:
-    """The fold is monotonic: `summary_thru_turn` only ever advances."""
+    """A second `set_summary` replaces both fields together — the later
+    fold's text and its boundary, never a mix of the two.
+
+    Scoped to what this layer actually promises: `set_summary`'s own
+    docstring says it enforces NO ordering and that the monotonicity
+    discipline lives in `Summarizer` and "only covers folds routed
+    through `Summarizer.kick()`". So this is not evidence that
+    `summary_thru_turn` only ever advances — write 9 then 3 here and 3
+    wins. What is pinned is pair replacement: no stale half survives the
+    overwrite."""
     await client.set_summary("sess_1", RollingSummary(text="covers 1-3", thru_turn=3))
 
     await client.set_summary("sess_1", RollingSummary(text="covers 1-9", thru_turn=9))
 
     fetched = await client.get_summary("sess_1")
     assert fetched == RollingSummary(text="covers 1-9", thru_turn=9)
+
+
+async def test_the_summary_pair_is_written_and_read_one_command_each(
+    client: RedisClient, fake_redis: _FakeRedis
+) -> None:
+    """Command *counts*, not just resulting values — because the values
+    are identical either way and only the count carries the property.
+
+    Two `HSET`s leave a window in which a reader (or a crash) sees fold
+    N's text beside fold N-1's boundary; two `HGET`s leave the mirror-image
+    window on the read side. One command each closes both: Redis applies a
+    multi-field `HSET` and an `HMGET` atomically. This also halves the
+    round trips, which `ContextBuilder` will care about inside docs/06's
+    40 ms `context.build` budget — but the round trips are the bonus and
+    the atomicity is the reason.
+    """
+    writes: list[object] = []
+    reads: list[object] = []
+    original_hset, original_hmget = fake_redis.hset, fake_redis.hmget
+
+    async def counting_hset(*args: object, **kwargs: object) -> None:
+        writes.append((args, kwargs))
+        await original_hset(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def counting_hmget(*args: object, **kwargs: object) -> list[str | None]:
+        reads.append((args, kwargs))
+        return await original_hmget(*args, **kwargs)  # type: ignore[arg-type]
+
+    fake_redis.hset = counting_hset  # type: ignore[method-assign]
+    fake_redis.hmget = counting_hmget  # type: ignore[method-assign]
+    summary = RollingSummary(text=CANONICAL_SUMMARY, thru_turn=9)
+
+    await client.set_summary("sess_1", summary)
+    fetched = await client.get_summary("sess_1")
+
+    assert len(writes) == 1, "the summary/boundary pair must be one HSET, not two"
+    assert len(reads) == 1, "the pair must be read by one HMGET, not two HGETs"
+    # A single HSET carrying BOTH fields — not one field with the other lost.
+    assert writes[0][1]["mapping"] == {  # type: ignore[index]
+        "summary": CANONICAL_SUMMARY,
+        "summary_thru_turn": "9",
+    }
+    assert fetched == summary
 
 
 async def test_set_summary_applies_session_ttl(

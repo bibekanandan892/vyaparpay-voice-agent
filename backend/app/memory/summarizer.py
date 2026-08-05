@@ -27,25 +27,35 @@ Judgment calls, flagged per house style:
    signature stays synchronous.
 
    **The scope of that guarantee, stated exactly: it covers `kick()`, not
-   this module.** `fold_pending()` below is public and `async` (the
-   post-call pipeline has to be able to await it), so a future turn-path
-   caller can `await summarizer.fold_pending(...)` and put the whole
-   ~1.5 s fold back on the hot path without touching a signature.
-   Nothing here prevents that; the off-path property is a property of
-   using `kick()`, and any wiring review has to check which of the two a
-   turn-path caller reached for.
+   this module.** Two other public entry points here DO await the full
+   ~1.5 s fold, and a turn-path caller reaching for either puts it back
+   on the hot path without touching a signature:
+
+   - `fold_pending()` is `async` because the post-call pipeline has to be
+     able to await it.
+   - `drain()` is `async` and waits for the in-flight fold to finish. Its
+     docstring markets it for the post-call pipeline and for tests, but
+     nothing stops `kick(...); await drain()` — the natural "make sure it
+     landed" reflex — from being written in a turn loop, where it costs
+     the whole fold.
+
+   Nothing here prevents either; the off-path property belongs to *using
+   `kick()` alone*, and any wiring review has to check which of the three
+   a turn-path caller reached for.
 
    This is the fire-and-forget shape `app/agent/cost_tracker.py`'s
    judgment call #1 explicitly rejected, so its three objections are
    answered rather than ignored: *needs a running loop* — true, and
-   `kick()` says so and lets `asyncio.create_task`'s own `RuntimeError`
-   fire loudly rather than catching it; *swallows failures* — a
-   done-callback logs every failure and records it on `last_error`,
-   nothing is silently dropped; *nondeterministic under test* — the task
-   factory is injected and `drain()` awaits the in-flight fold, so tests
-   never race. The difference in requirements is what forces the
-   different answer: nothing asked CostTracker's per-turn record to be
-   off-path, and docs/09 §4.1 asks this of the fold in as many words.
+   `kick()` says so and lets the task factory's own `RuntimeError` fire
+   loudly rather than catching it; *swallows failures* — `_guarded_fold`
+   wraps the whole fold in an in-coroutine `try/except` (not an
+   `add_done_callback`; there is none in this module) that logs every
+   failure and records it on `last_error`, so nothing is silently
+   dropped; *nondeterministic under test* — the task factory is injected
+   and `drain()` awaits the in-flight fold, so tests never race. The
+   difference in requirements is what forces the different answer:
+   nothing asked CostTracker's per-turn record to be off-path, and
+   docs/09 §4.1 asks this of the fold in as many words.
 
 2. **This module buffers the turns it will fold, in its own per-call
    state.** It cannot read them back from `SessionMemory`: that window is
@@ -86,12 +96,49 @@ Judgment calls, flagged per house style:
    a fold that hangs forever would block every later fold behind the
    single-flight guard.
 
-7. **No `Summarizer` Protocol in `app/domain/interfaces.py`.** docs/05's
-   component table names `Summarizer` but pins no signature for it, and
-   nothing else calls this yet — inventing a frozen Protocol ahead of its
-   first consumer is the speculative generality the house rules warn
-   about. The wiring task that gives it a caller can freeze the shape
-   then, against a real call site.
+7. **This departs from docs/05 §3.9's pinned signature, in three
+   ways.** docs/05 §3.9 is not silent about the shape — it pins one:
+
+       class Summarizer:
+           async def maybe_fold(self, session: Session) -> None: ...
+           async def final_summary(self, session: Session) -> ConversationSummary: ...
+
+   and docs/05's component table places `Summarizer` under `app/agent/`.
+   This module matches none of the three, on purpose:
+
+   - **`kick(session_id, turn_count)` is sync, not `async def
+     maybe_fold(session)`.** `app/domain/types.py`'s `Session` carries
+     `session_id`, `user_id`, `state`, `started_at`, `ended_at` — no
+     `turn_count`. `maybe_fold(session)` therefore cannot decide whether
+     this turn is a fold point at all without a second source, so it is
+     not implementable as written. Independently, `async def` is the one
+     shape judgment call #1 rules out: it can be `await`ed on the turn
+     path, which docs/09 §4.1 rule 4 forbids.
+   - **No `final_summary` counterpart here.** The durable half of memory
+     layer 3 landed beside this as `ConversationSummaryStore` (same
+     batch), but that class *persists* a `ConversationSummary` it is
+     handed — nothing yet *generates* one, because resolution
+     classification and intent extraction are post-call pipeline
+     decisions with no implementation. `fold_pending(..., thru_turn=N)`
+     is the text half of that seam and is documented as such below.
+   - **`app/memory/`, not `app/agent/`.** docs/09 §1's layer table names
+     this memory layer 3 and pairs it with `ConversationSummaryStore`;
+     the two ship together, so they live together. The table cell being
+     departed from marks its own row "§3.9 references" and points at
+     docs/09 as the owner of this algorithm.
+
+   Also no `Summarizer` Protocol in `app/domain/interfaces.py` — and the
+   reason is narrower than "there is no signature to freeze", since
+   §3.9's block above is one. The immediately preceding commit froze
+   `SemanticMemoryProto` there with zero implementations precisely
+   because docs/05 §3.7 pins *its* signature and batches were to build
+   against it in parallel. The difference is that this module does not
+   implement §3.9's shape: freezing the doc's shape would freeze
+   something nothing implements, and freezing *this* shape would pre-empt
+   the wiring task that will have the first real call site. If a Protocol
+   is wanted, that task is where it belongs — and per `interfaces.py`'s
+   own module docstring, a deviation from a pinned signature is a
+   contract change that should update the doc-facing contract first.
 
 Deliberately NOT in this module: rendering the summary into
 `ContextBundle.memory_summary` (`ContextBuilder`'s slot, a later task),
@@ -254,9 +301,32 @@ class Summarizer:
     Constructor injection: `router` (utility tier — Haiku, docs/05 §3.4),
     `session_memory` (the `session:{id}` hash this writes the summary
     into), `cost_tracker` (a fold is ~$0.0023 and must land in the call's
-    cost, docs/09 §4.1), and `task_factory` as the scheduling seam —
-    defaulting to `asyncio.create_task`, overridden in tests so the
-    off-turn-path behavior is observable rather than raced against.
+    cost, docs/09 §4.1), and `task_factory` as the scheduling seam.
+
+    **`task_factory` is production wiring, not only a test seam — and the
+    default escapes docs/05 §4's cancellation boundary.** docs/05 §4:
+    "the task group is the cancellation boundary... no turn task outlives
+    the call that spawned it." The default, `asyncio.create_task`, spawns
+    OUTSIDE any enclosing `TaskGroup`: verified by probe, a task so
+    created is still alive when the group exits and runs to completion
+    afterwards, on both clean and crashing teardown. So with the default,
+    a fold in flight at hang-up orphans — it goes on writing the summary
+    field of an ended call, and calls `cost_tracker.record_turn` after
+    `finalize()` may already have written the `call_costs` row, so that
+    fold's spend lands nowhere.
+
+    **Whoever wires this must therefore do one of two things**, and
+    `VoiceAgentWorker` already holds what the first needs (`self._tg`,
+    which is how it schedules turns — `app/voice/worker.py`):
+
+    - pass the call's `TaskGroup.create_task` as `task_factory`, which
+      buys both halves of §4's contract: a clean hang-up waits for the
+      fold, a crash cancels it; or
+    - `await drain()` at teardown, which waits for the in-flight fold
+      before the call's state goes away.
+
+    Tests override it for a third reason — so the off-turn-path behavior
+    is observable rather than raced against.
     """
 
     def __init__(
@@ -282,6 +352,7 @@ class Summarizer:
         self._in_flight: asyncio.Task[Any] | None = None
         self._last_error: BaseException | None = None
         self._dropped_turns = 0
+        self._rewound_turns = 0
         # Bridges the synchronous `_consume` (which sees the usage frame)
         # to `fold_pending`'s async `add_cost` — see `_consume`.
         self._pending_cost_usd: Decimal = _ZERO_USD
@@ -313,8 +384,14 @@ class Summarizer:
 
     @property
     def fold_count(self) -> int:
-        """Completed folds this call — docs/09 §11's drift budget. Also
-        the `fold_no` span attribute."""
+        """**Completed** folds this call — docs/09 §11's drift budget.
+        Incremented only after the store write lands (judgment call #3).
+
+        Not the same number as the `fold_no` span attribute, which is
+        `fold_count + 1` stamped at *attempt* time: two consecutive failed
+        folds both emit `fold_no=1` and neither becomes a `fold_count`.
+        The two agree only on the success path. `fold_no` counts attempts
+        at that boundary, this counts folds that actually wrote."""
         return self._fold_count
 
     @property
@@ -331,6 +408,17 @@ class Summarizer:
         return self._dropped_turns
 
     @property
+    def rewound_turns(self) -> int:
+        """Buffered turns replaced because `observe_turn` was called with
+        a turn number that did not increase — a retried turn, or the
+        docs/09 §11 eviction rebuild restarting `turn_count` mid-call.
+        Kept distinct from `dropped_turns`: that one means the buffer
+        overflowed and a summary loses content it should have had, this
+        one means the caller's turn numbering moved backwards. See
+        `observe_turn` for why neither raises."""
+        return self._rewound_turns
+
+    @property
     def pending_turns(self) -> tuple[BufferedTurn, ...]:
         return self._buffer
 
@@ -343,27 +431,65 @@ class Summarizer:
         (judgment call #2). Pure in-memory bookkeeping — this runs on the
         turn path, so it does no I/O and calls no model.
 
-        Turn numbers must strictly increase; a repeat or a regression is a
-        caller bug that would silently corrupt the fold's coverage range,
-        so it raises rather than guessing which one is real.
+        **Neither failure class on this path raises**, and that is one
+        policy, not two. `observe_turn` runs inside a live voice turn, so
+        raising here drops a merchant's call. Nothing this method can
+        detect is worth that: the whole subsystem is a compression
+        nicety, and docs/09 §11's degradation for losing it outright is
+        "let me double-check that" plus a tool call, not a dropped call.
 
-        **Buffer overflow drops the oldest turn** instead of raising, and
-        this is a deliberate, narrow exception to the house fail-loudly
-        rule: `observe_turn` runs inside a live voice turn, and raising
-        here would drop a merchant's call to protect a compression
-        nicety. The cost is stated rather than hidden — after a drop, the
-        next fold's summary has a *content* hole for the dropped turns,
-        while `summary_thru_turn` still advances to `N-6`. Rendering stays
-        overlap-free and gap-free; the summary's coverage of that range is
-        what degrades. `dropped_turns` and an ERROR log make it visible.
+        **Buffer overflow drops the oldest turn.** The cost is stated
+        rather than hidden — after a drop, the next fold's summary has a
+        *content* hole for the dropped turns, while `summary_thru_turn`
+        still advances to `N-6`. Rendering stays overlap-free and
+        gap-free; the summary's coverage of that range is what degrades.
+        `dropped_turns` and an ERROR log make it visible.
+
+        **A turn number that does not increase replaces the buffered
+        turns at or after it** (latest wins) rather than raising, which is
+        a change of policy from this method's first version. Three pieces
+        of evidence, in order of weight:
+
+        1. *The eviction rebuild reaches this inside a live turn.* docs/09
+           §11's eviction row rebuilds a session **in place** — "audio and
+           tools keep working" — and explicitly restarts `turn_count`. If
+           that rebuild reuses this instance (nothing constructs a fresh
+           one; see the `summary` property), the first `observe_turn(1,
+           ...)` afterwards is a regression, and raising would turn a
+           documented, survivable degradation into a dropped call.
+        2. *`kick()` already tolerates the same scenario.* Its
+           already-covered arm names "a retried turn, or a caller that
+           kicks more than once for turn N" and calls itself idempotent.
+           A retried turn being idempotent at `kick()` and fatal here was
+           one code path with two policies and only one of them argued.
+        3. *Replace, not ignore.* Ignoring the incoming turn would keep a
+           superseded first attempt over its retry, and after a rebuild
+           would discard every turn for the rest of the call (each new
+           low number losing to the stale high-water mark) — the
+           summarizer would go blind. Replacing keeps the strictly
+           increasing invariant true by construction instead of asserting
+           it, and after a rebuild the discarded turns are the ones whose
+           numbering the rebuild already invalidated; docs/09 §11 counts
+           them as lost either way.
+
+        What this does NOT put at risk: the coverage boundary. That comes
+        from `kick()`'s `turn_count` / `fold_pending`'s `thru_turn`, never
+        from the buffer, so a replacement changes what the fold *reads*,
+        never what it *claims to cover*. `rewound_turns` and a WARNING log
+        make it visible.
         """
-        if self._buffer and turn_no <= self._buffer[-1].turn_no:
-            raise ValueError(
-                f"turn_no {turn_no} is not greater than the last observed turn "
-                f"{self._buffer[-1].turn_no} — turn numbers must strictly increase, "
-                "or the fold's coverage range is wrong"
+        kept = tuple(t for t in self._buffer if t.turn_no < turn_no)
+        rewound = len(self._buffer) - len(kept)
+        if rewound:
+            self._rewound_turns += rewound
+            log.warning(
+                "summarizer.turn_number_did_not_increase_replaced_buffered_turns",
+                turn_no=turn_no,
+                replaced=rewound,
+                total_rewound=self._rewound_turns,
+                previous_last_turn=self._buffer[-1].turn_no,
             )
-        appended = (*self._buffer, BufferedTurn(turn_no=turn_no, messages=tuple(messages)))
+        appended = (*kept, BufferedTurn(turn_no=turn_no, messages=tuple(messages)))
         if len(appended) > _MAX_BUFFERED_TURNS:
             overflow = len(appended) - _MAX_BUFFERED_TURNS
             self._dropped_turns += overflow
@@ -431,8 +557,15 @@ class Summarizer:
         a fold failure is already logged and on `last_error`.
 
         For the post-call pipeline (which must not start reading the
-        summary while a fold is still writing it) and for tests, which use
-        it instead of sleeping.
+        summary while a fold is still writing it), for call teardown when
+        the default `task_factory` is in use (see the class docstring: it
+        is the alternative to passing a `TaskGroup.create_task`, and
+        without one of the two an in-flight fold orphans at hang-up), and
+        for tests, which use it instead of sleeping.
+
+        **Not for the turn path.** This awaits the whole ~1.5 s fold, so
+        `kick(...); await drain()` in a turn loop undoes judgment call
+        #1's entire point.
         """
         task = self._in_flight
         if task is None or task.done():
@@ -536,7 +669,23 @@ class Summarizer:
             async with asyncio.timeout(_FOLD_TIMEOUT_S):
                 await self.fold_pending(session_id, thru_turn=thru_turn)
         except asyncio.CancelledError:
-            # Call teardown cancelling the fold is expected, not an error.
+            # Cancellation is expected, not an error — but be exact about
+            # what actually reaches here, both verified by probe:
+            #
+            # - NOT `_FOLD_TIMEOUT_S` expiry. `asyncio.timeout` absorbs the
+            #   CancelledError it raises and re-raises `TimeoutError`, which
+            #   is not a CancelledError subclass, so a timed-out fold lands
+            #   in the generic arm below and is logged as a failure.
+            # - NOT call teardown, under the DEFAULT `task_factory`: that
+            #   spawns outside any enclosing TaskGroup, so group teardown
+            #   never cancels this task (see the class docstring). Under the
+            #   default the fold orphans and keeps running instead.
+            # - It DOES fire when something cancels the task explicitly:
+            #   event-loop shutdown, or a caller who injected a
+            #   TaskGroup-bound `task_factory` whose group is tearing down.
+            #   That injection is the wiring the class docstring asks for,
+            #   so this arm is what makes that wiring quiet rather than
+            #   noisy — it is anticipatory today, not dead.
             log.info(
                 "summarizer.fold_cancelled", session_id=session_id, thru_turn=thru_turn
             )
