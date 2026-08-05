@@ -1,0 +1,30 @@
+# Grafana dashboard provisioning for the `obs` compose profile (Phase-5
+# Batch 5). Companion to ../datasources/.
+#
+# Why provisioning instead of clicking: the Grafana service runs with no
+# persistent volume (see docker-compose.yml's comment on that container),
+# so anything hand-built in the UI dies with `docker compose down`. Boards
+# checked in here are re-applied on every container start.
+#
+# `foldersFromFilesStructure: false` and a flat `path` are deliberate —
+# there is exactly one folder of boards and no nesting to mirror.
+
+apiVersion: 1
+
+providers:
+  - name: VyaparPay
+    orgId: 1
+    folder: VyaparPay
+    type: file
+    # The boards are read-only in the UI. Editing a provisioned board and
+    # hitting Save otherwise produces a change that silently reverts on the
+    # next container start — worse than being told up front it is not
+    # editable. Change the JSON in git instead.
+    disableDeletion: false
+    allowUiUpdates: false
+    # Provisioned boards are re-read from disk on this interval, so an edit
+    # to the JSON shows up without recreating the container.
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -6,10 +6,16 @@
 # no persistent volume. Ten lines here make `docker compose --profile obs
 # up` land on a Grafana that can already see traces.
 #
-# Deliberately just the datasource: no dashboards. The six-panel board in
-# docs/04 §7.3 needs Loki (cost/token/error panels come from LogQL over the
-# structlog stream) and is Phase-5 work, and a half-wired dashboard is
-# worse than an honest absence.
+# Phase-5 Batch 5 added the dashboards this file used to disclaim; they
+# live in ../../dashboards/ and are wired by ../dashboards/dashboards.yaml.
+#
+# They are NOT docs/04 §7.3's six-panel board as written. That spec sources
+# cost, tokens and error counts from LogQL over the structlog stream, and
+# there is still no Loki in this stack. Latency comes from Tempo here as
+# specified; cost and per-call tokens come from Postgres `call_costs`
+# instead (see postgres.yaml for why that is the more correct source, not
+# merely the available one); the error-rate and active-calls panels have no
+# non-Loki source and are deliberately absent rather than faked.
 
 apiVersion: 1
 

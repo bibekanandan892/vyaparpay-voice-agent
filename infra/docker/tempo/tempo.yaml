@@ -1,18 +1,25 @@
-# infra/docker/tempo/tempo.yaml — minimal single-binary Tempo for the
-# `obs` compose profile (ADR-005; docs/04 §7).
+# infra/docker/tempo/tempo.yaml — single-binary Tempo for the `obs`
+# compose profile (ADR-005; docs/04 §7).
 #
-# Scope check: this file exists so the Phase-3 per-turn spans
+# This file gives the per-turn spans
 # (`turn` → `stt.final` → `context.build` → `llm.ttft` → `tool.exec.<name>`
-# → `tts.first_byte`) have somewhere to land while the voice pipeline is
-# being built. It is NOT the observability stack docs/04 §7 specifies —
-# there is no Loki, no trace-to-logs correlation, and no provisioned
-# dashboard here. Those are Phase-5 work; this is the trace sink that keeps
-# a latency question answerable in the meantime.
+# → `tts.first_byte`) somewhere to land, AND — as of Phase-5 Batch 5 —
+# makes them queryable as metrics so the provisioned latency dashboard
+# (infra/docker/grafana/dashboards/) has a backend.
+#
+# Still NOT the full docs/04 §7 stack: there is no Loki, so there is no
+# trace-to-logs correlation and no log-derived panel. The cost and
+# per-call token panels read Postgres instead — see
+# infra/docker/grafana/provisioning/datasources/postgres.yaml for why.
 #
 # To use it: `docker compose --profile obs up -d`, then set
 # OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317 in backend/.env (it ships
 # empty, which disables export entirely) and restart agent-api /
 # voice-worker.
+
+# Required by Grafana's Tempo datasource to stream query results rather
+# than waiting for a complete response. Top-level key, not nested.
+stream_over_http_enabled: true
 
 server:
   # Tempo's own HTTP API — Grafana's Tempo datasource queries this.
@@ -43,9 +50,15 @@ ingester:
 
 compactor:
   compaction:
-    # Local dev traces are worthless after an hour and the volume is a
-    # laptop disk. Anything longer is hoarding.
-    block_retention: 1h
+    # Phase-5 change: was 1h, on the reasoning that "local dev traces are
+    # worthless after an hour". That stops being true once a dashboard is
+    # the consumer — a 1h retention silently empties every latency panel
+    # an hour after the demo call that filled it, which reads as "the
+    # pipeline is broken" rather than "the data aged out". 24h covers a
+    # demo, a debrief the next morning, and the cost board's 6h default
+    # window, on a laptop-sized disk. tests/obs/test_dashboards.py asserts
+    # this retention is at least as wide as the widest dashboard window.
+    block_retention: 24h
 
 storage:
   trace:
@@ -56,3 +69,66 @@ storage:
       path: /var/tempo/wal
     local:
       path: /var/tempo/blocks
+
+# --- TraceQL metrics -----------------------------------------------------
+# Everything below exists so `| quantile_over_time(span:duration, .95)`
+# works. Without it those queries do not error — they return NO DATA, and
+# the latency panels render as an empty graph that looks like a healthy
+# idle system. That is the exact failure mode this batch was told to avoid,
+# so read the two traps before editing:
+#
+# TRAP 1 — `filter_server_spans` defaults to TRUE, and it would drop
+# almost every span this project emits. The local-blocks processor's
+# filter keeps a span only if `Kind == SPAN_KIND_SERVER || no parent`.
+# Every span in app/ is created with `start_as_current_span(name)` /
+# `start_span(name)` with no `kind=` argument, i.e. SpanKind.INTERNAL —
+# see app/obs/tracing.py and its call sites. So `context.build`,
+# `llm.ttft`, `llm.total`, `tool.exec.<name>`, `stt.final` and
+# `tts.first_byte` — all of them children — would be discarded at INGEST,
+# before ever reaching a block. No query can recover them afterwards.
+# Only a root `turn` span would survive, which is why a half-broken
+# waterfall (one bar, no stages) is the symptom to expect if this is ever
+# flipped back. It cannot be set per-tenant in `overrides:` — upstream
+# closed that request as not-planned — so the global block below is the
+# only place it works.
+#
+# TRAP 2 — the processor is spelled two different ways on purpose, and
+# swapping them silently disables the generator: the CONFIG block is
+# `local_blocks` (underscore, matching the Go struct tag) while the
+# OVERRIDES list value is `local-blocks` (hyphen, matching the processor's
+# registered name).
+#
+# Both traps are asserted by backend/tests/obs/test_dashboards.py, because
+# neither one can be caught by looking at a dashboard.
+metrics_generator:
+  storage:
+    # The generator's own metric-registry WAL.
+    path: /var/tempo/generator/wal
+  traces_storage:
+    # Required — upstream default is the empty string, and local-blocks
+    # cannot start without a path to keep its recent-trace blocks in.
+    path: /var/tempo/generator/traces
+  processor:
+    local_blocks:
+      # See TRAP 1. Non-negotiable for this project's span set.
+      filter_server_spans: false
+      # Persist completed blocks so a query can reach past the in-memory
+      # window; without it only very recent data answers.
+      flush_to_storage: true
+
+query_frontend:
+  metrics:
+    # Upstream default in Tempo 2.9 is 3h. The cost/token board defaults to
+    # a 6h window and block_retention above is 24h, so the default would
+    # reject exactly the queries this stack is set up to serve.
+    max_duration: 24h
+    concurrent_jobs: 8
+    target_bytes_per_job: 1.25e+09
+
+overrides:
+  defaults:
+    metrics_generator:
+      # Hyphen — see TRAP 2. This is what actually switches the processor
+      # on; the `metrics_generator.processor.local_blocks` block above only
+      # configures it.
+      processors: [local-blocks]

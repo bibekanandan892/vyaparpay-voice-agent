@@ -1,0 +1,449 @@
+{
+  "__comment": "PROVISIONED BOARD - edit this file in git, not in the Grafana UI (allowUiUpdates:false). Cost and per-call token panels read Postgres call_costs, which CostTracker.finalize() writes as a true per-call sum; per-TURN token panels read Tempo, because call_costs has no per-turn grain. See backend/DASHBOARDS.md for why each panel uses the source it does and which reference line it is read against.",
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "type": "row",
+      "id": 1,
+      "title": "Per-call cost (Postgres call_costs - the authoritative ledger)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 2,
+      "title": "Cost per call vs the canon line",
+      "description": "docs/16 §5 owns the canonical figure: ≈$0.30 (~₹25) per 5-minute call WITH prompt caching, ≈$0.35 without. Both are drawn as threshold bands. IMPORTANT: today's rows cannot reach either line - CostTracker.finalize() hardcodes stt_usd/tts_usd/embeddings_usd to zero (backend/app/agent/cost_tracker.py:260-269, 'Judgment call #6: Phase 2 is text-only'), so total_usd currently carries LLM dialogue + utility ONLY, roughly $0.10 of the $0.30. A low reading here is a MISSING-COMPONENT signal, not an under-budget win. See the 'Cost components' panel below, which makes the zeros visible.",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "lineWidth": 1,
+            "showPoints": "always",
+            "axisLabel": "USD per call",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "red", "value": 0.35 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS \"time\", total_usd::float8 AS \"total_usd\"\nFROM call_costs\nWHERE $__timeFilter(created_at)\nORDER BY created_at"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "Cost components per call (stacked)",
+      "description": "The six NUMERIC(10,6) component columns of call_costs, which the ck_call_costs_total_usd CHECK constraint (backend/app/models/orm.py:322) forces to sum to total_usd. This panel exists to make the Phase-2 zero-fill obvious: stt_usd, embeddings_usd and tts_usd are written as literal zero by CostTracker.finalize(), and turn_infra_usd is not passed at all (it falls to the column's server_default of 0). docs/16 §5 expects TTS alone to be ~50% of a real call's cost, so a stack that is 100% LLM is the current, known-incomplete state.",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "axisLabel": "USD per call",
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS \"time\",\n       stt_usd::float8           AS \"STT (Deepgram)\",\n       llm_dialogue_usd::float8  AS \"LLM dialogue\",\n       llm_utility_usd::float8   AS \"LLM utility\",\n       embeddings_usd::float8    AS \"Embeddings\",\n       tts_usd::float8           AS \"TTS (ElevenLabs)\",\n       turn_infra_usd::float8    AS \"Turn infra\"\nFROM call_costs\nWHERE $__timeFilter(created_at)\nORDER BY created_at"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Mean cost per call (USD)",
+      "description": "Mean of call_costs.total_usd over the dashboard time range. Threshold colours are the docs/16 §5 lines: green under $0.30, orange from $0.30, red from $0.35. Reads low today for the zero-fill reason described on the 'Cost per call' panel.",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "red", "value": 0.35 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT avg(total_usd)::float8 AS \"mean_usd_per_call\"\nFROM call_costs\nWHERE $__timeFilter(created_at)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Mean cost per call (INR)",
+      "description": "The same mean, shown in rupees for the docs/17 §2.5 exit criterion ('matching the ≈$0.30 (~₹25) canonical figure'). CAVEAT ON THE RATE: no doc in this repo states a USD→INR rate. 83.3333 is DERIVED from docs/16 §5's own paired figures ($0.30 ↔ ₹25) so this panel agrees with canon by construction; it is not a live FX rate and will drift from the market. Change it here and in backend/DASHBOARDS.md together if canon's pairing ever changes.",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyINR",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 25 },
+              { "color": "red", "value": 29.17 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "-- 83.3333 INR/USD is derived from docs/16 §5's $0.30 <-> ₹25 pairing.\nSELECT (avg(total_usd) * 83.3333)::float8 AS \"mean_inr_per_call\"\nFROM call_costs\nWHERE $__timeFilter(created_at)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Calls finalized (window)",
+      "description": "Row count in call_costs over the range. One row per call, written by CostTracker.finalize() at hang-up. Zero here means no call completed - which is also why every other panel on this board would be empty, so check this first before believing a flat cost line.",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*)::float8 AS \"calls\"\nFROM call_costs\nWHERE $__timeFilter(created_at)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "Prompt-cache hit share (per call)",
+      "description": "cached_input_tokens / input_tokens across the window. docs/16 §5 budgets a ~1,400-token cached prefix against ~2,200 input tokens per invocation (~64%), and values caching at ~$0.06/call (17% of the canonical total). A collapse toward 0% is the single cheapest explanation for a cost panel drifting upward. Source columns are true per-call sums (CostTracker.finalize(), backend/app/agent/cost_tracker.py:268-270).",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT (sum(cached_input_tokens)::float8\n        / NULLIF(sum(input_tokens), 0)::float8) AS \"cache_hit_share\"\nFROM call_costs\nWHERE $__timeFilter(created_at)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 8,
+      "title": "Token budgets (docs/11 §1: ≤2,500 in / ≤150 out per TURN)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Input tokens per turn vs budget",
+      "description": "Reads the `input_tokens` attribute of the `turn` span (emitted at backend/app/agent/cost_tracker.py:175 onto the span threaded from backend/app/agent/conversation_manager.py:219). Reference lines: 2,450 = docs/11 §1's nine slot budgets summed; 2,500 = the per-turn target; 3,000 = the hard cap that fails the build. READ THIS CAREFULLY: record_turn() fires once per LLM ROUND and re-sets the same key on the same span, so the value is the turn's LAST round, not its total. That is the RIGHT number for a prompt-budget question (the last round carries the most context - tool results have been appended - so it is the turn's largest prompt) and the WRONG number for per-turn token totals. Use the Postgres per-call token panel for totals.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "lineWidth": 0,
+            "axisLabel": "input tokens (last LLM round of the turn)",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2450 },
+              { "color": "orange", "value": 2500 },
+              { "color": "red", "value": 3000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"turn\" && span.input_tokens != nil } | quantile_over_time(span.input_tokens, .95)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"turn\" && span.input_tokens != nil } | max_over_time(span.input_tokens)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Output tokens per turn vs budget",
+      "description": "Same `turn` span, `output_tokens` attribute (backend/app/agent/cost_tracker.py:176). Reference line at 150 = docs/11 §1's per-turn output cap. The same last-round caveat as the input panel applies; for output it matters less, because the final round is the one that actually produces the spoken reply.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "lineWidth": 0,
+            "axisLabel": "output tokens (reply round)",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 150 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"turn\" && span.output_tokens != nil } | quantile_over_time(span.output_tokens, .95)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"turn\" && span.output_tokens != nil } | max_over_time(span.output_tokens)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Tokens per CALL (Postgres totals)",
+      "description": "The per-call totals CostTracker.finalize() sums across every round of every turn (backend/app/agent/cost_tracker.py:268-270) - the figure the per-turn Tempo panels above cannot give. docs/16 §5's canonical call budgets ~44k input / ~1.6k output across ~20 dialogue invocations, so these are call-scale numbers, NOT to be compared against the 2,500/150 per-turn lines.",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "lineWidth": 0,
+            "axisLabel": "tokens per call"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "vyapar-postgres" },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS \"time\",\n       input_tokens::float8        AS \"input tokens\",\n       cached_input_tokens::float8 AS \"cached input tokens\",\n       output_tokens::float8       AS \"output tokens\"\nFROM call_costs\nWHERE $__timeFilter(created_at)\nORDER BY created_at"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 12,
+      "title": "Recent turns - tokens, model and cost (raw spans)",
+      "description": "Plain TraceQL search, so this panel does NOT depend on Tempo's metrics generator - check it first when the two budget graphs above are empty. Rows appearing here with empty graphs above means the metrics-generator config is wrong (infra/docker/tempo/tempo.yaml), not the trace pipeline. Every column is emitted by CostTracker.record_turn(): input_tokens (cost_tracker.py:175), output_tokens (:176), cost_usd (:177), model (:178), cost_estimated (:181, set ONLY when the provider usage frame was incomplete or the served model had no pricing entry - an unflagged row is a priced-from-real-usage row). cost_usd here is ONE LLM ROUND, not the turn or the call; the call total is call_costs.total_usd, shown at the top of this board.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 33 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "limit": 200,
+          "tableType": "spans",
+          "query": "{ span:name = \"turn\" && span.input_tokens != nil } | select(span.session_id, span.turn_no, span.model, span.input_tokens, span.output_tokens, span.cost_usd, span.cost_estimated)"
+        }
+      ]
+    }
+  ],
+  "preload": false,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["vyaparpay", "cost", "tokens"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "VyaparPay - Cost & Token Budgets",
+  "uid": "vyaparpay-cost-tokens",
+  "version": 1,
+  "weekStart": ""
+}
