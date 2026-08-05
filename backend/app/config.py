@@ -16,6 +16,8 @@ from functools import lru_cache
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.domain.types import EMBEDDING_MODEL
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -61,6 +63,49 @@ class Settings(BaseSettings):
     llm_utility_input_usd_per_mtok: Decimal = Decimal("1.00")
     llm_utility_cached_input_usd_per_mtok: Decimal = Decimal("0.10")
     llm_utility_output_usd_per_mtok: Decimal = Decimal("5.00")
+
+    # --- Phase-5 memory (docs/09 §6) ---
+
+    # Embeddings provider (docs/04 §4's fourth provider). Optional-with-
+    # default like the Phase-3 voice keys above: agent-api's Phase-2 paths
+    # and the whole standard test suite boot with no OpenAI env at all, and
+    # `OpenAIEmbeddings` fail-fasts at construction on the missing key
+    # (same shape as `DeepgramStt._require_api_key`).
+    openai_api_key: SecretStr | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    # A model id is config, never a constant (canon §5) — but this one is
+    # also half of a *contract* (app/domain/types.py's EMBEDDING_MODEL /
+    # EMBEDDING_DIM): every stored vector and every query vector must come
+    # from the same model or cosine distance between them is meaningless
+    # rather than merely worse. So the field exists and is overridable, and
+    # its default IS the frozen constant. Overriding it to a model of a
+    # different width fails loudly at `OpenAIEmbeddings`' width check, at
+    # `MemoryChunk`'s validator, and at the `vector(1536)` column;
+    # overriding it to a *same-width* different model is not detectable by
+    # any of them and silently corrupts retrieval quality — that is a
+    # re-embed decision, not an env edit.
+    openai_embedding_model: str = EMBEDDING_MODEL
+
+    # HNSW query-time knobs for `SemanticRepo.search()` (docs/09 §6.2's
+    # scoped query). pgvector's HNSW collects candidates by distance FIRST
+    # and applies the scoping predicate afterwards, so a merchant whose own
+    # rows all fall outside the candidate set gets zero of them back — see
+    # SemanticRepo.search()'s docstring for the full reasoning and why
+    # over-fetching and filtering in Python is not an option here.
+    #
+    # `memory_hnsw_ef_search` must be in pgvector's own 1..1000 range
+    # (its default is 40; 100 here widens the initial candidate set).
+    # `memory_hnsw_iterative_scan` is passed straight through to
+    # `SET LOCAL hnsw.iterative_scan` and accepts pgvector's three values
+    # (`off`, `relaxed_order`, `strict_order`) plus the empty string,
+    # which means "do not set it at all". The empty string is the escape
+    # hatch for a server running pgvector older than 0.8.0, where the
+    # parameter does not exist and setting it fails nondeterministically —
+    # see `SemanticRepo._apply_hnsw_settings` for exactly how. The pinned
+    # `pgvector/pgvector:pg16` image is well past that floor; this is for
+    # a deployment that is not on it.
+    memory_hnsw_ef_search: int = 100
+    memory_hnsw_iterative_scan: str = "strict_order"
 
     otel_exporter_otlp_endpoint: str | None = None
     otel_service_name: str = "agent-api"
