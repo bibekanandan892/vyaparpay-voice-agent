@@ -165,22 +165,76 @@ public class UiTreeCollector(
     private var observerHandle: ObserverHandle? = null
     private var pendingDebounce: Job? = null
 
+    /**
+     * How many live hosts (in practice, `MainActivity` instances) have called
+     * [start] without a matching [stop].
+     *
+     * Main-confined: both calls come from Activity `onCreate`/`onDestroy`, so
+     * this needs no synchronization — the same confinement argument the rest of
+     * this class relies on.
+     */
+    private var activeHosts: Int = 0
+
     private val _tree = MutableStateFlow<RawSemanticsTree?>(null)
 
     /** The latest walked tree. Emits nothing until the first capture completes. */
     public val tree: Flow<RawSemanticsTree> = _tree.asStateFlow().filterNotNull()
 
-    /** Begins observing Compose state commits. Call once, on the UI thread. */
+    /**
+     * Begins observing Compose state commits. Call on the UI thread, once per
+     * host, balanced by [stop].
+     *
+     * **Reference-counted, because this is a `@Singleton` shared across
+     * `MainActivity` instances.** Two instances legitimately overlap: Android
+     * runs the incoming `onCreate` before the outgoing `onDestroy` on a
+     * configuration change, and `AndroidCallNotifier.contentIntent()` launches
+     * this activity with `FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_CLEAR_TOP`
+     * against a `standard` launchMode — the merchant tapping the ongoing-call
+     * notification to get back to the app. This used to `check(observerHandle
+     * == null)`, which was correct while the collector died with its Activity
+     * and became a crash the moment it did not: the incoming `onCreate` threw
+     * `IllegalStateException` with nothing to catch it.
+     *
+     * Plain idempotence would not do either — it would leave the *outgoing*
+     * Activity's [stop] tearing the observer down while the incoming one is
+     * still live, silently ending capture for the rest of the process. Only the
+     * 0 -> 1 transition registers.
+     */
     public fun start() {
-        check(observerHandle == null) { "UiTreeCollector.start() called twice" }
+        if (activeHosts++ > 0) return
         observerHandle = Snapshot.registerApplyObserver { _, _ -> scheduleDebouncedCapture() }
     }
 
-    /** Stops observing and cancels any pending debounced capture. */
+    /**
+     * Releases one host's claim. The last one out disposes the observer,
+     * cancels any pending debounced capture, and **drops every tracked root**.
+     *
+     * Clearing the roots is what keeps an app-lifetime collector from
+     * outliving the windows it walked. `MainActivity` balances its own
+     * `attachRoot` with a `detachRoot` in `onDestroy`, so in the ordinary
+     * overlap case each host removes exactly its own window; this clear is the
+     * backstop for anything still tracked when the last host goes away — a
+     * dialog window open at teardown, or a root whose detach never arrived.
+     * Without it, each destroyed Activity's `AndroidComposeView` (and through
+     * its Context, the Activity and its whole semantics tree) stayed reachable
+     * from this `@Singleton` forever, and every subsequent capture walked the
+     * dead roots too.
+     *
+     * The clear runs inside [scope], the same confinement [attachRoot] and
+     * [detachRoot] mutate [attachedRoots] under, so it cannot race them.
+     * Unbalanced [stop]s (more stops than starts) are tolerated and still tear
+     * down, matching this method's long-standing "stopping before ever
+     * starting does not throw" contract.
+     */
     public fun stop() {
+        if (activeHosts > 0 && --activeHosts > 0) return
+        activeHosts = 0
         observerHandle?.dispose()
         observerHandle = null
-        scope.launch { pendingDebounce?.cancel() }
+        scope.launch {
+            pendingDebounce?.cancel()
+            attachedRoots.clear()
+        }
     }
 
     /**

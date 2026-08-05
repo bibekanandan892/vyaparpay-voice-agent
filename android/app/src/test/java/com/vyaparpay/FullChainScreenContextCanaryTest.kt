@@ -188,16 +188,31 @@ class FullChainScreenContextCanaryTest {
      * in `POST /v1/sessions` — carries the decline dialog, the amount, the
      * recipient and the `402 DAILY_LIMIT_EXCEEDED` that explains it.
      *
-     * Each field below was checked against
-     * `protocol/fixtures/context/ctx_snapshot_payment_decline.json`'s
-     * `payload`, which is that wire shape's authority, and every one of them
-     * matches it **except `last_action.target`**, where production and the
-     * fixture genuinely disagree — see that assertion's own comment. The
-     * expectations here are the fixture's values, not a transcription of
-     * whatever the code happened to emit. The fixture is quoted as literals
-     * rather than read from disk: Android unit tests have no wired-up path to
-     * `protocol/`, the convention `SemanticSnapshotBuilderTest` and
-     * `ScreenContextPublisherTest` already established.
+     * Checked against `protocol/fixtures/context/ctx_snapshot_payment_decline
+     * .json`'s `payload`, which is that wire shape's authority. The fixture is
+     * quoted as literals rather than read from disk: Android unit tests have no
+     * wired-up path to `protocol/`, the convention `SemanticSnapshotBuilderTest`
+     * and `ScreenContextPublisherTest` already established.
+     *
+     * **Production and the fixture disagree in five places, and this test pins
+     * what production actually emits rather than what the fixture says.** Every
+     * one is asserted explicitly below so the divergence is visible and fails
+     * loudly if it changes; none is papered over by a loose assertion. They are
+     * all pre-existing and none is in this task's scope to change:
+     *
+     * 1. `last_action.target` is `pay_now_cta`, the testTag, not `"Pay Now"` —
+     *    `Modifier.trackedClickable` (`:core:ui`) records
+     *    `AppEvent.Tap(name = testTag)`.
+     * 2. The recipient's label is `"Paying"`, not `"To"` — `RecipientRow`'s own
+     *    leading `Text`.
+     * 3. The snackbar's label is `"Payment failed"`, not `"Payment Failed"`.
+     * 4. `dirty_fields` is `["amount_input"]`, not `[]` — the fixture depicts
+     *    the moment after the decline, but the amount field really has been
+     *    edited by then.
+     * 5. Production emits a `secondary_cta` the fixture has no component for.
+     *
+     * An earlier version of this kdoc claimed everything matched except (1);
+     * that was false, and the assertions were loose enough not to notice.
      *
      * The dialog half of this is only reachable because T8f taught
      * [ChildWindowTracker] to discover the `AlertDialog`'s own window in
@@ -235,17 +250,36 @@ class FullChainScreenContextCanaryTest {
         )
         val recipient = ir.components.filterIsInstance<ScreenComponent.Recipient>().singleOrNull()
         assertNotNull("expected a recipient component", recipient)
-        assertTrue(
-            "expected the canonical recipient in '${recipient!!.value}'",
-            SeededPaymentRepository.CANONICAL_RECIPIENT in recipient.value,
-        )
+        assertEquals(SeededPaymentRepository.CANONICAL_RECIPIENT, recipient!!.value)
+        // Divergence 2: the fixture's label is "To".
+        assertEquals("Paying", recipient.label)
 
         // The snackbar: PaymentViewModel.onPaymentDeclined sets it in the same
         // state update as the dialog, and the fixture carries both.
+        // Divergence 3: the fixture capitalises this as "Payment Failed".
+        val snackbar = ir.components.filterIsInstance<ScreenComponent.Snackbar>().singleOrNull()
+        assertNotNull("expected a snackbar component, roles were ${ir.components.map { it.role }}", snackbar)
+        assertEquals("Payment failed", snackbar!!.label)
+        assertTrue("the snackbar must be reported visible", snackbar.visible)
+
+        // The primary CTA, and divergence 5: production also emits a
+        // secondary_cta, which the fixture has no component for at all.
+        val primary = ir.components.filterIsInstance<ScreenComponent.PrimaryCta>().singleOrNull()
+        assertNotNull("expected a primary_cta", primary)
+        assertEquals("Pay Now", primary!!.label)
+        assertTrue("the Pay Now CTA is enabled at 245", primary.enabled)
         assertTrue(
-            "expected a snackbar component, roles were ${ir.components.map { it.role }}",
-            ir.components.any { it.role == ScreenComponentRole.SNACKBAR },
+            "expected the secondary_cta production emits but the fixture omits, roles were " +
+                "${ir.components.map { it.role }}",
+            ir.components.any { it.role == ScreenComponentRole.SECONDARY_CTA },
         )
+
+        // Envelope and top-level scalars. Divergence 4: the fixture pins
+        // dirty_fields to [], but the amount field genuinely has been edited by
+        // the time the decline lands.
+        assertEquals("screen_context/v1", ir.v)
+        assertEquals(listOf(AMOUNT_TEST_TAG), ir.dirtyFields)
+        assertTrue("loading must be false once the decline has resolved", !ir.loading)
 
         // `last_api` is the single highest-value field in the whole payload --
         // it is *why* the merchant is calling. It reaches the IR only because
@@ -581,22 +615,31 @@ class FullChainScreenContextCanaryTest {
      *   `:core:screencontext`, whose own comment notes it duplicates
      *   `NavigationTracker`'s table by hand).
      *
-     * A test comparing the last two directly is impossible without widening
-     * `ROUTE_TO_FLOW`'s visibility, and would be weak anyway:
-     * `isExcludedFromCapture` is `route in EXCLUDED_ROUTES || flow ==
-     * EXCLUDED_FLOW`, so either table alone still excludes every route it
-     * knows, and most disagreements between them are harmless. The dangerous
-     * case is the one neither table can see — a support surface missing from
-     * *both*.
+     * The last two ARE compared directly, in `AppStateManagerTest`'s
+     * `every excluded route still resolves to the support flow in
+     * NavigationTracker` — `flowFor` is `internal`, not private, and
+     * `NavigationTrackerTest` already calls it, so nothing had to be widened.
+     * An earlier version of this kdoc claimed that comparison was impossible
+     * without widening `ROUTE_TO_FLOW`; that was simply wrong.
+     *
+     * That table cross-check and this test cover different gaps, which is why
+     * both exist. `isExcludedFromCapture` is `route in EXCLUDED_ROUTES || flow
+     * == EXCLUDED_FLOW`, so a route dropped from one table alone is still
+     * excluded by the other — the cross-check catches the tables disagreeing,
+     * including for `ConversationOverlay`, which has no `AppRoute` entry and is
+     * therefore invisible to the sweep below. The dangerous case *it* cannot
+     * see is a support surface missing from both tables.
      *
      * This guard therefore checks behaviour against the feature's own public
-     * declaration instead, driving every route in the real `AppNavHost` through
+     * declaration, driving every route in the real `AppNavHost` through
      * the real `NavigationTracker` and asserting what [AppStateManager]
      * actually retained. It fails if any of the three drift: a support route
      * absent from both internal tables, a route wrongly added to
-     * `EXCLUDED_ROUTES`, a `ROUTE_TO_FLOW` row that stops resolving to
-     * `support`, or a feature that flips `IS_CAPTURED` without the pipeline
-     * following.
+     * `EXCLUDED_ROUTES`, or a feature that flips `IS_CAPTURED` without the
+     * pipeline following. (A `ROUTE_TO_FLOW` row that stops resolving to
+     * `support` is deliberately NOT on that list: `isExcludedFromCapture` is an
+     * OR, so `EXCLUDED_ROUTES` still catches it and this test would not fire.
+     * `AppStateManagerTest`'s table cross-check is what covers that case.)
      *
      * **What it still does not catch,** stated plainly: a *new* support surface
      * that is added to the nav graph but declares `IS_CAPTURED = true` (or is
@@ -776,9 +819,6 @@ class FullChainScreenContextCanaryTest {
 
         /** `ApiError.DAILY_LIMIT_EXCEEDED.name` — the fixture's `error_code`. */
         const val DAILY_LIMIT_EXCEEDED = "DAILY_LIMIT_EXCEEDED"
-
-        /** The Pay Now CTA's label, which `trackedClickable` reports as `last_action.target`. */
-        const val PAY_NOW_LABEL = "Pay Now"
 
         /** `HelpScreen`'s inline CTA label, and the FAQ section heading. */
         const val CALL_SUPPORT_LABEL = "Call Support"

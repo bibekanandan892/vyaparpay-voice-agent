@@ -87,14 +87,27 @@ import javax.inject.Inject
  *    activity — either way, a fresh `MainActivity` instance (and, via Hilt,
  *    a freshly injected `uiTreeCollector`/`navigationTracker` pair scoped to
  *    the same app-lifetime singletons) runs `onCreate` again, so there is no
- *    observer leaked across recreation: the old instance's `stop()` tears
- *    down its `Snapshot.registerApplyObserver` registration before the new
- *    one's `start()` registers a fresh one. There is deliberately no
- *    `detachRoot` call for the MAIN window — `UiTreeCollector`'s own kdoc
- *    reserves `detachRoot` for a window detaching *while the activity is
- *    still alive*, and the main window detaching because the activity itself
- *    is being destroyed is a different event. Sibling windows are a different
- *    matter entirely: see judgment call 7.
+ *    observer leaked across recreation. `UiTreeCollector.start`/`stop` are
+ *    reference-counted (see that class's kdoc) precisely because the incoming
+ *    `onCreate` runs *before* the outgoing `onDestroy` on a configuration
+ *    change — the observer therefore survives the handover rather than being
+ *    torn down by the Activity that is leaving.
+ *
+ *    **`onDestroy` DOES detach the main window (corrected in Phase-4 T8e).**
+ *    This previously did not, on the reasoning that `detachRoot` is for a
+ *    window closing while the activity is still alive. That reasoning depended
+ *    on the collector dying with the Activity, which stopped being true when
+ *    `UiTreeCollector` was correctly scoped `@Singleton`: an unbalanced
+ *    `attachRoot` then pins every destroyed Activity's `AndroidComposeView` —
+ *    and through its Context the Activity and its whole semantics tree — in an
+ *    app-lifetime object, one per rotation, dark-mode toggle, font-size or
+ *    locale change (this app declares no `configChanges`). Detaching here is
+ *    the precise balance for the `attachRoot` in `attachComposeRoot`, and it
+ *    is what keeps the overlap case correct: each instance removes exactly its
+ *    own window, so the incoming Activity's root is untouched.
+ *    `UiTreeCollector.stop` additionally clears any remaining roots when the
+ *    last host leaves. Sibling windows are a different matter entirely: see
+ *    judgment call 7.
  *
  * 7. **Sibling windows are tracked by [ChildWindowTracker], not by a second
  *    `decorView` walk (Phase-4 T8f).** Judgment call 5's walk is complete for
@@ -166,6 +179,8 @@ public class MainActivity : ComponentActivity() {
         // every sibling window it is still tracking as detached, and that has
         // to land on a collector that is still listening.
         childWindowTracker.stop()
+        // Balances the attachRoot in `attachComposeRoot` — see judgment call 6.
+        findRootForTest(window.decorView)?.let(uiTreeCollector::detachRoot)
         uiTreeCollector.stop()
         super.onDestroy()
     }
