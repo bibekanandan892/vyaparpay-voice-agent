@@ -205,7 +205,6 @@ internal class ChildWindowTracker(
      */
     private val trackedWindows = LinkedHashMap<View, TrackedWindow>()
 
-
     /** Cross-thread: [Snapshot] apply observers fire on whichever thread applied. */
     private val scanPending = AtomicBoolean(false)
 
@@ -331,6 +330,22 @@ internal class ChildWindowTracker(
 
         for (windowView in windowViews) {
             if (windowView === hostView || trackedWindows.containsKey(windowView)) continue
+            // Another live Activity's host window. Skipping it is what stops two
+            // overlapping trackers from adopting each other's main window (4
+            // roots for 2 windows, measured, before this line existed).
+            //
+            // KNOWN RESIDUAL: this covers HOST windows only. A sibling DIALOG
+            // owned by the outgoing Activity is not in `liveHostViews`, so the
+            // incoming tracker's first scan still adopts it on top of the
+            // outgoing tracker already holding it -- measured 4 roots for 3
+            // windows, with the dialog's components duplicated in the IR, in
+            // the narrow case where the merchant has a dialog up AND relaunches
+            // via the ongoing-call notification. Transient and self-healing
+            // (back to 1 root once the outgoing Activity dies), and strictly
+            // better than the pre-fix 6. The durable fix is per-host root
+            // ownership in `UiTreeCollector`, which closes this and the
+            // support-surface labelling gap together -- see
+            // `MainActivityOverlappingWindowsTest`'s KNOWN GAP test.
             if (windowView in liveHostViews) continue
             val root = try {
                 findRootForTest(windowView)
@@ -438,9 +453,13 @@ internal class ChildWindowTracker(
          * it. A decorView's context chain is `DecorContext -> ContextImpl`:
          * `android.view.DecorContext` deliberately wraps the *application*
          * context rather than the Activity, precisely so a decorView cannot
-         * leak one. Measured on both activities in
-         * `MainActivityOverlappingWindowsTest`'s probe — the chain contains no
-         * `Activity` at all, so ownership is simply not recoverable that way.
+         * leak one. Measured on both activities during review, and on every
+         * view `WindowInspector.getGlobalWindowViews()` returned: the chain
+         * contains no `Activity` at all, so ownership is simply not recoverable
+         * that way. (No committed test proves this — it is a statement about
+         * the framework, not about this code. Re-measure by walking
+         * `decorView.context` through `ContextWrapper.baseContext` if you want
+         * to confirm it before trusting it.)
          * "Scan only while resumed" was the other candidate and is worse: the
          * outgoing Activity is already paused while a dialog it owns is still
          * legitimately on screen.

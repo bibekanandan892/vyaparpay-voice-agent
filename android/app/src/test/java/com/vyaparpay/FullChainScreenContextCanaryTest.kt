@@ -194,11 +194,12 @@ class FullChainScreenContextCanaryTest {
      * wired-up path to `protocol/`, the convention `SemanticSnapshotBuilderTest`
      * and `ScreenContextPublisherTest` already established.
      *
-     * **Production and the fixture disagree in six places, and this test pins
-     * what production actually emits rather than what the fixture says.** Every
-     * one is asserted explicitly below so the divergence is visible and fails
-     * loudly if it changes; none is papered over by a loose assertion. They are
-     * all pre-existing and none is in this task's scope to change:
+     * **Production and the fixture disagree in seven places, and this test pins
+     * what production actually emits rather than what the fixture says.** Items
+     * 1-6 are each asserted explicitly below, so they stay visible and fail
+     * loudly if they change; none of those is papered over by a loose
+     * assertion. Item 7 is the exception and says so. They are all pre-existing
+     * and none is in this task's scope to change:
      *
      * 1. `last_action.target` is `pay_now_cta`, the testTag, not `"Pay Now"` —
      *    `Modifier.trackedClickable` (`:core:ui`) records
@@ -211,13 +212,19 @@ class FullChainScreenContextCanaryTest {
      *    edited by then.
      * 5. Production emits a `secondary_cta` the fixture has no component for.
      * 6. The amount field carries `focused = true`; the fixture has no
-     *    `focused` key. Component ORDER also differs and is deliberately not
-     *    asserted here — `UiTreeCollectorPaymentScreenCanaryTest` owns the
-     *    ordering contract (dialog immediately before snackbar).
+     *    `focused` key.
+     * 7. Component ORDER differs — production emits recipient before amount,
+     *    the fixture the other way round. This is the one divergence NOT
+     *    asserted here, and not asserted anywhere else either:
+     *    `UiTreeCollectorPaymentScreenCanaryTest` owns the ordering contract
+     *    but only pins dialog-immediately-before-snackbar, so the
+     *    recipient/amount swap is genuinely uncovered.
      *
-     * Two earlier versions of this kdoc undercounted: first claiming everything
-     * matched except (1), then five. Both times the assertions were loose enough
-     * not to notice.
+     * Three earlier versions of this kdoc undercounted — first claiming
+     * everything matched except (1), then five, then six — each time by folding
+     * a real difference into a neighbouring item, and the first two times the
+     * assertions were loose enough not to notice. Count the dump, not the list,
+     * if you touch this.
      *
      * The dialog half of this is only reachable because T8f taught
      * [ChildWindowTracker] to discover the `AlertDialog`'s own window in

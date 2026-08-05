@@ -128,9 +128,17 @@ class MainActivityOverlappingWindowsTest {
         settle()
         // Put the outgoing activity on the support surface, the way a merchant
         // on a call would be.
-        // No route juggling needed: the incoming activity's own bind is what
-        // sets the shared NavigationTracker's route, which is precisely the
-        // asymmetry under test.
+        //
+        // Swapping A's content shows the support surface WITHOUT navigating, so
+        // the shared route stays whatever A's own bind set -- DashboardScreen --
+        // for the whole test. An earlier version of this comment claimed the
+        // incoming activity's bind creates the asymmetry; it does not, and
+        // `isExcludedFromCapture` is never exercised here. This is therefore a
+        // simplification of the production sequence (A navigates to HelpScreen,
+        // route becomes excluded, B relaunches and flips it back to a
+        // non-excluded one). What it pins is narrower than that sequence and
+        // still exactly the gap: support content reaching a snapshot labelled
+        // with a non-excluded route.
         a.get().runOnUiThread { a.get().setContent { VyaparTheme { SupportRoute() } } }
         settle()
 
@@ -158,6 +166,24 @@ class MainActivityOverlappingWindowsTest {
             "documented gap: support content is in the captured tree under a non-excluded route",
             supportVisible && state.route !in setOf(SupportDestination.ROUTE, "ConversationOverlay"),
         )
+
+        // ...and pinned again one layer down, where the harm actually lands.
+        // `state.screen` is the IR `sessionCreateBody()` ships verbatim; the
+        // tree assertion above would still pass if someone closed the gap in
+        // `AppStateManager` while leaving the captured tree mixed, so this is
+        // the assertion that has to fail when the gap is genuinely fixed.
+        val ir = requireNotNull(state.screen) { "the gap needs a retained screen to show up in" }
+        val labels = ir.components.map { it.label }
+        assertEquals(
+            "the PUBLISHED IR carries the incoming activity's non-excluded route",
+            "DashboardScreen",
+            ir.screen,
+        )
+        assertTrue(
+            "documented gap: support-surface components reach the published IR, not just the raw " +
+                "tree -- labels were $labels",
+            SUPPORT_CTA_LABEL in labels,
+        )
     }
 
     private fun settle() {
@@ -173,3 +199,12 @@ class MainActivityOverlappingWindowsTest {
     private fun allTestTags(node: RawSemanticsNode): List<String> =
         listOfNotNull(node.testTag) + node.children.flatMap(::allTestTags)
 }
+
+/**
+ * The support surface's own CTA label, as `HelpScreen` renders it
+ * (`HelpScreen.kt:117`). Duplicated rather than imported because it is a
+ * literal there, not a constant -- if that ever changes, the KNOWN GAP
+ * assertion above stops proving anything and should be re-pointed at whatever
+ * replaces it.
+ */
+private const val SUPPORT_CTA_LABEL = "Call Support"

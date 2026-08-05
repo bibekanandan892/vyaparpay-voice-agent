@@ -35,8 +35,8 @@ import org.junit.Test
  * without `SINGLE_TOP` against a `standard` launchMode, leaving two instances
  * briefly alive at once (measured in `MainActivityOverlappingWindowsTest`). A
  * *configuration change* is NOT such a case — it is strictly
- * destroy-then-create — and an earlier version of this kdoc wrongly said it was. The tests below pin the reference-counted contract
- * that replaced it.
+ * destroy-then-create — and an earlier version of this kdoc wrongly said it
+ * was. The tests below pin the reference-counted contract that replaced it.
  *
  * They are deliberately behavioural: they observe whether a real Compose
  * snapshot commit still reaches [UiTreeCollector.tree], rather than reading
@@ -72,9 +72,15 @@ class UiTreeCollectorTest {
         // a second registered observer -- it structurally cannot. Two live
         // observers still yield one capture, because scheduleDebouncedCapture
         // cancels and replaces pendingDebounce and _tree conflates equal values.
-        // `the outgoing host's stop leaves the incoming host still observing` is
-        // what actually pins the single-registration behaviour, via its
-        // consequence.
+        // `the last host's stop disposes the observer` is what actually pins
+        // the single-registration behaviour, via its consequence: a second
+        // registration leaks an observer that keeps firing after the final
+        // stop(), which that test catches. (Verified by mutation -- registering
+        // on every start() fails that test and only that one. An earlier
+        // version of this comment named `the outgoing host's stop leaves the
+        // incoming host still observing`, which passes under that mutation;
+        // correcting a false coverage claim was the point of this rename, so
+        // getting the replacement wrong would have been the same defect twice.)
         assertEquals("one commit must produce one capture", 1, captures.size)
         collector.stop()
         collector.stop()
