@@ -7,7 +7,7 @@ import pytest
 
 from app.context.event_log import EVENTS_MAX_LEN, EventLog
 from app.context.redis_keys import CTX_TTL_SECONDS
-from tests.support.fake_redis import FakeRedis
+from tests.support.fake_redis import FakePipeline, FakeRedis
 
 
 async def test_get_events_is_empty_when_session_absent(event_log: EventLog) -> None:
@@ -113,29 +113,40 @@ async def test_append_many_round_trips_in_order(event_log: EventLog) -> None:
     assert await event_log.get_events("sess_1") == [event_1, event_2]
 
 
-async def test_append_many_is_one_pipelined_round_trip(
+async def test_append_many_queues_one_variadic_rpush_in_one_pipeline(
     event_log: EventLog, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The whole point of the fix: one `pipeline().execute()`, not N awaited
-    `rpush`/`ltrim`/`expire` calls. Counts real `Redis.pipeline()`
-    invocations rather than asserting call counts on individual commands,
-    since a pipeline queues synchronously and only the final `execute()`
-    is an awaited round trip."""
-    pipeline_calls = 0
+    """The whole point of the fix: one `pipeline().execute()` carrying
+    exactly three commands, the first a single variadic `RPUSH` holding
+    every event -- not `len(events)` single-value ones.
+
+    Asserting only the `pipeline()` call count is not enough, which the
+    first version of this test got wrong. Verified 2026-08-05 by mutating
+    `append_many` to queue a single-value `RPUSH` per event into the same
+    pipeline: `pipeline()` is still called exactly once, so that weaker
+    assertion (and the whole 55-test suite around it) stayed green while
+    the regression it names was live. Asserting the queued command shape
+    is what actually catches it."""
     real_pipeline = fake_redis.pipeline
+    pipelines: list[FakePipeline] = []
 
-    def _counting_pipeline(transaction: bool = True):
-        nonlocal pipeline_calls
-        pipeline_calls += 1
-        return real_pipeline(transaction=transaction)
+    def _recording_pipeline(transaction: bool = True) -> FakePipeline:
+        pipe = real_pipeline(transaction=transaction)
+        pipelines.append(pipe)
+        return pipe
 
-    monkeypatch.setattr(fake_redis, "pipeline", _counting_pipeline)
+    monkeypatch.setattr(fake_redis, "pipeline", _recording_pipeline)
 
-    await event_log.append_many(
-        "sess_1", [{"type": "tap", "name": str(i), "ts": i} for i in range(5)]
-    )
+    events = [{"type": "tap", "name": str(i), "ts": i} for i in range(5)]
+    await event_log.append_many("sess_1", events)
 
-    assert pipeline_calls == 1
+    assert len(pipelines) == 1
+    queued = pipelines[0].executed_ops
+    assert [name for name, _ in queued] == ["rpush", "ltrim", "expire"]
+
+    key, *pushed = queued[0][1]
+    assert key == "ctx:sess_1:events"
+    assert len(pushed) == len(events)
 
 
 async def test_append_many_applies_the_ttl_and_trims_to_the_cap(

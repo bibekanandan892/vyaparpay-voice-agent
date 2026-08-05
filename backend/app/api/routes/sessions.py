@@ -491,13 +491,19 @@ async def _persist_recent_events(
 
     This does change one thing the loop-shaped version of this docstring
     used to claim: `append_many`'s pipeline is a Redis `MULTI`/`EXEC`
-    transaction, so a failure now yields *nothing* written rather than a
-    truncated oldest-first prefix. That is still exactly the already-
-    accepted degraded outcome, not a new failure mode: a fully-empty
-    `ctx:{session_id}:events` reads back identically to a client that sent
-    `recent_events: []`, which this function already treats as fine. What
-    changed is which *empty-or-full* outcome a mid-write failure produces,
-    not whether a failure here can fail the call — it still cannot.
+    transaction, so for the ordinary failure — the pipeline never reaching
+    `EXEC` — nothing is written, rather than the truncated oldest-first
+    prefix the loop could leave. Not an unqualified guarantee, though, and
+    the review of this fix was right to push back on the first draft of
+    this paragraph for stating it as one: a connection lost after the
+    server commits `EXEC` but before the client reads the reply means the
+    data landed while this function still logs a failure.
+
+    Either way the outcome this function owns is unchanged. Whatever ends
+    up in `ctx:{session_id}:events` reads back as a timeline; an empty one
+    degrades exactly like a client that sent `recent_events: []`, which
+    this function already treats as fine; and a failure here still cannot
+    fail the call.
     """
     if not recent_events:
         return

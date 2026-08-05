@@ -762,9 +762,16 @@ def test_create_session_survives_a_failure_while_persisting_recent_events(
     async `rpush` once per event, so the failure must be injected into
     `FakePipeline.execute`'s dispatch target -- the private, synchronous
     `_rpush` -- not the public async method the pipeline path no longer
-    calls. (Patching the old target here would silently stop testing
-    anything: the request would just succeed for real, and this test
-    would keep passing for the wrong reason.)
+    calls.
+
+    Correcting this docstring's own first version, which claimed patching
+    the old `rpush` target would leave this test "silently passing for the
+    wrong reason": it would not. Reproduced 2026-08-05 -- the injection
+    goes inert, the write really lands, and the key-absence assertion
+    below fails loudly. The old target is still wrong, for a different
+    reason: the `except Exception` guard this test exists to cover never
+    runs, so neither a red nor a green result here would say anything
+    about it.
     """
 
     def _fail(key: str, *values: str) -> None:

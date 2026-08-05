@@ -30,6 +30,11 @@ class FakePipeline:
     def __init__(self, store: FakeRedis) -> None:
         self._store = store
         self._ops: list[tuple[str, tuple[Any, ...]]] = []
+        # What the last `execute()` drained, retained so a test can assert
+        # on the exact command shape that was pipelined -- one variadic
+        # RPUSH vs. N single-value ones, say. `_ops` itself is cleared by
+        # `execute()`, mirroring the real client's one-shot semantics.
+        self.executed_ops: list[tuple[str, tuple[Any, ...]]] = []
 
     def zremrangebyscore(self, key: str, min_: Any, max_: Any) -> FakePipeline:
         self._ops.append(("zremrangebyscore", (key, min_, max_)))
@@ -60,6 +65,14 @@ class FakePipeline:
         return self
 
     async def execute(self) -> list[Any]:
+        """Fidelity gap worth knowing before writing a failure-injection
+        test against this: real Redis `MULTI`/`EXEC` commits the queued
+        commands as a unit server-side, whereas this dispatches them one
+        at a time, so an injected mid-`execute` raise leaves the earlier
+        commands' mutations behind. Fine for the ordering and
+        command-shape assertions this fake exists for -- just not
+        evidence about real transactional atomicity."""
+        self.executed_ops = list(self._ops)
         results = [getattr(self._store, f"_{name}")(*args) for name, args in self._ops]
         self._ops.clear()
         return results
