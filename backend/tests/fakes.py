@@ -26,7 +26,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from app.domain.types import LLMEvent
+from app.domain.types import EMBEDDING_DIM, LLMEvent
 from app.domain.voice import SttEvent, TtsChunk
 
 
@@ -294,9 +294,49 @@ class FakeBrain:
         return self._replies.pop(0)
 
 
+class FakeEmbeddings:
+    """Scriptable `app.domain.interfaces.EmbeddingProvider` double, for
+    in-process tests of anything downstream of the embeddings provider
+    (`SemanticMemory` today; the seed embedder and post-call embed stage
+    later). There is no OpenAI key on the development machine, so this is
+    the only way those components are exercisable at all — the wire-level
+    counterpart is `tests/providers/test_openai_embeddings.py`.
+
+    **It honours the contract it doubles**, deliberately: it returns
+    exactly one `EMBEDDING_DIM`-wide vector per input text, positionally
+    aligned. A fake that returned a single vector for a batch, or vectors
+    of a convenient width, would let a caller that mishandles the batched
+    shape pass its tests and fail against the real provider.
+    """
+
+    def __init__(self, fill: float = 0.01) -> None:
+        self.calls: list[list[str]] = []
+        self._scripted: list[tuple[float, ...]] = []
+        self._default = tuple([fill] * EMBEDDING_DIM)
+
+    def script(self, *vectors: Sequence[float]) -> None:
+        """Queue vectors to be returned, in order, one per embedded text.
+        Widths are checked here rather than at `embed()` so a malformed
+        test double fails at the line that wrote it."""
+        for vector in vectors:
+            if len(vector) != EMBEDDING_DIM:
+                raise AssertionError(
+                    f"FakeEmbeddings.script() got a {len(vector)}-dim vector; "
+                    f"EmbeddingProvider always returns {EMBEDDING_DIM} floats"
+                )
+            self._scripted.append(tuple(float(value) for value in vector))
+
+    async def embed(self, texts: list[str]) -> list[tuple[float, ...]]:
+        self.calls.append(list(texts))
+        return [
+            self._scripted.pop(0) if self._scripted else self._default for _ in range(len(texts))
+        ]
+
+
 __all__ = [
     "FAKE_TTS_MS_PER_CHAR",
     "FakeBrain",
+    "FakeEmbeddings",
     "FakeLLM",
     "FakeLLMCall",
     "FakeStt",
