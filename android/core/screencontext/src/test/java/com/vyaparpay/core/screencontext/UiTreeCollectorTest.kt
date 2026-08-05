@@ -30,11 +30,12 @@ import org.junit.Test
  * the old one.** `start()` used to `check(observerHandle == null)`, and this
  * file asserted "starting twice throws". That was right while the collector
  * died with its Activity; once it was correctly scoped `@Singleton`, that
- * throw became process-global and reachable from ordinary app behaviour —
- * Android runs an incoming `MainActivity.onCreate` before the outgoing
- * `onDestroy` on every configuration change, and
+ * throw became process-global and reachable from ordinary app behaviour:
  * `AndroidCallNotifier.contentIntent()` relaunches the activity `CLEAR_TOP`
- * without `SINGLE_TOP`. The tests below pin the reference-counted contract
+ * without `SINGLE_TOP` against a `standard` launchMode, leaving two instances
+ * briefly alive at once (measured in `MainActivityOverlappingWindowsTest`). A
+ * *configuration change* is NOT such a case — it is strictly
+ * destroy-then-create — and an earlier version of this kdoc wrongly said it was. The tests below pin the reference-counted contract
  * that replaced it.
  *
  * They are deliberately behavioural: they observe whether a real Compose
@@ -56,7 +57,7 @@ import org.junit.Test
 class UiTreeCollectorTest {
 
     @Test
-    fun `a second host does not throw and does not register a second observer`() = runTest(UnconfinedTestDispatcher()) {
+    fun `a second host does not throw`() = runTest(UnconfinedTestDispatcher()) {
         val collector = UiTreeCollector(this, debounceMillis = 0)
         val captures = recordCaptures(collector)
 
@@ -66,8 +67,14 @@ class UiTreeCollectorTest {
         commitAComposeStateChange()
         advanceUntilIdle()
 
-        // Exactly one, not two: a second registered observer would run the
-        // apply callback twice for this single commit.
+        // Renamed after review: this asserts the second start() does not THROW
+        // and that capture still works. It deliberately does NOT claim to detect
+        // a second registered observer -- it structurally cannot. Two live
+        // observers still yield one capture, because scheduleDebouncedCapture
+        // cancels and replaces pendingDebounce and _tree conflates equal values.
+        // `the outgoing host's stop leaves the incoming host still observing` is
+        // what actually pins the single-registration behaviour, via its
+        // consequence.
         assertEquals("one commit must produce one capture", 1, captures.size)
         collector.stop()
         collector.stop()

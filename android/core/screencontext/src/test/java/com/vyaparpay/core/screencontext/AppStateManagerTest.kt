@@ -419,8 +419,10 @@ class AppStateManagerTest {
      * `FullChainScreenContextCanaryTest` (`:app`) walks every route in the real
      * nav graph and checks each is captured or excluded exactly as its feature
      * declares — but `ConversationOverlay` is not a nav destination and has no
-     * `AppRoute` entry, so that sweep is structurally blind to it. This test is
-     * the only thing covering it.
+     * `AppRoute` entry, so that sweep is structurally blind to it. Pre-existing
+     * `NavigationTrackerTest` cases also pin that row, so this test is not the
+     * only thing that fails if it changes; its unique contribution is checking
+     * the two tables AGREE, which nothing else does.
      *
      * **What it does not catch, stated plainly.** `isExcludedFromCapture` is
      * `route in EXCLUDED_ROUTES || flow == EXCLUDED_FLOW`, so a route dropped

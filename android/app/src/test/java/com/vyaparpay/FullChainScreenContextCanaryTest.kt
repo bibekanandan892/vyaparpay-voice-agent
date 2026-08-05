@@ -194,7 +194,7 @@ class FullChainScreenContextCanaryTest {
      * wired-up path to `protocol/`, the convention `SemanticSnapshotBuilderTest`
      * and `ScreenContextPublisherTest` already established.
      *
-     * **Production and the fixture disagree in five places, and this test pins
+     * **Production and the fixture disagree in six places, and this test pins
      * what production actually emits rather than what the fixture says.** Every
      * one is asserted explicitly below so the divergence is visible and fails
      * loudly if it changes; none is papered over by a loose assertion. They are
@@ -210,9 +210,14 @@ class FullChainScreenContextCanaryTest {
      *    the moment after the decline, but the amount field really has been
      *    edited by then.
      * 5. Production emits a `secondary_cta` the fixture has no component for.
+     * 6. The amount field carries `focused = true`; the fixture has no
+     *    `focused` key. Component ORDER also differs and is deliberately not
+     *    asserted here — `UiTreeCollectorPaymentScreenCanaryTest` owns the
+     *    ordering contract (dialog immediately before snackbar).
      *
-     * An earlier version of this kdoc claimed everything matched except (1);
-     * that was false, and the assertions were loose enough not to notice.
+     * Two earlier versions of this kdoc undercounted: first claiming everything
+     * matched except (1), then five. Both times the assertions were loose enough
+     * not to notice.
      *
      * The dialog half of this is only reachable because T8f taught
      * [ChildWindowTracker] to discover the `AlertDialog`'s own window in
@@ -244,10 +249,13 @@ class FullChainScreenContextCanaryTest {
         // "your ₹245 payment to Amazon Business".
         val amount = ir.components.filterIsInstance<ScreenComponent.AmountField>().singleOrNull()
         assertNotNull("expected an amount_field, roles were ${ir.components.map { it.role }}", amount)
-        assertTrue(
-            "expected the amount field to carry ₹$CANONICAL_AMOUNT, got '${amount!!.value}'",
-            amount.value.endsWith(CANONICAL_AMOUNT),
-        )
+        // Pinned exactly, including the rupee sign: the previous
+        // `endsWith(CANONICAL_AMOUNT)` was the loosest assertion in this method
+        // and did not even check the ₹. Divergence 6 lives here too -- production
+        // reports `focused = true` on this component and the fixture has no
+        // `focused` key at all.
+        assertEquals("₹" + CANONICAL_AMOUNT, amount!!.value)
+        assertTrue("the amount field is focused after performTextInput", amount.focused)
         val recipient = ir.components.filterIsInstance<ScreenComponent.Recipient>().singleOrNull()
         assertNotNull("expected a recipient component", recipient)
         assertEquals(SeededPaymentRepository.CANONICAL_RECIPIENT, recipient!!.value)

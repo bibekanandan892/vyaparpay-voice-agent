@@ -88,6 +88,41 @@ class UiTreeCollectorRootLifecycleTest {
         )
     }
 
+    /**
+     * The root-side twin of the observer-side regression, and the gap review
+     * found the suite completely blind to: moving `attachedRoots.clear()` above
+     * `stop()`'s reference-count early-return left all 449 tests passing.
+     *
+     * Under that mutation the OUTGOING Activity wipes the INCOMING Activity's
+     * freshly attached root. Because `MainActivity.attachComposeRoot` attaches
+     * exactly once per instance, nothing ever re-attaches it — capture goes
+     * permanently empty for a live Activity, which is the same
+     * silent-dead-pipeline class as the original `@Singleton` bug.
+     */
+    @Test
+    fun `an outgoing host's stop must not clear a still-live host's root`() {
+        composeTestRule.setContent { Text("a real composition, so there is a real RootForTest") }
+        composeTestRule.waitForIdle()
+
+        val root = findRootForTest(composeTestRule.activity.window.decorView)
+            ?: error("No RootForTest in the rendered view tree.")
+
+        val collector = UiTreeCollector(scope = CoroutineScope(Dispatchers.Unconfined))
+        collector.start() // Activity A
+        collector.start() // Activity B arrives before A is destroyed
+        collector.attachRoot(root) // B's window
+
+        collector.stop() // A is destroyed -- B is still live, so its root must survive
+        collector.forceImmediateCapture()
+
+        assertEquals(
+            "the outgoing host's stop must leave the surviving host's window attached; clearing " +
+                "here empties capture permanently for a live Activity",
+            1,
+            runBlocking { collector.tree.first() }.roots.size,
+        )
+    }
+
     private fun findRootForTest(view: View): RootForTest? {
         if (view is RootForTest) return view
         if (view is ViewGroup) {

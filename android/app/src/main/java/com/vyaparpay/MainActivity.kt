@@ -82,16 +82,22 @@ import javax.inject.Inject
  *    `ViewRootForTest.Companion.onViewCreatedCallback`, is the correct one.
  *
  * 6. **Lifecycle: `start`/`attachRoot` in `onCreate`, `stop` in `onDestroy`.**
- *    This is a single-activity app, so `onDestroy` only fires on a real
- *    process-level teardown or a configuration change recreating the
- *    activity — either way, a fresh `MainActivity` instance (and, via Hilt,
- *    a freshly injected `uiTreeCollector`/`navigationTracker` pair scoped to
- *    the same app-lifetime singletons) runs `onCreate` again, so there is no
- *    observer leaked across recreation. `UiTreeCollector.start`/`stop` are
- *    reference-counted (see that class's kdoc) precisely because the incoming
- *    `onCreate` runs *before* the outgoing `onDestroy` on a configuration
- *    change — the observer therefore survives the handover rather than being
- *    torn down by the Activity that is leaving.
+ *    This is a single-activity app, so `onDestroy` fires on a real
+ *    process-level teardown, on a configuration change recreating the
+ *    activity, and on the `CLEAR_TOP` relaunch judgment call 7 and
+ *    `MainActivityOverlappingWindowsTest` are about. In every case a fresh
+ *    `MainActivity` instance (and, via Hilt, a freshly injected
+ *    `uiTreeCollector`/`navigationTracker` pair scoped to the same app-lifetime
+ *    singletons) runs `onCreate` again, so there is no observer leaked across
+ *    recreation.
+ *
+ *    `UiTreeCollector.start`/`stop` are reference-counted (see that class's
+ *    kdoc) because of the **relaunch** case, where two instances are briefly
+ *    alive at once. Not because of configuration changes: those are strictly
+ *    destroy-then-create (`[onDestroy, onCreate]`, verified with real lifecycle
+ *    callbacks), so the observer is disposed and re-registered rather than
+ *    handed over. An earlier version of this paragraph claimed the opposite and
+ *    was simply wrong.
  *
  *    **`onDestroy` DOES detach the main window (corrected in Phase-4 T8e).**
  *    This previously did not, on the reasoning that `detachRoot` is for a
@@ -185,6 +191,18 @@ public class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    /**
+     * **Known, bounded gap (Phase-4 T8e review, LOW).** This is posted, so on a
+     * very short-lived Activity it can land after `onDestroy` — attaching a root
+     * whose balancing `detachRoot` has already run, leaving one dead root
+     * behind. It is bounded to a single Activity generation: the next
+     * `UiTreeCollector.stop()` that takes the count to zero clears the tracked
+     * roots wholesale. Left as-is rather than guarded with an `isDestroyed`
+     * check, because the check would race the same post it is meant to fix; the
+     * durable fix is per-host root ownership in `UiTreeCollector`, which is the
+     * same change the overlap gap needs (see
+     * `MainActivityOverlappingWindowsTest`).
+     */
     private fun attachComposeRoot() {
         findRootForTest(window.decorView)?.let(uiTreeCollector::attachRoot)
         // Started here, not in `onCreate`, for the same timing reason the walk

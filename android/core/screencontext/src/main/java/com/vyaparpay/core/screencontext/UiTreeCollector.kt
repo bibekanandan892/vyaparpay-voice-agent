@@ -185,12 +185,19 @@ public class UiTreeCollector(
      * host, balanced by [stop].
      *
      * **Reference-counted, because this is a `@Singleton` shared across
-     * `MainActivity` instances.** Two instances legitimately overlap: Android
-     * runs the incoming `onCreate` before the outgoing `onDestroy` on a
-     * configuration change, and `AndroidCallNotifier.contentIntent()` launches
-     * this activity with `FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_CLEAR_TOP`
-     * against a `standard` launchMode — the merchant tapping the ongoing-call
-     * notification to get back to the app. This used to `check(observerHandle
+     * `MainActivity` instances.** Two instances legitimately overlap when
+     * `AndroidCallNotifier.contentIntent()` launches this activity with
+     * `FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_CLEAR_TOP` against a `standard`
+     * launchMode — the merchant tapping the ongoing-call notification to get
+     * back to the app. Measured in `MainActivityOverlappingWindowsTest`: two
+     * instances alive at once, sharing this collector.
+     *
+     * A *configuration change* is **not** such a case, and an earlier version of
+     * this kdoc wrongly said it was. A config change is strictly
+     * destroy-then-create (`[onDestroy, onCreate]`, verified with real lifecycle
+     * callbacks), so the observer is disposed at 1 -> 0 and re-registered at
+     * 0 -> 1 rather than handed over. The reference counting is still required —
+     * just for the relaunch case, not that one. This used to `check(observerHandle
      * == null)`, which was correct while the collector died with its Activity
      * and became a crash the moment it did not: the incoming `onCreate` threw
      * `IllegalStateException` with nothing to catch it.
