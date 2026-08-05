@@ -1,6 +1,8 @@
-"""Frozen Protocols every Phase-2 agent-loop component implements.
+"""Frozen Protocols every agent-loop component and provider implements —
+the Phase-2 loop (context, prompt, LLM, tools, safety, cost) plus the
+Phase-5 memory subsystem (`EmbeddingProvider`, `SemanticMemoryProto`).
 
-Pinning these signatures up front is what lets Batches 2-4 build in
+Pinning these signatures up front is what lets a phase's batches build in
 parallel against a shared contract instead of each inventing its own
 shape. If a batch's implementation needs to deviate from a signature
 here, that's a contract change — update this file first (and note why),
@@ -8,6 +10,7 @@ don't silently drift in the implementation.
 
 Docs: docs/04-backend-architecture.md §4-5 (providers, repositories),
 docs/05-agent-architecture.md §3 (agent-loop components),
+docs/09-memory-architecture.md §6 (semantic retrieval contract),
 docs/10-tool-calling.md §2, §8 (tool registry/executor pipeline).
 """
 
@@ -22,12 +25,16 @@ from opentelemetry.trace import Span
 from pydantic import BaseModel
 
 from app.domain.types import (
+    RETRIEVAL_FLOOR,
+    RETRIEVAL_TOP_K,
     ContextBundle,
+    Embedding,
     EndReason,
     LLMEvent,
     Message,
     ModelTier,
     PendingConfirm,
+    RetrievedMemory,
     SafetyVerdict,
     Session,
     SessionUser,
@@ -75,6 +82,41 @@ class LLMProvider(Protocol):
         models: list[str],
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[LLMEvent]: ...
+
+
+class EmbeddingProvider(Protocol):
+    """docs/02 §3, docs/04 §4 — the fourth provider protocol, same shape as
+    `LLMProvider` above: one vendor file behind one interface, model id in
+    config, so swapping the embeddings vendor is a bounded change. Batch 2
+    writes `OpenAIEmbeddings` against this; this file has no implementation.
+
+    **Batched by construction.** `embed` takes a list and returns a list —
+    there is no single-text convenience overload, deliberately. The seed
+    embedder pushes ~180 KB chunks through this in one pass, and a
+    one-text-per-call shape would turn that into ~180 sequential HTTP
+    round trips. A caller with one string passes a one-element list.
+
+    **Positional alignment is part of the contract**: `result[i]` is the
+    embedding of `texts[i]`, and `len(result) == len(texts)`. Providers
+    that reorder or drop inputs (e.g. silently skipping an over-long or
+    empty string) would break every caller that zips the result back
+    against its own source rows — which is exactly what the seed embedder
+    and the post-call embed stage both do.
+
+    **Dimension**: every returned vector is `EMBEDDING_DIM` (1536) floats
+    from `EMBEDDING_MODEL` (`text-embedding-3-small`), per docs/09 §6.1.
+    That cannot be expressed in the annotation — `Embedding` is
+    `tuple[float, ...]` — so it is not enforced here. `MemoryChunk`
+    re-checks the width before a vector can be stored, and the
+    `vector(1536)` column rejects it at the DB boundary; a provider
+    returning 3072-dim vectors fails there, not at this call.
+
+    Failure behavior is the caller's, not this protocol's: docs/09 §11
+    says an embedding outage skips the RAG slot entirely (drop-rung 1) —
+    advisory by design, no keyword-search fallback in the demo.
+    """
+
+    async def embed(self, texts: list[str]) -> list[Embedding]: ...
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +228,77 @@ class SafetyLayerProto(Protocol):
     def screen_output(self, text: str, tool_results: list[ToolResult]) -> SafetyVerdict: ...
     def classify_affirmation(self, utterance: str, pending: PendingConfirm | None) -> bool: ...
     def authorize_tool(self, call: ToolCall, principal: SessionUser) -> bool: ...
+
+
+class SemanticMemoryProto(Protocol):
+    """docs/05 §3.7, docs/09 §6 — the Business Knowledge retriever:
+    pgvector cosine top-k over the seeded support KB plus *this merchant's*
+    past-call summaries.
+
+    Signature is docs/05 §3.7's verbatim, with one named return type: the
+    doc writes `-> list[Chunk]` and no `Chunk` exists in the doc set, so
+    `RetrievedMemory` (app/domain/types.py) pins it — see that class's
+    contract note.
+
+    ---
+    **`principal` is required — that is the structural half of the
+    security control, and only the structural half.** The other half is
+    the WHERE clause in the implementation; see the end of this docstring
+    before relying on this one.
+
+    docs/09 §6.2 states the scoping rule as SQL: `kind = 'kb_article' OR
+    user_id = :session_user`. In a fintech product a `call_summary` from
+    another merchant must be unreachable **by construction**, not by every
+    caller remembering to pass a filter — docs/14's threat table treats
+    cross-tenant reach by an authenticated user as a top-row risk, and
+    docs/14 §5 makes the same structural argument for tools ("no tool
+    accepts `user_id`; the executor injects the authenticated principal").
+    This protocol reuses that established pattern rather than inventing a
+    second one: `principal` is the same `SessionUser` `ToolExecutor`
+    injects, it has **no default**, and no parameter on this signature can
+    widen the scope.
+
+    **What would break if it were optional.** Give `principal` a
+    `SessionUser | None = None` default and the predicate has to degrade
+    to something that still returns rows for a `None` scope — in practice
+    `kind = 'kb_article'` only (silently useless retrieval, a quiet
+    quality regression nobody notices) or, the way it actually tends to
+    get written, the `user_id` clause is dropped entirely and every
+    merchant's private call summaries become retrievable by every other
+    merchant. The leak would be invisible in tests written by a caller
+    who passed a principal, and would surface as Asha reciting another
+    shop's payment history. Required-ness means the compiler and the
+    interpreter both reject the omission: mypy errors on the missing
+    argument, and CPython raises `TypeError` at the call. Leaking then
+    requires deliberately passing someone else's principal — a different,
+    much louder bug than forgetting a keyword argument.
+
+    **What this protocol does NOT enforce, stated plainly.** A Protocol
+    constrains the *signature*, not the SQL. An implementation can accept
+    `principal` and never reference it in its WHERE clause, and nothing
+    here would notice. The invariant is only real once Batch 2's
+    `SemanticMemory` puts the scoping predicate in the single function
+    that issues the query (docs/09 §6.2: "it lives in the one function
+    that issues the query") and proves it with a test that seeds two
+    merchants' summaries and asserts one cannot retrieve the other's.
+    This docstring is the contract; that test is the enforcement. Do not
+    read the required parameter as more than it is.
+
+    **Writes are not on this protocol.** Indexing (post-call embed +
+    insert, KB seed) belongs to `SemanticRepo` (docs/04 §5), not here —
+    this is the read side only, so a later batch adding a write path adds
+    it there rather than widening a retrieval interface that the scoping
+    argument above depends on staying narrow.
+    """
+
+    async def retrieve(
+        self,
+        query: str,
+        principal: SessionUser,
+        *,
+        k: int = RETRIEVAL_TOP_K,
+        floor: float = RETRIEVAL_FLOOR,
+    ) -> list[RetrievedMemory]: ...
 
 
 class CostTrackerProto(Protocol):
