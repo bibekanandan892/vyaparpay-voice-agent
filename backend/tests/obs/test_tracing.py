@@ -20,11 +20,15 @@ git history — from an earlier version that only asserted "does not raise"):
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.util._once import Once
 
+import app.obs.tracing as tracing_module
 from app.config import Settings
 from app.obs.tracing import (
     SPAN_CONTEXT_BUILD,
@@ -52,14 +56,60 @@ def _settings(**overrides: object) -> Settings:
 
 
 @pytest.fixture(autouse=True)
-def _reset_tracer_provider() -> None:
+def _reset_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Reset BOTH the cached provider and its `Once()` guard before and
     after every test — see module docstring point 1. Without resetting
     `_TRACER_PROVIDER_SET_ONCE`, `setup_observability` in every test after
-    the first would silently configure nothing."""
+    the first would silently configure nothing.
+
+    **And shut the provider down, which resetting the globals does not
+    do.** `setup_observability` with no OTLP endpoint builds a
+    `ConsoleSpanExporter(out=sys.stderr)` behind a `BatchSpanProcessor`,
+    and a `BatchSpanProcessor` runs a background worker thread. Dropping
+    the global reference orphans that thread rather than stopping it: it
+    stays alive holding the `sys.stderr` pytest had swapped in at the
+    moment of capture, and keeps waking on its schedule for the rest of
+    the session. Once pytest closes that captured stream, every flush
+    raises `ValueError: I/O operation on closed file` from a thread no
+    test owns.
+
+    That was not theoretical. Before this shutdown, running `tests/obs`
+    ahead of `tests/voice/test_peer_session.py` **hung the suite** — the
+    aiortc loopback test never completed, and the full run stalled at
+    ~91% indefinitely rather than failing. Because it is an ordering
+    interaction, `tests/voice` alone passed in 3.5s and the bug stayed
+    invisible until enough tests existed to reach that order by default.
+
+    `TracerProvider.shutdown()` flushes and joins every span processor,
+    so the thread is gone before pytest touches the stream.
+
+    **Every provider the test builds is shut down, not just whichever one
+    reached the global.** Shutting down `otel_trace._TRACER_PROVIDER` is
+    not enough and that was measured, not guessed: a probe at
+    `pytest_sessionfinish` still found two live
+    `OtelBatchSpanRecordProcessor` threads after `tests/obs`, exactly one
+    per `setup_observability(settings)` call that takes the console path.
+    `set_tracer_provider` is set-once, so a second call in a session where
+    the guard is already spent constructs the provider — spawning its
+    worker thread — and is then a silent no-op, leaving the object
+    unreachable from the global while its thread runs on. Recording every
+    construction is the only way to reach those.
+    """
+    created: list[TracerProvider] = []
+    real_provider_cls = tracing_module.TracerProvider
+
+    class _RecordingTracerProvider(real_provider_cls):  # type: ignore[valid-type,misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(tracing_module, "TracerProvider", _RecordingTracerProvider)
+
     otel_trace._TRACER_PROVIDER = None
     otel_trace._TRACER_PROVIDER_SET_ONCE = Once()
     yield
+    for provider in created:
+        provider.shutdown()
     otel_trace._TRACER_PROVIDER = None
     otel_trace._TRACER_PROVIDER_SET_ONCE = Once()
 
