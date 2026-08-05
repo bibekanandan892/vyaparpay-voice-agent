@@ -2,14 +2,23 @@
 call accumulates and persists. `ShortTermMemory` is Layer 1, the
 in-process per-turn scratch space; `SessionMemory` is Layer 2, the
 business-shape wrapper over `RedisClient`'s `session:{id}` hash fields.
-Layers 3-6 (rolling summary, long-term/profile/semantic memory, docs/09
-§4-§6) are Phase 5 scope (docs/17-roadmap.md §1.3) and do not live here
-yet.
+`SemanticMemory` is Layer 6, the pgvector retriever over the seeded support
+KB plus this merchant's own past-call summaries (docs/09 §6.2).
+
+Layers 3-5 (rolling summary, conversation-summary store, user profile,
+docs/09 §4-§5) are still Phase-5 scope and do not live here yet.
 """
 
 from __future__ import annotations
 
+from app.memory.semantic import SemanticMemory, prefetch_query, turn_query
 from app.memory.session_memory import SessionMemory
 from app.memory.short_term import ShortTermMemory
 
-__all__ = ["SessionMemory", "ShortTermMemory"]
+__all__ = [
+    "SemanticMemory",
+    "SessionMemory",
+    "ShortTermMemory",
+    "prefetch_query",
+    "turn_query",
+]
