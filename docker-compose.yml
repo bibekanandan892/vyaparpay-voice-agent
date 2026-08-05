@@ -242,8 +242,14 @@ services:
   # http://tempo:4317 and restart agent-api / voice-worker, or nothing
   # arrives and Tempo looks broken when it is merely idle.
   #
-  # This is NOT the docs/04 §7 observability stack — no Loki, no
-  # trace-to-logs correlation, no provisioned dashboard. Those are Phase 5.
+  # Phase-5 Batch 5 added provisioned dashboards on top of this profile:
+  # a per-turn latency waterfall over Tempo, plus per-call cost and token
+  # budgets. Still NOT the whole docs/04 §7 stack — there is no Loki, so
+  # no trace-to-logs correlation and no log-derived panel; the cost and
+  # per-call token panels read Postgres instead (which is also why grafana
+  # now depends_on it). backend/DASHBOARDS.md is the operator guide, and
+  # is explicit about which panels are unverified for want of a Docker
+  # daemon on the machine that authored them.
   tempo:
     profiles: ["obs"]
     image: grafana/tempo:2.9.4
@@ -278,14 +284,28 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
     volumes:
-      # Datasource provisioning only (Tempo pre-wired). No persistent
-      # volume on purpose — nothing here is worth keeping across a
-      # `compose down`, and provisioning makes the container disposable.
+      # Datasources (Tempo + Postgres) and the dashboard *provider*.
+      # No persistent volume on purpose — nothing here is worth keeping
+      # across a `compose down`, and provisioning makes the container
+      # disposable. That is also precisely why the dashboards are files:
+      # anything built by clicking in the UI dies with the container.
       - ./infra/docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboard JSON itself. Path must match `options.path` in
+      # provisioning/dashboards/dashboards.yaml.
+      - ./infra/docker/grafana/dashboards:/etc/grafana/dashboards:ro
     ports:
       - "127.0.0.1:3000:3000"
+    # Map form throughout — compose rejects a depends_on that mixes the
+    # short list syntax with per-service conditions.
     depends_on:
-      - tempo
+      tempo:
+        condition: service_started
+      # The cost and per-call-token panels query `call_costs` directly
+      # (see provisioning/datasources/postgres.yaml for why that table and
+      # not the spans). Without this, `--profile obs up` on its own starts
+      # a Grafana whose cost board errors on every refresh.
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:

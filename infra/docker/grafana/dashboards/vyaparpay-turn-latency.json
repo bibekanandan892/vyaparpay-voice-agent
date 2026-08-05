@@ -1,0 +1,347 @@
+{
+  "__comment": "PROVISIONED BOARD - edit this file in git, not in the Grafana UI (allowUiUpdates:false). Every panel here is read against a canonical number from docs/06 §4 (stage budgets) or docs/15 §7 (SLOs); a panel drifting off its reference line is the signal. Panels are split into two groups by DEPENDENCY: the 'waterfall' group needs Tempo's metrics-generator local-blocks processor (see infra/docker/tempo/tempo.yaml), the 'raw spans' group works on plain trace search. backend/DASHBOARDS.md explains both, and lists what could not be verified without a Docker daemon.",
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "type": "text",
+      "id": 1,
+      "title": "How to read this board",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Two `turn` spans exist per turn on the voice path, and they are not the same thing.** `VoiceAgentWorker._run_turn` opens the outer one at the endpoint decision (`backend/app/voice/worker.py:339`) and the Phase-2 brain's `ConversationManager.on_stt_final` nests a second one inside it (`backend/app/agent/conversation_manager.py:219`) - the worker's own comment at `worker.py:337` says so explicitly. A bare `{name=\"turn\"}` therefore matches **both**, mixing full-turn duration with brain-only duration. Every panel below disambiguates by attribute presence: the outer span is the only one carrying `turn_ms`/`endpoint_ms`, the inner is the only one carrying `input_tokens`/`cost_usd`.\n\n**The stacked waterfall cannot reach the ~1,900 ms p95 total from docs/06 §4.** THREE of the seven budgeted stages emit no span: VAD endpoint detection (250/400 ms - it is the `endpoint_ms` *attribute* on the outer `turn` span, not a span), chunk-to-TTS-dispatch (10/20 ms, which docs/06 §4.1 marks 'span-adjacent; measured as the gap between first token and first TTS request'), and the Opus-encode/network/jitter-buffer leg (75/140 ms, which `docs/06:188` states is client-side `getStats`, never a Tempo span). The stack is therefore exactly the four spans that DO have budget rows, and should land near **665 ms p50 / 1,340 ms p95** (80+15+450+120 and 150+40+900+250). Those four plus the three above reconcile to docs/06 §4's ~1,000 / ~1,900 totals. The gap is expected, not a regression.\n\n**A tool turn runs these stages more than once, and the stack shows one bar each.** `_run_tool_loop` (`backend/app/agent/conversation_manager.py:306`) loops a fresh LLM round per tool round, so `llm.ttft` and `tool.exec.*` occur repeatedly within one turn - docs/06 §4.3 describes exactly this for the canonical Rajesh Turn 3. A per-span p95 renders a single bar regardless, so on tool turns the stack UNDERSTATES real serial LLM time by roughly a full round. Read the full-turn-duration panel, not the stack, when the question is 'did this turn fit the SLO'.\n\n**Stage-latency attributes from docs/04 §7.2 are mostly not emitted.** `ctx_ms`, `ttft_ms`, `llm_ms`, `slots_filled`, `degraded` appear in that doc's \"frozen\" table but in no code path; `cache_hit` is allowlisted at `backend/app/obs/tracing.py:83` and deliberately never set (`context_builder.py:185`). These panels therefore time stages by **span duration**, which is always recorded, instead of by those attributes."
+      }
+    },
+    {
+      "type": "row",
+      "id": 2,
+      "title": "Latency waterfall - REQUIRES Tempo metrics-generator (local-blocks)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "Turn stage latency p95, stacked (the waterfall)",
+      "description": "Stacks exactly the four spans docs/06 §4.1 gives a budget row to, read against those p95 numbers: stt.final 150 ms, context.build 40 ms, llm.ttft 900 ms, tts.first_byte 250 ms, plus the tool.exec.* 2,000 ms ceiling. `llm.total` is deliberately EXCLUDED. It is not a stage of this budget: docs/06 §4 defines the turn as 'user stops speaking -> agent audio starts', but llm_router.py:395 holds total_span open across the WHOLE generation, which by design continues after audio starts (docs/06 §4.2 sentence-level dispatch; §4.1's TTS row: 'later sentences overlap generation'). Stacking it would both double-count the overlap with tts.first_byte and measure a longer window than the budget it is compared against - and docs/06 §4.1 maps the 450/900 row to `llm.ttft`, not to total. There is no docs/06 budget for total generation time; use the LLM TTFT panel below, and the full-turn panel for the end-to-end SLO. Span names come from the constants in backend/app/obs/tracing.py:60-68 and are enforced against them by backend/tests/obs/test_dashboards.py.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 16, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "axisLabel": "p95 stage duration",
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name =~ \"stt\\.final|context\\.build|llm\\.ttft|tts\\.first_byte\" } | quantile_over_time(span:duration, .95) by (span:name)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name =~ \"tool\\.exec\\..*\" } | quantile_over_time(span:duration, .95) by (span:name)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Full turn duration p50 / p95 vs SLO",
+      "description": "The OUTER `turn` span only - selected by `span.turn_ms != nil`, an attribute emitted at backend/app/voice/worker.py:356 and nowhere else, which is what distinguishes the worker's full-turn span from the brain's nested one. Reference lines are docs/15 §7's answer-latency SLO: p50 ≤ 1.0 s, p95 ≤ 2.0 s (both marked Future/Phase-6 there, so these are targets to watch, not alerts). docs/06 §4 budgets the same total at ~1.0 s / ~1.9 s.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "axisLabel": "turn duration",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"turn\" && span.turn_ms != nil } | quantile_over_time(span:duration, .5)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"turn\" && span.turn_ms != nil } | quantile_over_time(span:duration, .95)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "LLM time-to-first-token p50 / p95",
+      "description": "The `llm.ttft` span (opened at backend/app/agent/llm_router.py:451), which brackets exactly the first-token wait. docs/06 §4 budgets 450 ms p50 / 900 ms p95, and states the p50 assumes a WARM cached prefix - 'a cold prefix roughly doubles this line' (docs/06:183). This is the single largest stage in the budget, so it is the first place to look when the waterfall total drifts. Note there is no `ttft_ms` attribute to read: docs/04 §7.2 lists one, but no code emits it, so the panel times the span itself.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "axisLabel": "TTFT",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.45 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"llm.ttft\" } | quantile_over_time(span:duration, .5) by (span.tier)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name = \"llm.ttft\" } | quantile_over_time(span:duration, .95) by (span.tier)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Tool execution p95 by tool vs the 2 s ceiling",
+      "description": "One series per `tool.exec.<name>` span (opened via tool_span(), backend/app/obs/tracing.py:190, from backend/app/agent/tool_executor.py:352). The red line is the hard 2 s ceiling ToolExecutor enforces with asyncio.wait_for (docs/10). Seeded tools actually run 5-15 ms for reads and ~40 ms for writes, so anything approaching the line is an outlier worth a trace, not normal variance.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "auto",
+            "axisLabel": "tool p95",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{ span:name =~ \"tool\\.exec\\..*\" } | quantile_over_time(span:duration, .95) by (span:name)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 7,
+      "title": "Raw spans - works WITHOUT the metrics generator",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 8,
+      "title": "Recent turns (outer `turn` span)",
+      "description": "Plain TraceQL search - no metrics generator involved, so this is the panel to check first if the waterfall above is empty. If rows appear here but the waterfall is blank, the metrics-generator config is the problem, not the trace pipeline. Columns are the attributes the worker actually emits on the outer span: session_id (worker.py:340), turn_no (:341), endpoint_ms (:342, the VAD stage that has no span of its own), interrupted (:355, barge-in - docs/06 §6.2 budgets ≤250 ms), turn_ms (:356). Click a row to open the full trace waterfall.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 27 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "limit": 100,
+          "tableType": "spans",
+          "query": "{ span:name = \"turn\" && span.turn_ms != nil } | select(span.session_id, span.turn_no, span.endpoint_ms, span.interrupted, span.turn_ms)"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 9,
+      "title": "Recent tool executions",
+      "description": "Plain TraceQL search over `tool.exec.<name>` spans. Columns are exactly what ToolExecutor emits (backend/app/agent/tool_executor.py:384-389): tool name, turn_no, status (the ToolStatus enum value), latency_ms, and idempotency_key for write-tier calls. NOTE: docs/04 §7.2 also lists `tier` on this span - it is NOT emitted here (only llm.ttft/llm.total carry `tier`), so there is deliberately no tier column.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 27 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "limit": 100,
+          "tableType": "spans",
+          "query": "{ span:name =~ \"tool\\.exec\\..*\" } | select(span.tool, span.turn_no, span.status, span.latency_ms, span.idempotency_key)"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 10,
+      "title": "Turns that hit a guard rail",
+      "description": "The five boolean flags ConversationManager sets on the inner `turn` span when a turn goes off the happy path: turn.failed (conversation_manager.py:235, the degraded-apology path), turn.over_budget (:283, the $1 per-call budget guard), turn.tool_loop_bound_hit (:350), turn.output_blocked (:469, output safety screen), and turn.affirmed (:256, whether a write-tier confirmation was given). A row here is a turn worth opening the trace for. Empty is the healthy state - cross-check against the 'Recent turns' panel to tell 'no problems' from 'no traffic'.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 37 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "limit": 100,
+          "tableType": "spans",
+          "query": "{ span:name = \"turn\" && (span.turn.failed = true || span.turn.over_budget = true || span.turn.tool_loop_bound_hit = true || span.turn.output_blocked = true) } | select(span.session_id, span.turn_no, span.turn.failed, span.turn.over_budget, span.turn.tool_loop_bound_hit, span.turn.output_blocked, span.turn.affirmed)"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 11,
+      "title": "Recent STT finalizations and TTS first-byte",
+      "description": "The two provider-side voice stages, as raw spans. `stt.final` carries stt_ms (worker.py:398), text_len (:399, a CHARACTER COUNT of the transcript, never the transcript itself) and is_endpoint (:391, false when the endpoint was forced rather than VAD-detected). `tts.first_byte` carries tts_ttfb_ms (elevenlabs.py:171) and sentence_no (:160). docs/06 §4 budgets 150 ms p95 for STT finalization and 250 ms p95 for TTS TTFB. A `tts.first_byte` span with NO tts_ttfb_ms is an alignment-only stream that produced no audio - a documented clean case (elevenlabs.py), not an error.",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 46 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "limit": 100,
+          "tableType": "spans",
+          "query": "{ span:name = \"stt.final\" } | select(span.stt_ms, span.text_len, span.is_endpoint)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "limit": 100,
+          "tableType": "spans",
+          "query": "{ span:name = \"tts.first_byte\" } | select(span.tts_ttfb_ms, span.sentence_no)"
+        }
+      ]
+    }
+  ],
+  "preload": false,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["vyaparpay", "latency", "tempo"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "VyaparPay - Turn Latency",
+  "uid": "vyaparpay-turn-latency",
+  "version": 1,
+  "weekStart": ""
+}

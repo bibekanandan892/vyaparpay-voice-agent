@@ -1,0 +1,57 @@
+# Postgres datasource — the per-call COST and per-call TOKEN source.
+#
+# Why a second datasource, when the batch brief says "dashboards over Tempo
+# traces": because the per-call cost number Tempo can offer is wrong, and a
+# wrong cost panel is exactly the failure this batch exists to avoid.
+#
+# The `cost_usd` / `input_tokens` / `output_tokens` span attributes are set
+# by CostTracker.record_turn() (backend/app/agent/cost_tracker.py:175-178)
+# onto the `turn` span that ConversationManager threads into it
+# (backend/app/agent/conversation_manager.py:219 -> :413). record_turn() is
+# called once per LLM ROUND, and a turn with a tool call runs several
+# rounds (`_run_tool_loop`'s `while True:`,
+# backend/app/agent/conversation_manager.py:306). Each call re-sets the
+# same attribute key on the same span, and OTel's set_attribute is
+# last-write-wins — so a `turn` span carries only its FINAL round's tokens
+# and cost, never the turn's total. Summing that across spans undercounts
+# every turn that used a tool.
+#
+# `call_costs` has no such problem: CostTracker.finalize() writes
+# `input_tokens=sum(t.input_tokens for t in self._turns)` and the analogous
+# cost sums (backend/app/agent/cost_tracker.py:240-271), i.e. a true
+# per-call total, and the `ck_call_costs_total_usd` CHECK constraint
+# (backend/app/models/orm.py:323-326) guarantees the component columns and
+# `total_usd` agree. That is the table docs/16 §5's ≈$0.30 figure is about.
+#
+# Read-only by intent: `vyapar` is the dev superuser (compose ships one
+# role), so this cannot be enforced at the grant level here. It is enforced
+# by the panels — every SQL target in the provisioned boards is a SELECT.
+
+apiVersion: 1
+
+datasources:
+  - name: Postgres
+    type: grafana-postgresql-datasource
+    uid: vyapar-postgres
+    # `proxy`: Grafana's backend connects, so `postgres` resolves on the
+    # compose network rather than in the operator's browser.
+    access: proxy
+    url: postgres:5432
+    user: vyapar
+    database: vyapar
+    isDefault: false
+    editable: true
+    jsonData:
+      # The compose Postgres has no TLS configured at all; `require` here
+      # would fail every query with a confusing handshake error.
+      sslmode: disable
+      postgresVersion: 1600
+      # No timescaledb in pgvector/pgvector:pg16.
+      timescaledb: false
+    secureJsonData:
+      # The dev password baked into docker-compose.yml. It is not a secret
+      # in any meaningful sense (the same literal is in the compose file
+      # and in backend/.env.example), and this datasource only ever reaches
+      # a loopback-bound Postgres. Do not copy this pattern anywhere the
+      # database is reachable off-host.
+      password: vyapar

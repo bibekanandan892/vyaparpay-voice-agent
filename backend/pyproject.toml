@@ -42,6 +42,15 @@ dev = [
     "respx>=0.21",
     "ruff>=0.7",
     "mypy>=1.13",
+    # tests/obs/test_dashboards.py parses the Grafana/Tempo provisioning
+    # YAML under infra/docker/ to check it against the span contract in
+    # app/obs/tracing.py. Declared explicitly rather than reached via
+    # `pytest.importorskip("yaml")`: an importorskip turns a missing
+    # dependency into a green skip, which is exactly how
+    # tests/e2e/test_voice_pipeline_e2e.py went unrun for a whole phase
+    # (see the audit note at the top of .github/workflows/ci.yml). A
+    # dashboard guard that silently stops running is worse than none.
+    "pyyaml>=6.0",
 ]
 # Phase-3 voice worker only — agent-api and the test suite never import
 # these, so the base install stays lean (`pip install -e ".[dev,voice]"`

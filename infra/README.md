@@ -17,9 +17,16 @@ infra/
     │   ├── turnserver.conf     # coturn config — every directive commented
     │   ├── gen-cert.sh         # dev self-signed cert for the turns: listener
     │   └── certs/              # gen-cert.sh output (*.pem, gitignored)
-    ├── tempo/tempo.yaml        # minimal trace sink (obs profile)
-    └── grafana/provisioning/   # Tempo datasource, pre-wired (obs profile)
+    ├── tempo/tempo.yaml        # trace sink + TraceQL metrics (obs profile)
+    └── grafana/
+        ├── provisioning/       # Tempo + Postgres datasources, dashboard provider
+        └── dashboards/         # the two provisioned boards (JSON, obs profile)
 ```
+
+The dashboards have their own operator guide:
+[backend/DASHBOARDS.md](../backend/DASHBOARDS.md) — what each panel means,
+which canonical number it is read against, and an explicit list of what
+could not be verified without a Docker daemon.
 
 ---
 
@@ -66,8 +73,8 @@ does not touch `backend/`.
 | `coturn` | `coturn/coturn:4.16` | STUN + TURN relay — NAT traversal for the two WebRTC peers (ADR-006) | `3478/udp+tcp`, `5349/tcp+udp`, `49160-49200/udp` |
 | `agent-api` | `./backend` | FastAPI: session mint, business APIs, migrations | `8000` |
 | `voice-worker` | `./backend` (same image) | `/v1/signal` WebSocket, aiortc peer, voice pipeline | `8080` |
-| `tempo` | `grafana/tempo:2.9.4` | OTLP trace sink — `obs` profile only | `127.0.0.1:3200`, `127.0.0.1:4317` |
-| `grafana` | `grafana/grafana:13.1` | Trace viewer — `obs` profile only | `127.0.0.1:3000` |
+| `tempo` | `grafana/tempo:2.9.4` | OTLP trace sink + TraceQL metrics — `obs` profile only | `127.0.0.1:3200`, `127.0.0.1:4317` |
+| `grafana` | `grafana/grafana:13.1` | Trace viewer + provisioned dashboards — `obs` profile only | `127.0.0.1:3000` |
 
 `agent-api` and `voice-worker` are the same image (`vyapar-backend:dev`)
 started two ways — [docs/04 §1](../docs/04-backend-architecture.md). They
@@ -202,5 +209,16 @@ locally before pushing:
 docker compose config -q
 ```
 
-It does **not** validate `turnserver.conf` or `tempo.yaml` — those are only
-exercised by actually starting the containers.
+It does **not** validate `turnserver.conf` — that is only exercised by
+actually starting the container.
+
+`tempo.yaml` and the Grafana provisioning are partially covered:
+`backend/tests/obs/test_dashboards.py` (in the normal `pytest tests` gate)
+parses them and asserts the settings the dashboards depend on — the
+`local-blocks` processor being enabled, `filter_server_spans` being off so
+this project's INTERNAL spans are not silently dropped, block retention
+being at least as wide as the widest dashboard window, and every panel
+datasource resolving to a provisioned one. What it cannot check is whether
+Tempo and Grafana actually *start* with these files and whether a panel
+renders; see the "What is NOT verified" section of
+[backend/DASHBOARDS.md](../backend/DASHBOARDS.md).
