@@ -903,6 +903,123 @@ async def test_end_falls_back_to_the_existing_rolling_summary_when_nothing_new_f
     assert store.saved[0].summary == "already folded earlier in the call"
 
 
+# --------------------------------------------------------------------------
+# `real_summarizer` (summarizer-turn-loop-wiring task) — the tail-turn-gap
+# closure (session_manager.py judgment call #12, updated): end()'s summary
+# stage folds through the REAL per-call Summarizer, not a fresh throwaway,
+# whenever the caller supplies one.
+# --------------------------------------------------------------------------
+
+
+async def test_end_folds_through_the_real_summarizer_when_one_is_supplied(
+    db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """The core proof of the tail-turn-gap closure: when `real_summarizer`
+    is passed to `end()`, `_save_summary` calls `fold_pending` on THAT
+    instance — never on the throwaway `pipeline.summarizer_factory()`
+    double, which must not even be invoked."""
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="in_call"),
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.05")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(n, "user") for n in range(1, 8)]
+
+    real_rolling = RollingSummary(text="folded from the real per-call buffer", thru_turn=7)
+    real_summarizer = _FakeSummarizer(real_rolling)
+
+    factory_calls: list[str] = []
+
+    def _unreachable_factory() -> Summarizer:
+        factory_calls.append("called")
+        raise AssertionError("the throwaway factory must not be reached")
+
+    store = _RecordingSummaryStore()
+    pipeline = SummaryPipelineDeps(
+        summarizer_factory=_unreachable_factory,
+        conversation_summary_store=cast("ConversationSummaryStore", store),
+    )
+    manager = SessionManager(fake_sessionmaker(db_session), redis_client, summary_pipeline=pipeline)
+
+    await manager.end(
+        "sess_1", EndReason.HANGUP, real_summarizer=cast("Summarizer", real_summarizer)
+    )
+
+    assert factory_calls == []
+    assert real_summarizer.calls == [("sess_1", 7)]  # thru_turn = len(turn_records)
+    assert len(store.saved) == 1
+    assert store.saved[0].summary == "folded from the real per-call buffer"
+
+
+async def test_end_still_falls_back_when_the_real_summarizer_has_nothing_new_to_fold(
+    db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """A real per-call Summarizer whose buffer is already fully covered
+    by an earlier rolling fold (turn_count lands exactly on a fold
+    boundary) legitimately returns `None` from `fold_pending` — the
+    existing `SessionMemory.get_summary()` fallback must still run, the
+    same as the no-real-summarizer case."""
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="in_call"),
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.02")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+    existing = RollingSummary(text="last rolling fold's own text", thru_turn=9)
+    redis_client.get_summary.return_value = existing
+
+    real_summarizer = _FakeSummarizer(None)  # nothing left to fold
+
+    def _unreachable_factory() -> Summarizer:
+        raise AssertionError(
+            "real_summarizer is not None, so the throwaway factory must never run"
+        )
+
+    store = _RecordingSummaryStore()
+    pipeline = SummaryPipelineDeps(
+        summarizer_factory=_unreachable_factory,
+        conversation_summary_store=cast("ConversationSummaryStore", store),
+    )
+    manager = SessionManager(fake_sessionmaker(db_session), redis_client, summary_pipeline=pipeline)
+
+    await manager.end(
+        "sess_1", EndReason.HANGUP, real_summarizer=cast("Summarizer", real_summarizer)
+    )
+
+    assert len(store.saved) == 1
+    assert store.saved[0].summary == "last rolling fold's own text"
+
+
+async def test_end_without_real_summarizer_uses_the_throwaway_factory_as_before(
+    db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """`real_summarizer` defaults to `None` — every pre-existing caller
+    (and every test above this section) reproduces judgment call #12's
+    original fallback chain exactly, unchanged."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(
+        conversation=conversation,
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.1234")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user"), _turn_record(2, "agent")]
+    _configure_invocations(db_session, [])
+
+    rolling = RollingSummary(text="from the throwaway factory", thru_turn=2)
+    summarizer = _FakeSummarizer(rolling)
+    store = _RecordingSummaryStore()
+    manager = SessionManager(
+        fake_sessionmaker(db_session),
+        redis_client,
+        summary_pipeline=_pipeline_deps(summarizer, store),
+    )
+
+    await manager.end("sess_1", EndReason.HANGUP)  # no real_summarizer= at all
+
+    assert summarizer.calls == [("sess_1", 2)]
+    assert store.saved[0].summary == "from the throwaway factory"
+
+
 async def test_end_without_a_summary_pipeline_configured_still_ends_and_logs_the_skip(
     manager: SessionManager, db_session: AsyncMock, redis_client: AsyncMock
 ) -> None:
