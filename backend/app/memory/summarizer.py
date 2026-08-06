@@ -624,6 +624,15 @@ class Summarizer:
                 # `record_turn` (CostTracker's own accumulation, and thus
                 # the `call_costs` row) already happened inside `_consume`;
                 # this is only the Redis budget-guard counter.
+                #
+                # LLM cost only, deliberately: the media half of that
+                # counter is drained by `ConversationManager` via
+                # `take_unpublished_media_cost()` (CostTracker judgment
+                # call #9). Draining it here too would be correct — the
+                # watermark makes double-counting impossible — but a fold
+                # is off the turn path and can land between turns, so it
+                # would publish media spend at an arbitrary point for no
+                # benefit the next turn's drain does not already give.
                 if self._pending_cost_usd:
                     await self._session_memory.add_cost(session_id, self._pending_cost_usd)
                     self._pending_cost_usd = _ZERO_USD

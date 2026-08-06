@@ -51,16 +51,31 @@ Work down this list — it is ordered by how often each one is the cause.
 1. **`OTEL_EXPORTER_OTLP_ENDPOINT` is still empty in `backend/.env`.** No
    spans are being exported at all; Tempo is idle, not broken. Restart
    `agent-api` and `voice-worker` after setting it.
-2. **No call has completed.** Check "Calls finalized (window)" on the cost
+2. **The call was a voice call, and nothing finalized it.** The cost
+   board reads `call_costs`, and that table is written only by
+   `CostTracker.finalize()`. Grep for callers: `scripts/demo_cli.py` is
+   the only one. `DELETE /v1/sessions/{id}` publishes `"end"` on
+   `session_control:{id}` for the worker to run finalize-then-end
+   (`app/api/routes/sessions.py` judgment call 1), but no subscriber to
+   that channel exists in `app/voice/`, and `CallSession.close()` does
+   not finalize either. So a voice call currently produces spans and
+   **nothing else durable**: no cost row, and no `session:{id}:turns`
+   records either — `RedisClient.append_turn` has exactly one caller,
+   inside `finalize()` itself, so the per-turn ledger dies with the
+   process too. (`ConversationManager` writes the 8-turn `transcript`
+   field on the `session:{id}` hash; that is a different key and a
+   rolling window, not the ledger.) Wiring the worker's post-call
+   pipeline is a separate task from pricing the components.
+3. **No call has completed.** Check "Calls finalized (window)" on the cost
    board and "Recent turns" on the latency board. Those two panels exist
    specifically to tell *no traffic* apart from *no data*.
-3. **The metrics generator is not recording.** If the raw-span tables have
+4. **The metrics generator is not recording.** If the raw-span tables have
    rows but the graphs are empty, the problem is
    [`infra/docker/tempo/tempo.yaml`](../infra/docker/tempo/tempo.yaml), not
    the trace pipeline. Its two traps are documented in that file and
    asserted by tests; the quickest manual check is to run
    `{span:name="turn"} | count_over_time()` in Grafana's Explore view.
-4. **The time range is wider than Tempo's retention** (24 h) or than the
+5. **The time range is wider than Tempo's retention** (24 h) or than the
    metrics query limit (`query_frontend.metrics.max_duration`, also 24 h).
 
 ---
@@ -143,7 +158,7 @@ header drifts from the arithmetic.
 
 The same multi-round fact that pushed cost to Postgres applies to latency,
 and is easier to miss. `_run_tool_loop`'s `while True:`
-(`conversation_manager.py:306`) opens a fresh LLM round per tool round, so
+(`conversation_manager.py:322`) opens a fresh LLM round per tool round, so
 **`llm.ttft` and `tool.exec.*` occur several times within a single turn** —
 docs/06 §4.3 walks through exactly this for the canonical Rajesh Turn 3
 (two parallel read tools, then "a short LLM continuation to reason over the
@@ -181,49 +196,78 @@ brain-only duration. Every panel disambiguates by attribute presence:
 The `turn` span *does* carry `cost_usd`. Summing it would still be wrong.
 
 `CostTracker.record_turn()` is called **once per LLM round**
-(`conversation_manager.py:413`, inside `_run_tool_loop`'s `while True:` at
-`conversation_manager.py:306`), and each call re-sets the same attribute key
+(`conversation_manager.py:429`, inside `_run_tool_loop`'s `while True:` at
+`conversation_manager.py:322`), and each call re-sets the same attribute key
 on the same `turn` span. OTel's `set_attribute` is last-write-wins, so a
 `turn` span carries **only its final round's** tokens and cost. Any turn
 that used a tool undercounts.
 
 `call_costs` has no such problem: `CostTracker.finalize()` writes
 `input_tokens=sum(t.input_tokens for t in self._turns)` and the analogous
-cost sums (`cost_tracker.py:240-271`), and the `ck_call_costs_total_usd`
+cost sums (`cost_tracker.py:440-468`), and the `ck_call_costs_total_usd`
 CHECK constraint (`app/models/orm.py:323-326`) forces the component columns to
 agree with `total_usd`. That is the table docs/16 §5's ≈$0.30 figure is
 about.
 
-### ⚠ The cost panels cannot hit $0.30 today
+### How to read a component that shows $0
 
-`CostTracker.finalize()` hardcodes **five of the six cost components to
-zero** (`cost_tracker.py:261-271`, "Judgment call #6: Phase 2 is
-text-only"):
+Five of the six columns are priced from config unit prices
+(`app/config.py`: Deepgram per audio-minute, ElevenLabs per character,
+embeddings and LLM per million tokens) against usage the producing stage
+reports; `turn_infra_usd` is written as a literal $0, because coturn is
+self-hosted and docs/16 §5 budgets its marginal per-call cost at zero.
 
-| Component | docs/16 §5 budget (cached) | Written today |
+A priced stage that never reports contributes $0 — which is **correct for
+a call that never ran that stage** and a **defect for one that did**, and
+the row alone cannot tell those apart. `finalize()`'s
+`cost_tracker.finalized` log line carries `recorded_stages` /
+`unrecorded_stages` for exactly that question; check it before concluding
+a $0 column is broken.
+
+Which stages report today:
+
+| Component | docs/16 §5 budget (cached) | Reported by |
 |---|---|---|
-| STT — Deepgram | $0.04 | **0** |
-| LLM dialogue | $0.09 | real |
-| LLM utility | $0.01 | real |
-| Embeddings | <$0.001 | **0** |
-| TTS — ElevenLabs | $0.15 | **0** |
-| Turn infra | $0.00 | not passed (column default 0) |
-| **Total** | **≈$0.30** | **≈$0.10** |
+| STT — Deepgram | $0.04 | `SttSupervisor` → worker → brain (voice calls only) |
+| LLM dialogue | $0.09 | `CostTracker.record_turn` |
+| LLM utility | $0.01 | `CostTracker.record_turn` |
+| Embeddings | <$0.001 | nothing yet — see below |
+| TTS — ElevenLabs | $0.15 | `SpeechDispatcher` → worker → brain (voice calls only) |
+| Turn infra | $0.00 | passed as $0 (self-hosted coturn, docs/16 §5) |
 
-So a reading of ~$0.10 is a **missing-component signal, not an
-under-budget win** — and TTS, the single largest line item at ~50% of a
-real call, is one of the zeros. The "Cost components per call (stacked)"
-panel exists to make that visible rather than letting the total quietly
-mislead.
+Three things an operator should know before reading these panels:
 
-**This blocks part of the docs/17 §2.5 exit criterion.** That criterion asks
-for a dashboard "matching the ≈$0.30 (~₹25) canonical figure". The board can
-*draw* the $0.30 and $0.35 lines and does; the data cannot reach them until
-whichever batch owns STT/TTS/embeddings cost attribution fills those
-columns in. That is application work, not dashboard work, and it **is
-tracked as its own task** — it is owned, not merely noted here. This section
-stays so an operator reading a $0.10 total knows why, not as the defect's
-only record.
+1. **Embeddings will read $0 on every call.** `OpenAIEmbeddings` is not
+   constructed in any composition root, so the stage does not run at all;
+   it appears in `unrecorded_stages` on every finalize. docs/16 §5 budgets
+   it at <$0.001, so this moves the total by less than a rounding step.
+2. **A text-only call legitimately has no STT or TTS.** `scripts/demo_cli.py`
+   is text-only, so its rows show $0 for both and its total is LLM-only.
+   Voice calls are the ones the ≈$0.30 line is drawn for.
+3. **And no voice call writes a row yet at all** — nothing in the worker
+   calls `finalize()`, per ["If a panel is empty"](#if-a-panel-is-empty)
+   item 2. So the STT and TTS rows in the table above describe metering
+   that runs and feeds `call_total()`'s live budget guard, but that has no
+   row to land in until the worker's post-call pipeline is wired. Until
+   then every row on this board comes from `scripts/demo_cli.py`, whose
+   total is LLM-only by construction.
+
+Neither the ≈$0.30 nor the ≈$0.35 reference line has been checked against
+a rendered panel fed by a real call — see [What is NOT verified](#what-is-not-verified).
+What *is* checked is the arithmetic behind it:
+`tests/agent/test_cost_tracker.py` replays docs/16 §5's canonical
+5-minute call through `CostTracker` and asserts every component, the
+total, and that TTS is the largest line item.
+
+**Expect the canonical call to price at $0.2809, not $0.30.** That test
+records the exact figure. Two reasons, both in the test's own docstrings:
+docs/16 §5's per-component column is rounded to cents and sums to $0.29
+before it is quoted as "≈$0.30"; and `record_turn` prices cached input at
+a single rate, while docs/16 §5's assumptions price cache *writes* at
+1.25×, a $0.0048 premium on the canonical call's one prefix write.
+Charging that premium needs `cache_creation_input_tokens` plumbed as its
+own usage field. So a real 5-minute call landing near $0.28 is on budget;
+one landing near $0.10 is a missing media component.
 
 ### Panels
 
@@ -267,22 +311,22 @@ are the ones the dashboards actually use:
 | `turn` (outer) | `turn_no` | `app/voice/worker.py:341` |
 | `turn` (outer) | `endpoint_ms` | `app/voice/worker.py:342` |
 | `turn` (outer) | `interrupted` | `app/voice/worker.py:355` |
-| `turn` (outer) | `turn_ms` | `app/voice/worker.py:356` |
-| `turn` (inner) | `session_id` | `app/agent/conversation_manager.py:220` |
-| `turn` (inner) | `turn_no` | `app/agent/conversation_manager.py:221` |
-| `turn` (inner) | `turn.failed` | `app/agent/conversation_manager.py:235` |
-| `turn` (inner) | `turn.affirmed` | `app/agent/conversation_manager.py:256` |
-| `turn` (inner) | `turn.over_budget` | `app/agent/conversation_manager.py:283` |
-| `turn` (inner) | `turn.tool_loop_bound_hit` | `app/agent/conversation_manager.py:350` |
-| `turn` (inner) | `turn.output_blocked` | `app/agent/conversation_manager.py:469` |
-| `turn` (inner) | `input_tokens` | `app/agent/cost_tracker.py:175` |
-| `turn` (inner) | `output_tokens` | `app/agent/cost_tracker.py:176` |
-| `turn` (inner) | `cost_usd` | `app/agent/cost_tracker.py:177` |
-| `turn` (inner) | `model` | `app/agent/cost_tracker.py:178` |
-| `turn` (inner) | `cost_estimated` | `app/agent/cost_tracker.py:181` |
-| `stt.final` | `is_endpoint` | `app/voice/worker.py:391` |
-| `stt.final` | `stt_ms` | `app/voice/worker.py:398` |
-| `stt.final` | `text_len` | `app/voice/worker.py:399` |
+| `turn` (outer) | `turn_ms` | `app/voice/worker.py:387` |
+| `turn` (inner) | `session_id` | `app/agent/conversation_manager.py:236` |
+| `turn` (inner) | `turn_no` | `app/agent/conversation_manager.py:237` |
+| `turn` (inner) | `turn.failed` | `app/agent/conversation_manager.py:251` |
+| `turn` (inner) | `turn.affirmed` | `app/agent/conversation_manager.py:272` |
+| `turn` (inner) | `turn.over_budget` | `app/agent/conversation_manager.py:299` |
+| `turn` (inner) | `turn.tool_loop_bound_hit` | `app/agent/conversation_manager.py:366` |
+| `turn` (inner) | `turn.output_blocked` | `app/agent/conversation_manager.py:493` |
+| `turn` (inner) | `input_tokens` | `app/agent/cost_tracker.py:249` |
+| `turn` (inner) | `output_tokens` | `app/agent/cost_tracker.py:250` |
+| `turn` (inner) | `cost_usd` | `app/agent/cost_tracker.py:251` |
+| `turn` (inner) | `model` | `app/agent/cost_tracker.py:252` |
+| `turn` (inner) | `cost_estimated` | `app/agent/cost_tracker.py:255` |
+| `stt.final` | `is_endpoint` | `app/voice/worker.py:422` |
+| `stt.final` | `stt_ms` | `app/voice/worker.py:429` |
+| `stt.final` | `text_len` | `app/voice/worker.py:430` |
 | `llm.ttft` | `tier` | `app/agent/llm_router.py:454` |
 | `tool.exec.<name>` | `tool` | `app/agent/tool_executor.py:384` |
 | `tool.exec.<name>` | `turn_no` | `app/agent/tool_executor.py:385` |
@@ -305,7 +349,7 @@ attributed to the wrong span. The dashboards query none of the phantoms.
 |---|---|
 | `context.build` carries `ctx_ms`, `slots_filled`, `degraded` | none emitted; the span carries only `session_id` (`context_builder.py:203`) |
 | `llm.ttft` carries `ttft_ms`, `cache_hit` | neither emitted. `cache_hit` is on the allowlist (`tracing.py:83`) but `context_builder.py:185` explains it is deliberately never set |
-| `llm.total` carries `llm_ms`, `input_tokens`, `output_tokens`, `cost_usd` | `llm_ms` never emitted; the token/cost trio lands on the **`turn`** span, because `conversation_manager.py:413` passes the turn span into `record_turn()` |
+| `llm.total` carries `llm_ms`, `input_tokens`, `output_tokens`, `cost_usd` | `llm_ms` never emitted; the token/cost trio lands on the **`turn`** span, because `conversation_manager.py:429` passes the turn span into `record_turn()` |
 | `tool.exec.<name>` carries `tier` | not emitted there; only `llm.ttft`/`llm.total` carry `tier` |
 
 **The same drift appears a second time**, at `docs/06-voice-pipeline.md:183`

@@ -263,12 +263,17 @@ class FakeTts:
 class FakeBrain:
     """Scriptable `app.voice.worker.Brain` double — one reply per
     expected `on_stt_final()` call, FIFO, same run-dry discipline as
-    `FakeLLM`/`FakeVad`. Utterances received are recorded on `.calls`."""
+    `FakeLLM`/`FakeVad`. Utterances received are recorded on `.calls`;
+    billable media usage forwarded by the worker accumulates on
+    `.stt_seconds` / `.tts_chars` (the real brain forwards these to its
+    per-call `CostTracker`)."""
 
     def __init__(self) -> None:
         self._replies: list[str] = []
         self.calls: list[str] = []
         self._hold: asyncio.Event | None = None
+        self.stt_seconds = 0.0
+        self.tts_chars = 0
 
     def script(self, *replies: str) -> None:
         self._replies.extend(replies)
@@ -292,6 +297,12 @@ class FakeBrain:
             hold, self._hold = self._hold, None
             await hold.wait()
         return self._replies.pop(0)
+
+    def record_stt_audio(self, seconds: float) -> None:
+        self.stt_seconds += seconds
+
+    def record_tts_text(self, characters: int) -> None:
+        self.tts_chars += characters
 
 
 class FakeEmbeddings:

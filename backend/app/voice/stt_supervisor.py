@@ -29,6 +29,11 @@ Judgment calls, flagged per house style:
 4. **The queue re-arms its end sentinel** so a stream attempt that opens
    after the ingress already closed still terminates cleanly instead of
    hanging on an empty queue.
+5. **Billable STT audio is metered in `_queued_audio`**, the generator
+   the provider actually iterates, and reported through
+   `on_audio_seconds` — the worker forwards it to the call's cost ledger
+   (docs/16 §5 prices Deepgram per audio-minute). Metering in the pump
+   instead would count audio that was queued but never sent.
 
 Docs: docs/06 §9 (STT row). Tests: tests/voice/test_worker.py drives
 this through VoiceAgentWorker with a scripted FakeStt.
@@ -44,12 +49,14 @@ from typing import cast
 
 from app.domain.voice import SttEvent, SttProvider
 from app.obs.logging import get_logger
-from app.voice.audio_ingress import STT_SAMPLE_RATE, AudioIngress
+from app.voice.audio_ingress import BYTES_PER_SAMPLE, STT_SAMPLE_RATE, AudioIngress
 
 log = get_logger(__name__)
 
 # Judgment call 2: consecutive zero-event deaths before giving up.
 _MAX_DEATHS_WITHOUT_EVENTS = 2
+# Judgment call 5: the STT socket is fed 16 kHz mono s16 (audio_ingress).
+_STT_BYTES_PER_SECOND = STT_SAMPLE_RATE * BYTES_PER_SAMPLE
 
 
 class SttSupervisor:
@@ -65,12 +72,14 @@ class SttSupervisor:
         ingress: AudioIngress,
         on_event: Callable[[SttEvent], None],
         on_stream_died: Callable[[], None],
+        on_audio_seconds: Callable[[float], None],
     ) -> None:
         self._session_id = session_id
         self._stt = stt
         self._ingress = ingress
         self._on_event = on_event
         self._on_stream_died = on_stream_died
+        self._on_audio_seconds = on_audio_seconds
         self._audio_q: asyncio.Queue[bytes | None] = asyncio.Queue()
 
     async def run(self) -> None:
@@ -124,6 +133,14 @@ class SttSupervisor:
             if chunk is None:
                 self._audio_q.put_nowait(None)  # judgment call 4: re-arm
                 return
+            # Judgment call 5: metered HERE, not in the pump, because this
+            # is the generator the provider iterates — every chunk counted
+            # is a chunk handed to Deepgram. A chunk still sitting in the
+            # queue at hang-up is never counted, and the queue is consumed
+            # (not replayed) across reconnects, so no chunk is counted
+            # twice. What the provider does with it after that — vendor-
+            # side idle/keepalive metering — is not observable here.
+            self._on_audio_seconds(len(chunk) / _STT_BYTES_PER_SECOND)
             yield chunk
 
     async def _open_stream(self) -> AsyncGenerator[SttEvent, None]:

@@ -142,9 +142,18 @@ Role = Literal["user", "agent"]
 
 class Brain(Protocol):
     """The brain seam this worker drives — `ConversationManager`
-    satisfies it as-is (docs/05 §1.1's transport-blind boundary)."""
+    satisfies it as-is (docs/05 §1.1's transport-blind boundary).
+
+    The two `record_*` methods carry billable media usage to the brain,
+    which holds this call's `CostTracker` (app/voice/run.py builds one per
+    call and hands it to `ConversationManager`): STT is priced per
+    audio-minute and TTS per character (docs/16 §5), and neither quantity
+    is visible from inside the brain. They pass usage counts only — no
+    transport detail — so the boundary above still holds."""
 
     async def on_stt_final(self, text: str) -> str: ...
+    def record_stt_audio(self, seconds: float) -> None: ...
+    def record_tts_text(self, characters: int) -> None: ...
 
 
 class SttStreamDied(RuntimeError):
@@ -204,6 +213,7 @@ class VoiceAgentWorker:
             ingress=ingress,
             on_event=self._on_stt_event,
             on_stream_died=self._fail_final_waiter,
+            on_audio_seconds=self._record_stt_audio,
         )
         self._speech = SpeechDispatcher(
             session_id,
@@ -215,6 +225,7 @@ class VoiceAgentWorker:
             on_agent_final=lambda turn_no, text: self._send_transcript_final(
                 turn_no, "agent", text
             ),
+            on_tts_chars=self._record_tts_text,
         )
         self._brain: Brain | None = None
         self._tg: asyncio.TaskGroup | None = None
@@ -247,6 +258,26 @@ class VoiceAgentWorker:
         finally:
             self._tg = None
             log.info("worker.stopped", session_id=self._session_id, turns=self._turn_no)
+
+    # ------------------------------------------------------------------
+    # Billable media usage -> the brain's per-call cost ledger
+    # ------------------------------------------------------------------
+
+    def _require_brain(self) -> Brain:
+        """`run()` sets `_brain` before creating any task, and every
+        caller below runs inside one of those tasks — so a None here is a
+        wiring bug, not a race, and must not be swallowed into a silently
+        free call."""
+        brain = self._brain
+        if brain is None:  # pragma: no cover - unreachable via run()
+            raise RuntimeError("worker used the brain before it was built")
+        return brain
+
+    def _record_stt_audio(self, seconds: float) -> None:
+        self._require_brain().record_stt_audio(seconds)
+
+    def _record_tts_text(self, characters: int) -> None:
+        self._require_brain().record_tts_text(characters)
 
     # ------------------------------------------------------------------
     # VAD loop — endpointing + barge-in (docs/06 §5/§6)
