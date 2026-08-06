@@ -73,7 +73,7 @@ from app.agent.cost_tracker import CostTracker
 from app.agent.llm_router import LLMRouter
 from app.agent.prompt_builder import PromptBuilder
 from app.agent.safety_layer import SafetyLayer
-from app.agent.session_manager import SessionManager
+from app.agent.session_manager import SessionManager, SummaryPipelineDeps
 from app.agent.tool_executor import ToolExecutor
 from app.config import Settings, get_settings
 from app.context.context_compressor import ContextCompressor
@@ -83,7 +83,9 @@ from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import SESSION_CONTROL_END, RedisClient
 from app.domain.types import EndReason
 from app.domain.voice import IceServer
+from app.memory.conversation_summary_store import ConversationSummaryStore
 from app.memory.session_memory import SessionMemory
+from app.memory.summarizer import Summarizer
 from app.obs.logging import configure_logging, get_logger
 from app.obs.tracing import setup_observability
 from app.providers.deepgram import DeepgramStt
@@ -155,6 +157,57 @@ class _BrainStack:
     llm_router: LLMRouter
 
 
+def _build_summary_pipeline(
+    settings: Settings,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    redis: RedisClient,
+    session_memory: SessionMemory,
+    llm_router: LLMRouter,
+    embeddings: OpenAIEmbeddings | None,
+) -> SummaryPipelineDeps:
+    """post-call-summary-profile-wiring task: `SessionManager.end()`'s
+    summary/embed stage (that class's judgment call #10) needs an
+    `LLMRouter` (to fold the final summary) and a `ConversationSummaryStore`
+    (to save + embed it) — collaborators no earlier task built a
+    `SessionManager` with, since nothing called `end()`'s new stage before
+    this task wired it.
+
+    `summarizer_factory` builds a FRESH `Summarizer` per call
+    (`SessionManager`'s own judgment call #12: nothing keeps the real
+    per-call instance addressable, because nothing constructs one on the
+    turn path yet either — a separate, unbuilt task). Its `cost_tracker`
+    is a throwaway `CostTracker`, never `finalize()`d: the real per-call
+    tracker already finalized and committed `call_costs` before `end()`
+    runs, and a fold that only fires once the buffer-population wiring
+    lands would need its own accounting story then, not invented here on
+    spec for a path that cannot execute yet (judgment call #12).
+
+    `conversation_summary_store` embeds through the SAME `embeddings`
+    instance `ContextBuilder`'s retrieval prefetch already uses above —
+    `None` when `OPENAI_API_KEY` is unset, which
+    `ConversationSummaryStore.__init__` accepts as "no embed, ever" (that
+    class's judgment call #3), the identical drop-rung-1 posture the
+    prefetch already has.
+    """
+    conversation_summary_store = ConversationSummaryStore(
+        sessionmaker, embeddings=embeddings, settings=settings if embeddings else None
+    )
+
+    def summarizer_factory() -> Summarizer:
+        return Summarizer(
+            # Same documented Protocol wart as llm_router's own
+            # construction below — LLMRouterProto vs. the real class.
+            llm_router,  # type: ignore[arg-type]
+            session_memory,
+            cost_tracker=CostTracker(settings, session_factory=sessionmaker, redis=redis),
+        )
+
+    return SummaryPipelineDeps(
+        summarizer_factory=summarizer_factory,
+        conversation_summary_store=conversation_summary_store,
+    )
+
+
 def _build_brain_stack(
     settings: Settings,
     http: httpx.AsyncClient,
@@ -165,7 +218,6 @@ def _build_brain_stack(
     singleton stack, wired for the voice worker process."""
     llm_provider = OpenRouterLLM(http, settings)
     configure_tools(sessionmaker)
-    session_manager = SessionManager(sessionmaker, redis)
     session_memory = SessionMemory(redis)
     # Phase-4 T3: ContextBuilder's slot-4/5 deps — EventLog wraps the same
     # `redis` singleton, ContextCompressor is stateless (its own docstring:
@@ -198,6 +250,10 @@ def _build_brain_stack(
     # The documented interfaces.py Protocol wart (async-generator vs
     # coroutine spelling) — same ignore as demo_cli's construction.
     llm_router = LLMRouter(llm_provider, settings)  # type: ignore[arg-type]
+    summary_pipeline = _build_summary_pipeline(
+        settings, sessionmaker, redis, session_memory, llm_router, embeddings
+    )
+    session_manager = SessionManager(sessionmaker, redis, summary_pipeline=summary_pipeline)
     return _BrainStack(
         session_manager=session_manager,
         session_memory=session_memory,

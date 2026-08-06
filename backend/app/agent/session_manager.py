@@ -104,15 +104,121 @@ rather than silently guessed at:
    transaction as the drain, after the duplicate-end no-op check (#7) so
    a second `end()` on an already-ended session still short-circuits
    before this new check ever runs.
+10. **`end()`'s post-call MEMORY pipeline (docs/09 §8: final summary +
+    resolution/intents, its embed, the profile merge) is wired here too,
+    after the primary transaction above — post-call-summary-profile-
+    wiring task.** `Summarizer.fold_pending()` and
+    `UserProfileMemory.merge_post_call()` were both fully built and
+    tested in earlier Phase-5 batches with zero callers (grepped, `app/`
+    tree-wide, confirmed) — this is the wiring. The new collaborators
+    (`SummaryPipelineDeps`, below) are optional and keyword-only,
+    defaulting to `None`: `app/api/routes/sessions.py`'s
+    `get_session_manager()` builds a `SessionManager` only to call
+    `.create()` (that route's own judgment call #1 explains why it can
+    never legitimately call `.end()` — the finalize-before-end
+    invariant needs the voice-worker's per-call `CostTracker`) — forcing
+    that call site to thread through an `LLMRouter`/`Settings`/
+    `ConversationSummaryStore` it will never exercise would be
+    unjustified complexity for a dependency this pipeline never reaches
+    from there. `UserProfileMemory` needs no such bundle: it wraps
+    `UserProfileRepo(db)`, built inline inside its own short transaction
+    exactly the way `ConversationRepo`/`CostRepo` already are above —
+    only the *summary* stage (final fold, embed) has real external
+    collaborators (an LLM router, an embeddings provider) to inject.
+11. **Resolution/intents classification is deterministic, not a second
+    LLM call — a real design decision, argued, not defaulted into.**
+    docs/09 §8's mermaid diagram pairs "Summarizer (Haiku): final
+    summary + resolution" as one labeled stage, which reads as
+    resolution riding the same Haiku call that produces the summary
+    text. Two things outweighed following that reading literally: (a)
+    `Summarizer` is an already-shipped, already-tested, in-production
+    component for the *in-call rolling* summary — changing its prompt
+    schema to also emit structured resolution/intents for a *post-call-
+    only* concern risks regressing a reviewed path for a use it was not
+    designed to serve, and (b) checking first (per this task's own
+    instruction) turned up grounded, tool-confirmed signals that need no
+    inference at all: `EndReason.ESCALATED` is an exact, structural
+    mirror of `Resolution.ESCALATED` (the caller already decided this);
+    `SessionMemory`'s `pending_confirm` field (docs/10 §4's gate state)
+    is a real, load-bearing signal for "abandoned" the task's own brief
+    pointed at; and `ToolAuditRepo.list_for_session()`'s `status` column
+    settles "did anything tool-confirmed complete" without guessing.
+    `_classify_resolution`/`_classify_intents` (module-level, pure,
+    tested without a model — the same shape `summarizer.py`'s own
+    `should_fold`/`summary_thru_turn` take) are the result. `intents` is
+    likewise derived from which tools were invoked (`_TOOL_INTENTS`)
+    rather than freeform-classified, in the spirit of
+    `app/memory/user_profile.py`'s own house rule against LLM inference
+    where a tool-confirmed or structural fact already answers the
+    question.
+12. **A fresh per-call `Summarizer`'s buffer is empty today, and that is
+    not a rare edge case — it is the only reachable one.** Grepped the
+    whole `app/` tree: nothing constructs a `Summarizer` in production
+    code, and `ConversationManager`'s turn loop never calls
+    `observe_turn()`/`kick()` — the in-call rolling-fold wiring this
+    class's `Summarizer.fold_pending()` seam assumes upstream is a
+    separate, unbuilt task, out of this one's scope (this task's brief
+    is explicit that the new logic belongs inside `end()`, not
+    `ConversationManager`). Consequently `fold_pending(thru_turn=N)` on
+    the fresh `Summarizer` `SummaryPipelineDeps.summarizer_factory`
+    produces will return `None` for every call until that separate
+    wiring lands — `_save_summary` falls back to whatever
+    `SessionMemory.get_summary()` already holds (the last in-call fold,
+    if one ever ran) and, failing that too, skips the summary/embed
+    stage with a distinctly greppable log rather than fabricating text.
+    Stated plainly because it bears on the milestone this task serves
+    (docs/17 §2.5's "returning-caller proof"): until the rolling-fold
+    wiring lands separately, no call in this codebase produces a real
+    summary through this path, so nothing is ever embedded, and the
+    milestone cannot be demonstrated end-to-end from this task alone.
+13. **Profile `extraction` is deferred, deliberately, not silently
+    dropped.** `UserProfileMemory.merge_post_call(extraction=...)` needs
+    a Haiku-based extraction step against a closed JSON schema — real,
+    separate new work (a new prompt + provider call, mirroring
+    `UserProfileMemory`'s own description of how extraction works) this
+    task does not build. `extraction=None` is passed explicitly, which
+    that method's own docstring names as the legitimate "nothing new
+    stated this call" value, not a placeholder for missing work.
+    `opened_issues` — tool-confirmed, in scope — is derived from
+    `ToolAuditRepo.list_for_session()`'s `request_limit_increase`
+    successes (`_opened_issues_from_invocations`); `resolved_issue_ids`
+    is never populated because no tool in today's registry closes an
+    issue (there is no cancel/approve-confirmation tool), so there is
+    nothing tool-confirmed to point at.
+14. **The whole post-call memory stage runs AFTER the primary
+    transaction above has committed, and its failures are caught,
+    logged, and never re-raised.** Two reasons, not one: first, docs/09
+    §8's "each stage is independently skippable" — a summary-save
+    failure must not prevent the profile merge, and vice versa, so each
+    is caught separately, not as one all-or-nothing block. Second, and
+    more load-bearing: by the time this stage runs, judgment call #7's
+    duplicate-end gate has ALREADY flipped `conversations.state` to
+    `'ended'` in the committed primary transaction — so if this stage's
+    exception were instead allowed to propagate out of `end()`,
+    `app/voice/run.py`'s `_end_with_retry` would retry `end()` itself,
+    and that retry would immediately hit the duplicate-end no-op and
+    return without ever re-attempting the failed memory stage. Letting
+    the exception propagate would therefore not buy a real retry — it
+    would only turn an ordinary, already-logged memory-pipeline hiccup
+    into a spurious `_end_with_retry` backoff-and-retry cycle and,
+    on exhaustion, a misleading `session_end_failed_after_finalize`
+    ERROR log that names a session stuck as `in_call` when it is not (it
+    already ended cleanly; only its memory pipeline degraded). Building
+    a real retry/reconciliation path for a mid-pipeline crash is the
+    same out-of-scope call `app/voice/run.py`'s `_end_with_retry` module
+    comment already made for the analogous `call_costs`-orphan case —
+    "it needs its own composition-root decisions... this wiring task
+    does not own" — applied here to the memory pipeline instead.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -122,8 +228,23 @@ from app.auth.signaling import mint_signaling_token
 from app.data.redis_client import RedisClient
 from app.data.repositories.conversation_repo import ConversationRepo
 from app.data.repositories.cost_repo import CostRepo
-from app.domain.types import EndReason, Session, SessionState
-from app.models import Conversation
+from app.data.repositories.tool_audit_repo import ToolAuditRepo
+from app.data.repositories.user_profile_repo import UserProfileRepo
+from app.domain.types import (
+    ConversationSummary,
+    EndReason,
+    PendingConfirm,
+    Resolution,
+    Session,
+    SessionState,
+    SessionUser,
+    ToolInvocationStatus,
+)
+from app.memory.conversation_summary_store import ConversationSummaryStore
+from app.memory.session_memory import SessionMemory
+from app.memory.summarizer import Summarizer
+from app.memory.user_profile import IssueOpen, UserProfileMemory
+from app.models import CallCost, Conversation, ToolInvocation
 from app.obs.logging import get_logger
 
 log = get_logger(__name__)
@@ -180,6 +301,131 @@ def _parse_started_at(value: Any) -> datetime | None:
     return None if value is None else datetime.fromisoformat(value)
 
 
+@dataclass(frozen=True)
+class SummaryPipelineDeps:
+    """The external collaborators `SessionManager.end()` needs to run
+    docs/09 §8's summary/embed stage (judgment call #10, module
+    docstring) — grouped separately from the base `(sessionmaker, redis)`
+    constructor args because only the call sites that actually reach
+    `end()` need them (`app/api/routes/sessions.py` never does).
+
+    `summarizer_factory` returns a FRESH `Summarizer` on every call,
+    never a shared instance — mirrors that class's own "one instance per
+    call" contract. `SessionManager` cannot reach the real per-call
+    instance a live call would have used (nothing constructs one in
+    production yet, judgment call #12), so the factory is the seam that
+    makes this testable without coupling to that gap: production wiring
+    builds a real closure over its own `LLMRouter`/`SessionMemory`/
+    `CostTracker`, tests inject a factory returning a scripted double.
+    """
+
+    summarizer_factory: Callable[[], Summarizer]
+    conversation_summary_store: ConversationSummaryStore
+
+
+# docs/09 §8's diagram pairs "Summarizer (Haiku): final summary +
+# resolution" as one stage; judgment call #11 (module docstring) is why
+# this codebase classifies resolution deterministically instead. The
+# three checks below are ordered by how unambiguous the signal is: an
+# `EndReason` the caller already decided, a structural Redis field, then
+# a tool-audit read — never a guess.
+_TOOL_INTENTS: Final[dict[str, str]] = {
+    "request_limit_increase": "limit_increase",
+    "get_wallet_balance": "balance_check",
+    "get_payment_status": "payment_status",
+}
+
+# The only mutating (CONFIRM_REQUIRED-tier) tool in today's registry
+# (verified via `app/tools/` — grep, three tool modules total). A second
+# mutating tool needs its own entry in `_opened_issues_from_invocations`;
+# nothing here generalizes across tools automatically, deliberately —
+# YAGNI over guessing a shape no second tool has shown yet.
+_LIMIT_INCREASE_TOOL: Final = "request_limit_increase"
+
+
+def _classify_resolution(
+    *,
+    reason: EndReason,
+    pending_confirm: PendingConfirm | None,
+    invocations: Sequence[ToolInvocation],
+) -> Resolution:
+    """Judgment call #11 (module docstring): deterministic, not a second
+    LLM call. Checked in this order because the first two are exact,
+    structural facts the pipeline already has — nothing here infers
+    anything a merchant said:
+
+    1. `reason is EndReason.ESCALATED` -> `ESCALATED`. `end()`'s own
+       caller already decided this; mirroring it is not a guess.
+    2. A `pending_confirm` still held in Redis at end-of-call ->
+       `ABANDONED` — a mutating action was proposed (docs/10 §4's gate)
+       and the call ended before it was affirmed, executed, or
+       superseded.
+    3. Any tool invocation that succeeded (`status == 'ok'`) ->
+       `RESOLVED` — something tool-confirmed completed this call.
+    4. Otherwise -> `PENDING` — the default: no escalation, no live
+       gate, and nothing tool-confirmed finished (a purely informational
+       call, or every tool attempt errored/was denied).
+    """
+    if reason is EndReason.ESCALATED:
+        return Resolution.ESCALATED
+    if pending_confirm is not None:
+        return Resolution.ABANDONED
+    if any(inv.status == ToolInvocationStatus.OK.value for inv in invocations):
+        return Resolution.RESOLVED
+    return Resolution.PENDING
+
+
+def _classify_intents(invocations: Sequence[ToolInvocation]) -> tuple[str, ...]:
+    """One intent per distinct tool INVOKED (attempted, not only
+    succeeded — a denied or errored attempt still tells the next call
+    what the merchant was trying to do), first-invocation order
+    (`dict.fromkeys`, the same order-preserving-dedup idiom
+    `app/api/routes/sessions.py::_summary_payload` already uses for its
+    own `tools_used`). `_TOOL_INTENTS` maps today's three registered
+    tools; an unmapped future tool falls back to its own name rather
+    than being silently dropped."""
+    return tuple(
+        dict.fromkeys(_TOOL_INTENTS.get(inv.tool_name, inv.tool_name) for inv in invocations)
+    )
+
+
+def _tools_used(invocations: Sequence[ToolInvocation]) -> tuple[str, ...]:
+    """Distinct tool names invoked this call, first-invocation order —
+    mechanical, no classification (module docstring: the easy,
+    audit-sourced half of the resolution/intents stage)."""
+    return tuple(dict.fromkeys(inv.tool_name for inv in invocations))
+
+
+def _opened_issues_from_invocations(invocations: Sequence[ToolInvocation]) -> tuple[IssueOpen, ...]:
+    """Tool-confirmed `opened_issues` for `UserProfileMemory
+    .merge_post_call` (judgment call #13, module docstring). A
+    successful `request_limit_increase` becomes one `IssueOpen`, keyed
+    by the tool's own `request_id` — a stable identifier the tool
+    minted, not one this module invents."""
+    issues: list[IssueOpen] = []
+    for inv in invocations:
+        if inv.tool_name != _LIMIT_INCREASE_TOOL or inv.status != ToolInvocationStatus.OK.value:
+            continue
+        output = inv.output or {}
+        request_id = output.get("request_id")
+        if not request_id:
+            continue
+        input_ = inv.input or {}
+        current = input_.get("current_limit")
+        requested = input_.get("requested_limit")
+        summary = (
+            f"Daily limit increase requested: ₹{current:,} → ₹{requested:,}"
+            if isinstance(current, int) and isinstance(requested, int)
+            else f"Daily limit increase requested (request_id={request_id})"
+        )
+        issues.append(
+            IssueOpen(
+                id=str(request_id), summary=summary, status=str(output.get("status") or "pending")
+            )
+        )
+    return tuple(issues)
+
+
 class SessionManager:
     """docs/05 §3.1. Composes `ConversationRepo` (the durable
     `conversations`/`conversation_turns` stub, docs/12 §4.1-4.2) and
@@ -195,10 +441,19 @@ class SessionManager:
     """
 
     def __init__(
-        self, sessionmaker: async_sessionmaker[AsyncSession], redis: RedisClient
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        redis: RedisClient,
+        *,
+        summary_pipeline: SummaryPipelineDeps | None = None,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._redis = redis
+        self._session_memory = SessionMemory(redis)
+        # Judgment call #10 (module docstring): optional, keyword-only —
+        # a caller whose SessionManager never reaches end() (e.g.
+        # app/api/routes/sessions.py) has nothing to wire.
+        self._summary_pipeline = summary_pipeline
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[AsyncSession]:
@@ -315,7 +570,8 @@ class SessionManager:
                 # never ran for this session_id — draining now would
                 # silently commit an empty/stale turn list with no other
                 # signal that anything went wrong.
-                if await CostRepo(db).get(session_id) is None:
+                call_cost = await CostRepo(db).get(session_id)
+                if call_cost is None:
                     raise RuntimeError(
                         "SessionManager.end() called before CostTracker.finalize() for "
                         f"session_id={session_id!r} — no call_costs row exists yet, so "
@@ -346,6 +602,13 @@ class SessionManager:
                         trace_id=record.get("trace_id"),
                         started_at=_parse_started_at(record.get("started_at")),
                     )
+
+                # Read in the same transaction (cheap, read-only) so the
+                # post-call memory stage below — judgment call #10 —
+                # doesn't need a second session just for this: it drives
+                # both the resolution/intents classification (#11) and
+                # the profile merge's opened_issues (#13).
+                invocations = await ToolAuditRepo(db).list_for_session(session_id)
 
                 duration_s: int | None = None
                 if conversation.started_at is not None and conversation.ended_at is not None:
@@ -379,5 +642,156 @@ class SessionManager:
             duration_s=duration_s,
         )
 
+        # docs/09 §8's post-call memory pipeline — judgment call #10/#14
+        # (module docstring). Runs after the transaction above already
+        # committed; never raises, so a memory-pipeline hiccup cannot
+        # turn a successful call-end into a caller-visible failure or a
+        # spurious _end_with_retry cycle (judgment call #14 explains why
+        # a retry here would not even help). `call_cost` (the whole row,
+        # not `.total_usd` eagerly) is passed through so that attribute
+        # access happens inside `_save_summary`'s own try/except, not
+        # here unguarded — the summary stage is the only one that needs
+        # it, and it must not be able to abort the profile-merge stage
+        # too.
+        await self._run_post_call_memory(
+            session_id=session_id,
+            user_id=conversation.user_id,
+            reason=reason,
+            turn_count=len(turn_records),
+            duration_s=duration_s if duration_s is not None else 0,
+            call_cost=call_cost,
+            invocations=invocations,
+        )
 
-__all__ = ["SessionManager"]
+    # ------------------------------------------------------------------
+    # Post-call memory pipeline (docs/09 §8) — judgment calls #10-#14
+    # ------------------------------------------------------------------
+
+    async def _run_post_call_memory(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        reason: EndReason,
+        turn_count: int,
+        duration_s: int,
+        call_cost: CallCost,
+        invocations: Sequence[ToolInvocation],
+    ) -> None:
+        """The summary/embed stage (judgment call #10's optional
+        `SummaryPipelineDeps`) and the profile-merge stage (needs no
+        extra collaborator), each independently caught so one failing
+        never blocks the other — docs/09 §8's "each stage is
+        independently skippable" applied at this granularity."""
+        intents = _classify_intents(invocations)
+        tools_used = _tools_used(invocations)
+
+        if self._summary_pipeline is not None:
+            try:
+                await self._save_summary(
+                    pipeline=self._summary_pipeline,
+                    session_id=session_id,
+                    user_id=user_id,
+                    reason=reason,
+                    turn_count=turn_count,
+                    duration_s=duration_s,
+                    call_cost=call_cost,
+                    intents=intents,
+                    tools_used=tools_used,
+                    invocations=invocations,
+                )
+            except Exception:
+                log.warning(
+                    "session_manager.post_call_summary_failed",
+                    session_id=session_id,
+                    exc_info=True,
+                )
+        else:
+            log.info(
+                "session_manager.post_call_summary_pipeline_not_configured",
+                session_id=session_id,
+            )
+
+        try:
+            await self._merge_profile(
+                session_id=session_id, user_id=user_id, invocations=invocations
+            )
+        except Exception:
+            log.warning(
+                "session_manager.post_call_profile_merge_failed",
+                session_id=session_id,
+                exc_info=True,
+            )
+
+    async def _save_summary(
+        self,
+        *,
+        pipeline: SummaryPipelineDeps,
+        session_id: str,
+        user_id: str,
+        reason: EndReason,
+        turn_count: int,
+        duration_s: int,
+        call_cost: CallCost,
+        intents: tuple[str, ...],
+        tools_used: tuple[str, ...],
+        invocations: Sequence[ToolInvocation],
+    ) -> None:
+        """Fold the final summary (judgment call #12's honest ceiling),
+        classify resolution (#11), and save it — `ConversationSummaryStore
+        .save()` owns the embed step and its own failure isolation.
+        `call_cost.total_usd` is read here, inside this stage's own
+        try/except (its caller's), rather than eagerly by `end()` —
+        deliberate: the profile-merge stage needs no cost figure at all
+        and must not be able to fail over one."""
+        pending_confirm = await self._session_memory.get_pending_confirm(session_id)
+        resolution = _classify_resolution(
+            reason=reason, pending_confirm=pending_confirm, invocations=invocations
+        )
+
+        summarizer = pipeline.summarizer_factory()
+        rolling = await summarizer.fold_pending(session_id, thru_turn=turn_count)
+        if rolling is None:
+            # Judgment call #12: the fresh Summarizer's buffer is empty
+            # today (nothing wires observe_turn()/kick() into the turn
+            # loop yet) — fall back to whatever the last in-call fold
+            # already wrote, so this picks up real content for free the
+            # moment that separate wiring lands.
+            rolling = await self._session_memory.get_summary(session_id)
+        if rolling is None:
+            log.info(
+                "session_manager.post_call_summary_skipped_no_content", session_id=session_id
+            )
+            return
+
+        summary = ConversationSummary(
+            session_id=session_id,
+            user_id=user_id,
+            summary=rolling.text,
+            resolution=resolution,
+            intents=intents,
+            tools_used=tools_used,
+            turn_count=turn_count,
+            duration_s=duration_s,
+            cost_usd=call_cost.total_usd,
+        )
+        await pipeline.conversation_summary_store.save(summary)
+
+    async def _merge_profile(
+        self, *, session_id: str, user_id: str, invocations: Sequence[ToolInvocation]
+    ) -> None:
+        """The profile-merge stage (judgment call #13): tool-confirmed
+        `opened_issues` only; `extraction` is deferred (`None`, the
+        method's own documented "nothing new stated" value)."""
+        opened_issues = _opened_issues_from_invocations(invocations)
+        principal = SessionUser(user_id=user_id)
+        async with self._transaction() as db:
+            await UserProfileMemory(UserProfileRepo(db)).merge_post_call(
+                principal,
+                session_id=session_id,
+                extraction=None,
+                opened_issues=opened_issues,
+            )
+
+
+__all__ = ["SessionManager", "SummaryPipelineDeps"]

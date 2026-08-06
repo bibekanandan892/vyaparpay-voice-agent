@@ -648,6 +648,15 @@ def test_semantic_repo_exposes_no_other_query_method() -> None:
     `add`/`update` stay inherited and unlisted: they are write paths, not
     reads, and `SemanticMemoryProto` assigns indexing to this repo, so a
     later batch is expected to override them.
+
+    `add_call_summary` is exactly that later batch (post-call-summary-
+    profile-wiring task) — a write, not a query, and it exists precisely
+    so `app/memory/conversation_summary_store.py` never has to import
+    `MemoryChunk` itself (see that method's own docstring and
+    `test_semantic_repo_is_the_only_module_in_app_that_reaches_memory_chunks`
+    above). Listed here for the same reason `get`'s override is: a new
+    write path is a deliberate act with a reason attached, not a name
+    this test should silently start tolerating.
     """
     public = {
         name
@@ -661,6 +670,9 @@ def test_semantic_repo_exposes_no_other_query_method() -> None:
         # Not a query: an override that refuses the inherited unscoped
         # primary-key fetch. See SemanticRepo.get()'s docstring.
         "get",
+        # A write, not a query — the post-call embed stage's insert path.
+        # See SemanticRepo.add_call_summary()'s own docstring.
+        "add_call_summary",
     }
     assert public == allowed
 
