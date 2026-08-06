@@ -25,11 +25,15 @@ from typing import Any, cast
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
+from app.config import Settings
 from app.data.repositories.conversation_repo import ConversationRepo
-from app.domain.types import ConversationSummary, Resolution
+from app.domain.types import EMBEDDING_DIM, ConversationSummary, Resolution
 from app.memory.conversation_summary_store import ConversationSummaryStore
 from app.models.orm import ConversationSummary as ConversationSummaryRow
+from app.models.orm import MemoryChunk as MemoryChunkRow
+from tests.fakes import FakeEmbeddings
 
 CANONICAL = ConversationSummary(
     session_id="a1f3c9",
@@ -71,17 +75,56 @@ class _RecordingRepo:
         return self.rows
 
 
+class _FakeNestedTransaction:
+    """Stands in for the SAVEPOINT `AsyncSession.begin_nested()` opens —
+    real enough to prove the isolation property under test: whatever was
+    `.add()`-ed to the session DURING this block is discarded if the
+    block exits with an exception, and left alone otherwise. Never
+    swallows the exception (`__aexit__` returns `False`, matching the
+    real `begin_nested()` context manager) — the caller's own try/except
+    is what's under test, not this double's."""
+
+    def __init__(self, session: _FakeSession) -> None:
+        self._session = session
+        self._added_mark = 0
+
+    async def __aenter__(self) -> _FakeNestedTransaction:
+        self._added_mark = len(self._session.added)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type is not None:
+            self._session.nested_rollbacks += 1
+            del self._session.added[self._added_mark :]
+        return False
+
+
 class _FakeSession:
-    def __init__(self) -> None:
+    def __init__(self, *, flush_error: BaseException | None = None) -> None:
         self.commits = 0
+        self.added: list[Any] = []
+        self.flush_count = 0
+        self.nested_rollbacks = 0
+        self._flush_error = flush_error
 
     async def commit(self) -> None:
         self.commits += 1
 
+    def add(self, entity: Any) -> None:
+        self.added.append(entity)
+
+    async def flush(self) -> None:
+        self.flush_count += 1
+        if self._flush_error is not None:
+            raise self._flush_error
+
+    def begin_nested(self) -> _FakeNestedTransaction:
+        return _FakeNestedTransaction(self)
+
 
 class _FakeSessionFactory:
-    def __init__(self) -> None:
-        self.session = _FakeSession()
+    def __init__(self, *, flush_error: BaseException | None = None) -> None:
+        self.session = _FakeSession(flush_error=flush_error)
         self.opened = 0
 
     def __call__(self) -> _FakeSessionFactory:
@@ -305,3 +348,136 @@ async def test_list_for_user_returns_an_immutable_tuple(
 
     assert isinstance(result, tuple)
     assert [s.session_id for s in result] == ["a1f3c9", "b2e4d1"]
+
+
+# --------------------------------------------------------------------------
+# embed-and-insert (post-call-summary-profile-wiring task, judgment call #3)
+# --------------------------------------------------------------------------
+
+
+class _RaisingEmbeddings:
+    """`EmbeddingProvider`-shaped double whose `embed()` always raises —
+    for proving the isolation contract without a real HTTP failure."""
+
+    async def embed(self, texts: list[str]) -> list[tuple[float, ...]]:
+        raise RuntimeError("embeddings provider unreachable")
+
+
+def _fixture_settings() -> Settings:
+    # Pydantic coerces plain str to SecretStr at construction, but mypy
+    # types the *parameter* as SecretStr — the same mismatch
+    # tests/conftest.py's settings_factory and scripts/test_seed_kb.py's
+    # own _fixture_settings() already carry an ignore for.
+    return Settings(
+        jwt_secret="test-jwt-secret",
+        database_url="postgresql+asyncpg://test:test@localhost/test",
+        openrouter_api_key="test-openrouter-key",
+    )  # type: ignore[arg-type]
+
+
+def test_constructor_requires_embeddings_and_settings_together() -> None:
+    """Judgment call #3: a half-configured pair is a wiring bug, caught
+    at construction rather than at the first `save()`."""
+    with pytest.raises(ValueError, match="together"):
+        ConversationSummaryStore(
+            cast("async_sessionmaker[AsyncSession]", lambda: None),
+            embeddings=cast("Any", FakeEmbeddings()),
+        )
+    with pytest.raises(ValueError, match="together"):
+        ConversationSummaryStore(
+            cast("async_sessionmaker[AsyncSession]", lambda: None),
+            settings=_fixture_settings(),
+        )
+
+
+async def test_save_embeds_and_inserts_a_memory_chunk_when_a_provider_is_configured(
+    repo: _RecordingRepo, factory: _FakeSessionFactory
+) -> None:
+    embeddings = FakeEmbeddings()
+    embeddings.script(tuple([0.5] * EMBEDDING_DIM))
+    store = ConversationSummaryStore(
+        cast("async_sessionmaker[AsyncSession]", factory),
+        repo_factory=cast("Any", lambda _session: cast("ConversationRepo", repo)),
+        embeddings=cast("Any", embeddings),
+        settings=_fixture_settings(),
+    )
+
+    await store.save(CANONICAL)
+
+    assert embeddings.calls == [[CANONICAL.summary]]
+    (chunk,) = factory.session.added
+    assert isinstance(chunk, MemoryChunkRow)
+    assert chunk.kind == "call_summary"
+    assert chunk.source_id == CANONICAL.session_id
+    assert chunk.content == CANONICAL.summary
+    assert chunk.user_id == CANONICAL.user_id
+    assert chunk.embedding == [0.5] * EMBEDDING_DIM
+    assert factory.session.commits == 1  # one commit covers both writes
+    assert factory.session.nested_rollbacks == 0
+
+
+async def test_save_skips_the_embed_step_when_no_provider_is_configured(
+    store: ConversationSummaryStore, factory: _FakeSessionFactory
+) -> None:
+    """The default (no `embeddings`/`settings`) — every other test in
+    this file already exercises this path implicitly; asserted directly
+    here as the documented baseline judgment call #3 describes."""
+    await store.save(CANONICAL)
+
+    assert factory.session.added == []
+    assert factory.session.commits == 1
+
+
+async def test_save_commits_the_summary_row_even_when_the_embed_call_itself_raises(
+    repo: _RecordingRepo, factory: _FakeSessionFactory
+) -> None:
+    """THE test: an embeddings provider that raises before ever touching
+    the database must not prevent the summary row from committing. This
+    is docs/09 §8's "an embedding outage queues the memory_chunks insert
+    for retry without blocking the summary row" — the blocking half,
+    proven end to end through `save()`."""
+    store = ConversationSummaryStore(
+        cast("async_sessionmaker[AsyncSession]", factory),
+        repo_factory=cast("Any", lambda _session: cast("ConversationRepo", repo)),
+        embeddings=cast("Any", _RaisingEmbeddings()),
+        settings=_fixture_settings(),
+    )
+
+    with capture_logs() as logs:
+        await store.save(CANONICAL)  # must not raise
+
+    assert len(repo.upserts) == 1  # the summary row's own write still happened
+    assert repo.upserts[0]["session_id"] == CANONICAL.session_id
+    assert factory.session.added == []  # nothing landed in memory_chunks
+    assert factory.session.commits == 1  # the summary write's commit still ran
+    assert any(e["event"] == "conversation_summary_store.embed_failed_skipped" for e in logs)
+
+
+async def test_save_commits_the_summary_row_even_when_the_chunk_insert_fails_at_flush(
+    repo: _RecordingRepo,
+) -> None:
+    """The stronger proof a bare try/except cannot give: the embeddings
+    call SUCCEEDS and the chunk genuinely reaches `session.add()`, but
+    the DB-level write (`flush()`, standing in for a real constraint
+    violation) fails — a SAVEPOINT is what stops that from poisoning the
+    surrounding transaction and taking the already-written summary row
+    down with it. A bare try/except around the insert would look
+    identical to the previous test on this path only by accident."""
+    factory = _FakeSessionFactory(flush_error=RuntimeError("constraint violation"))
+    embeddings = FakeEmbeddings()
+    embeddings.script(tuple([0.25] * EMBEDDING_DIM))
+    store = ConversationSummaryStore(
+        cast("async_sessionmaker[AsyncSession]", factory),
+        repo_factory=cast("Any", lambda _session: cast("ConversationRepo", repo)),
+        embeddings=cast("Any", embeddings),
+        settings=_fixture_settings(),
+    )
+
+    await store.save(CANONICAL)  # must not raise
+
+    assert len(repo.upserts) == 1
+    # The chunk was add()-ed, then the SAVEPOINT rolled it back on the
+    # flush failure — nothing survives in the session's added list.
+    assert factory.session.added == []
+    assert factory.session.nested_rollbacks == 1
+    assert factory.session.commits == 1

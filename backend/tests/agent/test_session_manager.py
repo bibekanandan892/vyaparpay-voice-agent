@@ -17,19 +17,38 @@ import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
-from app.agent.session_manager import SessionManager
+from app.agent.session_manager import (
+    SessionManager,
+    SummaryPipelineDeps,
+    _classify_intents,
+    _classify_resolution,
+    _opened_issues_from_invocations,
+    _tools_used,
+)
 from app.api.errors import ResourceNotFoundError
 from app.auth.signaling import mint_signaling_token
 from app.data.redis_client import RedisClient
 from app.domain.interfaces import SessionManagerProto
-from app.domain.types import EndReason, Session, SessionState
-from app.models.orm import CallCost, Conversation, ConversationTurn
+from app.domain.types import (
+    ConversationSummary,
+    EndReason,
+    PendingConfirm,
+    Resolution,
+    RollingSummary,
+    Session,
+    SessionState,
+)
+from app.memory.conversation_summary_store import ConversationSummaryStore
+from app.memory.summarizer import Summarizer
+from app.memory.user_profile import IssueOpen
+from app.models.orm import CallCost, Conversation, ConversationTurn, ToolInvocation
+from app.models.orm import UserProfile as UserProfileRow
 
 _SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -57,12 +76,39 @@ def fake_sessionmaker(session: AsyncSession) -> async_sessionmaker[AsyncSession]
 
 @pytest.fixture
 def db_session() -> AsyncMock:
-    return AsyncMock(spec=AsyncSession)
+    session = AsyncMock(spec=AsyncSession)
+    # `end()` now reads `ToolAuditRepo.list_for_session()` in the same
+    # transaction (post-call-summary-profile-wiring task) — every
+    # existing test that never configured `.execute()` would otherwise
+    # see `list(result.scalars().all())` try to iterate an unconfigured
+    # mock and raise. Default to "no tool invocations this call"; tests
+    # that care override via `_configure_invocations`.
+    #
+    # `MagicMock()`, not the auto-created child mock: an `AsyncMock`'s
+    # own child attributes (including `.execute.return_value`) default to
+    # `AsyncMock` too, and `Result.scalars()`/`.all()` are synchronous
+    # real methods — chaining off the auto-created child silently turns
+    # `result.scalars()` into an unawaited coroutine instead of a list
+    # (verified by probe: `type(session.execute.return_value)` is
+    # `AsyncMock` unless overridden like this).
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = []
+    session.execute.return_value = result
+    return session
 
 
 @pytest.fixture
 def redis_client() -> AsyncMock:
-    return AsyncMock(spec=RedisClient)
+    client = AsyncMock(spec=RedisClient)
+    # Shared defaults for the post-call summary stage's two reads
+    # (SessionMemory.get_pending_confirm / .get_summary, both thin
+    # pass-throughs to these same methods) — an unconfigured AsyncMock
+    # would otherwise return another AsyncMock, not None, and silently
+    # fail summary-stage tests for the wrong reason. Tests that care
+    # override either explicitly.
+    client.get_pending_confirm.return_value = None
+    client.get_summary.return_value = None
+    return client
 
 
 @pytest.fixture
@@ -287,6 +333,33 @@ def _turn_record(turn_no: int, role: str, **extra: Any) -> dict[str, Any]:
     return {"turn_no": turn_no, "role": role, **extra}
 
 
+def _invocation(
+    tool_name: str,
+    *,
+    status: str = "ok",
+    input: dict[str, Any] | None = None,  # noqa: A002 -- mirrors ToolInvocation's own column name
+    output: dict[str, Any] | None = None,
+) -> ToolInvocation:
+    return ToolInvocation(
+        session_id="sess_1",
+        tool_name=tool_name,
+        input=input if input is not None else {},
+        output=output,
+        status=status,
+        latency_ms=12,
+    )
+
+
+def _configure_invocations(db_session: AsyncMock, invocations: list[ToolInvocation]) -> None:
+    """`ToolAuditRepo.list_for_session()`'s `result.scalars().all()`
+    chain, pinned to a specific list — overrides the `db_session` fixture's
+    own "no invocations" default. Mutates the existing `MagicMock` the
+    fixture already installed at `execute.return_value` rather than
+    replacing it wholesale, for the same reason that fixture uses a
+    plain `MagicMock` in the first place."""
+    db_session.execute.return_value.scalars.return_value.all.return_value = invocations
+
+
 async def test_end_marks_conversation_ended_and_drains_turns_in_order(
     manager: SessionManager, db_session: AsyncMock, redis_client: AsyncMock
 ) -> None:
@@ -466,18 +539,26 @@ async def test_end_rolls_back_the_whole_drain_when_a_record_is_malformed(
 
 
 def _get_by_model(
-    *, conversation: Conversation | None, call_cost: CallCost | None
+    *,
+    conversation: Conversation | None,
+    call_cost: CallCost | None,
+    user_profile: UserProfileRow | None = None,
 ) -> Any:
     """Builds a `db_session.get` side_effect that discriminates by the
-    model class each repo passes through (both `ConversationRepo.get`
-    and `CostRepo.get` are the same inherited `SqlAlchemyRepository.get`,
-    so a single uniform `return_value` can't tell them apart)."""
+    model class each repo passes through (`ConversationRepo.get`,
+    `CostRepo.get`, and `UserProfileRepo.get` are all the same inherited
+    `SqlAlchemyRepository.get` shape or a thin override of it, so a
+    single uniform `return_value` can't tell them apart). `**kwargs`
+    absorbs `UserProfileRepo.get`'s own `with_for_update` keyword, which
+    the other two callers never pass."""
 
-    async def fake_get(model: type, _id: str) -> Any:
+    async def fake_get(model: type, _id: str, **kwargs: Any) -> Any:
         if model is Conversation:
             return conversation
         if model is CallCost:
             return call_cost
+        if model is UserProfileRow:
+            return user_profile
         raise AssertionError(f"unexpected model queried: {model!r}")
 
     return fake_get
@@ -488,10 +569,17 @@ async def test_end_succeeds_when_a_call_costs_row_already_exists(
 ) -> None:
     """Happy path for judgment call #9: `CostTracker.finalize()` already
     ran (a `call_costs` row exists for this session_id), so `end()`
-    proceeds with the drain exactly as before this check was added."""
+    proceeds with the drain exactly as before this check was added.
+
+    Two commits land on the shared mock session, not one: the post-call
+    profile-merge stage (judgment call #10) opens its own transaction
+    after the primary one commits — `user_profile=None` (no existing row)
+    lets that second transaction complete cleanly instead of raising, so
+    `rollback` genuinely stays unawaited rather than merely being caught
+    and swallowed."""
     conversation = _conversation(state="in_call")
     db_session.get.side_effect = _get_by_model(
-        conversation=conversation, call_cost=CallCost(session_id="sess_1")
+        conversation=conversation, call_cost=CallCost(session_id="sess_1"), user_profile=None
     )
     redis_client.get_turns.return_value = [_turn_record(1, "user")]
 
@@ -499,8 +587,493 @@ async def test_end_succeeds_when_a_call_costs_row_already_exists(
 
     assert conversation.state == "ended"
     assert len(_added_turns(db_session)) == 1
-    db_session.commit.assert_awaited_once()
+    assert db_session.commit.await_count == 2  # primary transaction + profile-merge
     db_session.rollback.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------
+# Post-call memory pipeline (docs/09 §8) — post-call-summary-profile-wiring
+# task. `_classify_resolution`/`_classify_intents`/`_tools_used`/
+# `_opened_issues_from_invocations` are pure (SessionManager's own judgment
+# call #11/#13), tested directly with literal expected values — never by
+# calling the function under test to compute its own expected output.
+# --------------------------------------------------------------------------
+
+
+def test_classify_resolution_escalated_reason_wins_over_every_other_signal() -> None:
+    """Judgment call #11's first, most unambiguous check: `end()`'s own
+    caller already decided this, so it wins even over a live pending
+    confirm or a successful tool call."""
+    pending = PendingConfirm(
+        tool="request_limit_increase", args={}, proposed_turn=3, invocation_id=""
+    )
+    resolution = _classify_resolution(
+        reason=EndReason.ESCALATED,
+        pending_confirm=pending,
+        invocations=[_invocation("get_wallet_balance", status="ok")],
+    )
+    assert resolution is Resolution.ESCALATED
+
+
+def test_classify_resolution_a_live_pending_confirm_is_abandoned() -> None:
+    """The signal the task brief pointed at: a mutating action proposed
+    and never affirmed, executed, or superseded before the call ended."""
+    pending = PendingConfirm(
+        tool="request_limit_increase",
+        args={"current_limit": 25_000, "requested_limit": 50_000},
+        proposed_turn=5,
+        invocation_id="",
+    )
+    resolution = _classify_resolution(
+        reason=EndReason.HANGUP, pending_confirm=pending, invocations=[]
+    )
+    assert resolution is Resolution.ABANDONED
+
+
+def test_classify_resolution_a_successful_tool_call_is_resolved() -> None:
+    resolution = _classify_resolution(
+        reason=EndReason.HANGUP,
+        pending_confirm=None,
+        invocations=[
+            _invocation("get_payment_status", status="ok"),
+            _invocation("request_limit_increase", status="error"),
+        ],
+    )
+    assert resolution is Resolution.RESOLVED
+
+
+def test_classify_resolution_defaults_to_pending_with_no_signal_at_all() -> None:
+    resolution = _classify_resolution(
+        reason=EndReason.HANGUP, pending_confirm=None, invocations=[]
+    )
+    assert resolution is Resolution.PENDING
+
+
+def test_classify_resolution_every_tool_failing_stays_pending_not_abandoned() -> None:
+    """A denied/errored tool attempt with no LIVE pending confirm is not
+    the same as an abandoned confirm gate — nothing was proposed and left
+    hanging, it simply didn't succeed."""
+    resolution = _classify_resolution(
+        reason=EndReason.HANGUP,
+        pending_confirm=None,
+        invocations=[_invocation("request_limit_increase", status="denied")],
+    )
+    assert resolution is Resolution.PENDING
+
+
+def test_classify_intents_maps_known_tools_and_dedupes_in_first_seen_order() -> None:
+    intents = _classify_intents(
+        [
+            _invocation("get_wallet_balance"),
+            _invocation("get_payment_status"),
+            _invocation("get_wallet_balance"),  # repeat later in the call
+        ]
+    )
+    assert intents == ("balance_check", "payment_status")
+
+
+def test_classify_intents_falls_back_to_the_tool_name_when_unmapped() -> None:
+    intents = _classify_intents([_invocation("escalate_to_human")])
+    assert intents == ("escalate_to_human",)
+
+
+def test_tools_used_dedupes_in_first_invocation_order() -> None:
+    used = _tools_used(
+        [
+            _invocation("get_wallet_balance"),
+            _invocation("request_limit_increase"),
+            _invocation("get_wallet_balance"),
+        ]
+    )
+    assert used == ("get_wallet_balance", "request_limit_increase")
+
+
+def test_opened_issues_from_invocations_builds_one_issue_per_successful_request() -> None:
+    issues = _opened_issues_from_invocations(
+        [
+            _invocation(
+                "request_limit_increase",
+                status="ok",
+                input={"current_limit": 25_000, "requested_limit": 50_000},
+                output={
+                    "request_id": "LMT-2026-0724-0913",
+                    "status": "submitted",
+                    "eta_hours": 4,
+                },
+            )
+        ]
+    )
+    assert len(issues) == 1
+    assert issues[0].id == "LMT-2026-0724-0913"
+    assert issues[0].status == "submitted"
+    assert issues[0].summary == "Daily limit increase requested: ₹25,000 → ₹50,000"
+
+
+def test_opened_issues_from_invocations_ignores_non_ok_and_unrelated_tools() -> None:
+    issues = _opened_issues_from_invocations(
+        [
+            _invocation("get_wallet_balance", status="ok"),
+            _invocation("request_limit_increase", status="denied"),
+            _invocation("request_limit_increase", status="error"),
+        ]
+    )
+    assert issues == ()
+
+
+# --------------------------------------------------------------------------
+# Post-call memory pipeline — wired through end() (judgment calls #10-#14)
+# --------------------------------------------------------------------------
+
+
+class _FakeSummarizer:
+    """`Summarizer`-shaped double: `end()` only ever calls `fold_pending`
+    (judgment call #12) — no `observe_turn`/`kick`, since nothing
+    populates a real Summarizer's buffer on the turn path either."""
+
+    def __init__(
+        self, result: RollingSummary | None = None, *, error: BaseException | None = None
+    ) -> None:
+        self._result = result
+        self._error = error
+        self.calls: list[tuple[str, int]] = []
+
+    async def fold_pending(self, session_id: str, *, thru_turn: int) -> RollingSummary | None:
+        self.calls.append((session_id, thru_turn))
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class _RecordingSummaryStore:
+    """`ConversationSummaryStore`-shaped double — `SessionManager` only
+    ever calls `save()` on this collaborator."""
+
+    def __init__(self, *, error: BaseException | None = None) -> None:
+        self.saved: list[ConversationSummary] = []
+        self._error = error
+
+    async def save(self, summary: ConversationSummary) -> None:
+        if self._error is not None:
+            raise self._error
+        self.saved.append(summary)
+
+
+def _pipeline_deps(
+    summarizer: _FakeSummarizer, store: _RecordingSummaryStore
+) -> SummaryPipelineDeps:
+    return SummaryPipelineDeps(
+        summarizer_factory=lambda: cast("Summarizer", summarizer),
+        conversation_summary_store=cast("ConversationSummaryStore", store),
+    )
+
+
+def _patch_user_profile_memory(
+    monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """Replaces `UserProfileMemory` where `SessionManager` constructs it,
+    so these tests prove the WIRING (what `_merge_profile` calls
+    `merge_post_call` with) rather than re-exercising that class's own,
+    already-tested internals (tests/memory/test_user_profile.py)."""
+
+    class _RecordingUserProfileMemory:
+        def __init__(self, repo: Any) -> None:
+            self._repo = repo
+
+        async def merge_post_call(
+            self,
+            principal: Any,
+            *,
+            session_id: str,
+            extraction: Any = None,
+            opened_issues: Any = (),
+            resolved_issue_ids: Any = (),
+        ) -> None:
+            calls.append(
+                {
+                    "principal": principal,
+                    "session_id": session_id,
+                    "extraction": extraction,
+                    "opened_issues": tuple(opened_issues),
+                    "resolved_issue_ids": tuple(resolved_issue_ids),
+                }
+            )
+
+    monkeypatch.setattr("app.agent.session_manager.UserProfileMemory", _RecordingUserProfileMemory)
+
+
+async def test_end_saves_a_summary_with_classified_resolution_and_intents(
+    db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """Proves the wiring end to end: fold_pending's result, the
+    tool-audit-derived resolution/intents/tools_used, and the drained
+    turn_count/cost_usd all reach the saved ConversationSummary
+    unmodified — a literal expected value, not a re-derivation."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(
+        conversation=conversation,
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.1234")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user"), _turn_record(2, "agent")]
+    _configure_invocations(db_session, [_invocation("get_wallet_balance", status="ok")])
+
+    rolling = RollingSummary(text="Rajesh's ₹245 payment...", thru_turn=2)
+    summarizer = _FakeSummarizer(rolling)
+    store = _RecordingSummaryStore()
+    manager = SessionManager(
+        fake_sessionmaker(db_session),
+        redis_client,
+        summary_pipeline=_pipeline_deps(summarizer, store),
+    )
+
+    await manager.end("sess_1", EndReason.HANGUP)
+
+    assert summarizer.calls == [("sess_1", 2)]  # thru_turn = len(turn_records)
+    assert len(store.saved) == 1
+    saved = store.saved[0]
+    assert saved.session_id == "sess_1"
+    assert saved.user_id == "usr_rajesh01"
+    assert saved.summary == "Rajesh's ₹245 payment..."
+    assert saved.resolution is Resolution.RESOLVED
+    assert saved.tools_used == ("get_wallet_balance",)
+    assert saved.intents == ("balance_check",)
+    assert saved.turn_count == 2
+    assert saved.cost_usd == Decimal("0.1234")
+
+
+async def test_end_skips_summary_save_when_nothing_was_ever_buffered(
+    db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """Judgment call #12: a fresh Summarizer's buffer is empty and
+    SessionMemory.get_summary() has nothing either — this IS the only
+    reachable state today (nothing wires observe_turn()/kick() into the
+    turn loop yet). The stage is skipped and logged, never fabricated,
+    and end() still succeeds."""
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="in_call"),
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.01")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+    # redis_client.get_summary already defaults to None (fixture).
+
+    summarizer = _FakeSummarizer(None)  # fold_pending: nothing to fold
+    store = _RecordingSummaryStore()
+    manager = SessionManager(
+        fake_sessionmaker(db_session),
+        redis_client,
+        summary_pipeline=_pipeline_deps(summarizer, store),
+    )
+
+    with capture_logs() as logs:
+        await manager.end("sess_1", EndReason.HANGUP)
+
+    assert store.saved == []
+    assert any(
+        e["event"] == "session_manager.post_call_summary_skipped_no_content" for e in logs
+    )
+
+
+async def test_end_falls_back_to_the_existing_rolling_summary_when_nothing_new_folded(
+    db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """The forward-compatibility half of judgment call #12: once a
+    future task wires kick()/observe_turn(), whatever it already wrote to
+    session:{id}.summary is picked up here with no further change."""
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="in_call"),
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.02")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+    existing = RollingSummary(text="already folded earlier in the call", thru_turn=3)
+    redis_client.get_summary.return_value = existing
+
+    summarizer = _FakeSummarizer(None)
+    store = _RecordingSummaryStore()
+    manager = SessionManager(
+        fake_sessionmaker(db_session),
+        redis_client,
+        summary_pipeline=_pipeline_deps(summarizer, store),
+    )
+
+    await manager.end("sess_1", EndReason.HANGUP)
+
+    assert len(store.saved) == 1
+    assert store.saved[0].summary == "already folded earlier in the call"
+
+
+async def test_end_without_a_summary_pipeline_configured_still_ends_and_logs_the_skip(
+    manager: SessionManager, db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """`app/api/routes/sessions.py`'s SessionManager (judgment call #10)
+    never sets `summary_pipeline` — `end()` must still complete."""
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="in_call"),
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.01")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+
+    with capture_logs() as logs:
+        await manager.end("sess_1", EndReason.HANGUP)  # must not raise
+
+    assert any(
+        e["event"] == "session_manager.post_call_summary_pipeline_not_configured" for e in logs
+    )
+
+
+async def test_end_summary_save_failure_does_not_block_call_end_or_profile_merge(
+    monkeypatch: pytest.MonkeyPatch, db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """The single most important behavioral property this task adds: a
+    failing summary/embed stage — here `ConversationSummaryStore.save()`
+    itself raising, the same externally-visible outcome an embedding
+    -provider failure inside it produces (that class's own SAVEPOINT
+    isolation covers the internal case; this covers SessionManager's own
+    boundary around the whole stage) — must not stop
+    `conversations.state` from having already committed, and must not
+    stop the independent profile-merge stage from running."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(
+        conversation=conversation,
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.03")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+
+    rolling = RollingSummary(text="text", thru_turn=1)
+    summarizer = _FakeSummarizer(rolling)
+    store = _RecordingSummaryStore(error=RuntimeError("embedding provider down"))
+    profile_calls: list[dict[str, Any]] = []
+    _patch_user_profile_memory(monkeypatch, profile_calls)
+
+    manager = SessionManager(
+        fake_sessionmaker(db_session),
+        redis_client,
+        summary_pipeline=_pipeline_deps(summarizer, store),
+    )
+
+    with capture_logs() as logs:
+        await manager.end("sess_1", EndReason.HANGUP)  # must not raise
+
+    # The primary transaction (state flip + drain) already committed
+    # BEFORE the summary stage ever ran — this assertion is the proof.
+    assert conversation.state == "ended"
+    assert store.saved == []  # save() raised; nothing landed
+    assert any(e["event"] == "session_manager.post_call_summary_failed" for e in logs)
+    assert len(profile_calls) == 1  # the OTHER stage still ran despite it
+
+
+async def test_end_merges_profile_with_an_opened_issue_from_a_successful_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    manager: SessionManager,
+    db_session: AsyncMock,
+    redis_client: AsyncMock,
+) -> None:
+    """docs/09 §5.2's tool-confirmed opened_issues, reached through
+    end() -> _merge_profile -> UserProfileMemory.merge_post_call, proven
+    against the real request_limit_increase output shape. Uses the
+    default `manager` fixture (no summary_pipeline) — profile-merge needs
+    none, by design (judgment call #10)."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(
+        conversation=conversation,
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.04")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+    _configure_invocations(
+        db_session,
+        [
+            _invocation(
+                "request_limit_increase",
+                status="ok",
+                input={"current_limit": 25_000, "requested_limit": 50_000},
+                output={
+                    "request_id": "LMT-2026-0724-0913",
+                    "status": "submitted",
+                    "eta_hours": 4,
+                },
+            )
+        ],
+    )
+    calls: list[dict[str, Any]] = []
+    _patch_user_profile_memory(monkeypatch, calls)
+
+    await manager.end("sess_1", EndReason.HANGUP)
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["session_id"] == "sess_1"
+    assert call["principal"].user_id == "usr_rajesh01"
+    assert call["extraction"] is None  # judgment call #13: deferred, not a guess
+    assert call["resolved_issue_ids"] == ()
+    (issue,) = call["opened_issues"]
+    assert isinstance(issue, IssueOpen)
+    assert issue.id == "LMT-2026-0724-0913"
+    assert issue.status == "submitted"
+    assert issue.summary == "Daily limit increase requested: ₹25,000 → ₹50,000"
+
+
+async def test_end_does_not_open_an_issue_for_a_denied_limit_increase(
+    monkeypatch: pytest.MonkeyPatch,
+    manager: SessionManager,
+    db_session: AsyncMock,
+    redis_client: AsyncMock,
+) -> None:
+    db_session.get.side_effect = _get_by_model(
+        conversation=_conversation(state="in_call"),
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.01")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+    _configure_invocations(
+        db_session, [_invocation("request_limit_increase", status="denied", output=None)]
+    )
+    calls: list[dict[str, Any]] = []
+    _patch_user_profile_memory(monkeypatch, calls)
+
+    await manager.end("sess_1", EndReason.HANGUP)
+
+    assert calls[0]["opened_issues"] == ()
+
+
+async def test_end_called_twice_runs_the_post_call_memory_pipeline_only_once(
+    monkeypatch: pytest.MonkeyPatch, db_session: AsyncMock, redis_client: AsyncMock
+) -> None:
+    """docs/09 §8's idempotency, extended to the new pipeline: the
+    duplicate-end gate (judgment call #7) short-circuits BEFORE the
+    post-call memory pipeline ever runs, so a second `end()` call — the
+    shape `app/voice/run.py`'s `_end_with_retry` produces retrying after
+    the first call already succeeded — never re-attempts the summary/
+    embed or profile stages (judgment call #14)."""
+    conversation = _conversation(state="in_call")
+    db_session.get.side_effect = _get_by_model(
+        conversation=conversation,
+        call_cost=CallCost(session_id="sess_1", total_usd=Decimal("0.01")),
+        user_profile=None,
+    )
+    redis_client.get_turns.return_value = [_turn_record(1, "user")]
+
+    rolling = RollingSummary(text="text", thru_turn=1)
+    summarizer = _FakeSummarizer(rolling)
+    store = _RecordingSummaryStore()
+    profile_calls: list[dict[str, Any]] = []
+    _patch_user_profile_memory(monkeypatch, profile_calls)
+
+    manager = SessionManager(
+        fake_sessionmaker(db_session),
+        redis_client,
+        summary_pipeline=_pipeline_deps(summarizer, store),
+    )
+
+    await manager.end("sess_1", EndReason.HANGUP)
+    await manager.end("sess_1", EndReason.HANGUP)  # retried, e.g. _end_with_retry-style
+
+    assert len(store.saved) == 1
+    assert len(profile_calls) == 1
+    assert summarizer.calls == [("sess_1", 1)]
 
 
 async def test_end_raises_when_finalize_never_ran(

@@ -86,7 +86,7 @@ from app.agent.cost_tracker import CostTracker
 from app.agent.llm_router import LLMRouter
 from app.agent.prompt_builder import PromptBuilder
 from app.agent.safety_layer import SafetyLayer
-from app.agent.session_manager import SessionManager
+from app.agent.session_manager import SessionManager, SummaryPipelineDeps
 from app.agent.tool_executor import ToolExecutor
 from app.config import Settings, get_settings
 from app.context.context_compressor import ContextCompressor
@@ -94,8 +94,11 @@ from app.context.event_log import EventLog
 from app.data.engine import create_engine_and_sessionmaker
 from app.data.redis_client import RedisClient
 from app.domain.types import EndReason, Session
+from app.memory.conversation_summary_store import ConversationSummaryStore
 from app.memory.session_memory import SessionMemory
+from app.memory.summarizer import Summarizer
 from app.obs import configure_logging, setup_observability
+from app.providers.openai_embeddings import OpenAIEmbeddings
 from app.providers.openrouter import OpenRouterLLM
 from app.tools.registry import configure as configure_tools
 from app.tools.registry import registry
@@ -144,7 +147,6 @@ def _build_collaborators(
     # call below, kept for parity with app/api/main.py's lifespan.
     configure_tools(sessionmaker)
 
-    session_manager = SessionManager(sessionmaker, redis_client)
     session_memory = SessionMemory(redis_client)
     # Phase-4 T3: ContextBuilder's slot-4/5 deps — same shared redis_client,
     # ContextCompressor is stateless (its own docstring: "one instance is
@@ -176,6 +178,35 @@ def _build_collaborators(
         sessionmaker=sessionmaker,
     )
     cost_tracker = CostTracker(settings, session_factory=sessionmaker, redis=redis_client)
+    # post-call-summary-profile-wiring task: mirrors app/voice/run.py's
+    # `_build_summary_pipeline` — `OPENAI_API_KEY` is optional (config.py's
+    # stated design), so `embeddings`/`ConversationSummaryStore`'s embed
+    # step is `None`/skipped when it is unset, the same drop-rung-1
+    # posture the worker's own build takes, not a new failure mode for
+    # this harness.
+    embeddings = OpenAIEmbeddings(http, settings) if settings.openai_api_key else None
+    conversation_summary_store = ConversationSummaryStore(
+        sessionmaker, embeddings=embeddings, settings=settings if embeddings else None
+    )
+
+    def summarizer_factory() -> Summarizer:
+        # See SessionManager's judgment call #12: a fresh, throwaway
+        # Summarizer/CostTracker per end() call — nothing on the turn
+        # path populates a real per-call Summarizer's buffer yet.
+        return Summarizer(
+            llm_router,  # type: ignore[arg-type]
+            session_memory,
+            cost_tracker=CostTracker(settings, session_factory=sessionmaker, redis=redis_client),
+        )
+
+    session_manager = SessionManager(
+        sessionmaker,
+        redis_client,
+        summary_pipeline=SummaryPipelineDeps(
+            summarizer_factory=summarizer_factory,
+            conversation_summary_store=conversation_summary_store,
+        ),
+    )
     return (
         session_manager,
         session_memory,

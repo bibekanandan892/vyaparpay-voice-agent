@@ -24,17 +24,75 @@ Judgment calls, flagged per house style:
    A `save()` that raised on a second attempt would make that documented
    retry impossible, so it upserts.
 
-3. **This does not embed anything.** docs/09 §8's pipeline writes the
-   summary row *and* a `memory_chunks` row with `kind='call_summary'`,
-   and docs/04's transaction-boundary note wants both in one transaction.
-   The embed is a separate task with no implementation yet
-   (`EmbeddingProvider` is a Protocol with no concrete class). Stating
-   the consequence plainly rather than implying otherwise: **a summary
-   saved through this class today has no vector, and the one-transaction
-   property docs/04 asks for is not delivered by this file** — closing
-   that needs the embed task to either extend `save()` with an
-   embed-and-insert step inside the same session, or to take over the
-   session boundary entirely.
+3. **This now embeds, and it does so inside `save()`'s own session —
+   CLOSED by the post-call-summary-profile-wiring task, superseding the
+   "no implementation yet" note this judgment call used to carry.**
+   `EmbeddingProvider` had no concrete class when this was written; the
+   concrete class (`app.providers.openai_embeddings.OpenAIEmbeddings`)
+   shipped in Phase-5 T2a, before this task, and is what `embeddings`
+   below is typed against. The chosen path is the first of the two this
+   note always named as the way to close the gap: `save()` extends with
+   an embed-and-insert step inside the SAME `db_session` `upsert_summary`
+   already used, wrapped in `db_session.begin_nested()` (a SQL
+   SAVEPOINT) — not the second path (taking over the session boundary
+   entirely), because the summary upsert's own transaction shape did not
+   need to change, only gain one more write inside it.
+
+   **The insert itself goes through a new `SemanticRepo.add_call_summary()`
+   method, not a `MemoryChunk` row built here.**
+   `tests/data/repositories/test_semantic_repo.py`'s own
+   `test_semantic_repo_is_the_only_module_in_app_that_reaches_memory_chunks`
+   enforces that only `app/models/orm.py` and `semantic_repo.py` may
+   import the `MemoryChunk` ORM class anywhere in `app/` — this module
+   passes `add_call_summary()` the primitive fields instead
+   (`source_id`/`content`/`embedding`/`user_id`) and never imports the
+   ORM class itself, so the guard's "the query path stays the one
+   reader" property extends to the write path this task adds.
+
+   **Why a SAVEPOINT and not a bare try/except around the insert.** A
+   caught Python exception does not, by itself, undo a poisoned SQL
+   transaction: if `SemanticRepo.add_call_summary()`'s `flush()` fails at
+   the DB level (a real constraint violation, not just the embeddings HTTP
+   call raising before touching the DB), Postgres marks the surrounding
+   transaction as aborted, and every statement after that — including
+   the `db_session.commit()` this method's caller depends on to persist
+   the summary row it already wrote — fails too
+   (`InFailedSqlTransactionError`), silently taking the summary write
+   down with it. `begin_nested()` opens a SAVEPOINT; on an exception
+   inside its `async with` block, only that SAVEPOINT rolls back, and
+   the outer transaction — carrying the already-flushed
+   `upsert_summary` — is untouched and free to commit. This is the one
+   behavioral property the whole embed-failure-isolation contract
+   (docs/09 §8: "An embedding outage queues the `memory_chunks` insert
+   for retry without blocking the summary row") actually rests on; a
+   plain try/except around the insert would look identical on the happy
+   path and silently fail this exact contract the day the failure mode
+   is a DB-level one instead of a network one.
+
+   **"Retry" is a caught-and-logged skip, not a queue.** Building an
+   actual retry queue for a failed embed is out of scope here, for the
+   same reason `app/voice/run.py`'s `_end_with_retry` module comment
+   gives for declining to build a durable reconciliation sweep: it needs
+   its own composition-root decisions (which process runs it, on what
+   schedule) that this task does not own. `_embed_and_insert_chunk`
+   below catches, logs a distinctly greppable
+   `conversation_summary_store.embed_failed_skipped` event (mirroring
+   that module's own naming convention for exactly this class of
+   decision), and returns — the summary row still commits, and the
+   session's call summary simply has no vector until a future batch
+   builds the sweep.
+
+   **`embeddings`/`settings` are optional, together.** `None` for both
+   (the default) means this store behaves exactly as it did before this
+   task: no embed attempt, no `memory_chunks` row — the same "advisory,
+   drop-rung 1" posture docs/09 §11 already documents for a missing
+   `OPENAI_API_KEY` elsewhere in this codebase (`app/voice/run.py`'s
+   `_build_brain_stack`: `embeddings = OpenAIEmbeddings(...) if
+   settings.openai_api_key else None`). The constructor raises if only
+   one of the pair is supplied — a caller that passes an `embeddings`
+   provider with no `settings` (needed to construct `SemanticRepo`) has
+   a wiring bug, not a legitimate half-configured state, and should hear
+   about it at construction rather than at the first `save()`.
 
 4. **Nothing here classifies `resolution` or extracts `intents`.** Those
    are post-call pipeline decisions (docs/09 §8's "Summarizer (Haiku):
@@ -50,8 +108,12 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import Settings
 from app.data.repositories.conversation_repo import ConversationRepo
-from app.domain.types import ConversationSummary
+from app.data.repositories.semantic_repo import SemanticRepo
+from app.domain.interfaces import EmbeddingProvider
+from app.domain.types import ConversationSummary, MemoryKind
+from app.domain.types import MemoryChunk as MemoryChunkDomain
 from app.models.orm import ConversationSummary as ConversationSummaryRow
 from app.obs.logging import get_logger
 
@@ -79,9 +141,25 @@ class ConversationSummaryStore:
         session_factory: async_sessionmaker[AsyncSession],
         *,
         repo_factory: Callable[[AsyncSession], ConversationRepo] = ConversationRepo,
+        embeddings: EmbeddingProvider | None = None,
+        settings: Settings | None = None,
+        semantic_repo_factory: Callable[[AsyncSession, Settings], SemanticRepo] = SemanticRepo,
     ) -> None:
+        if (embeddings is None) != (settings is None):
+            # Fail fast at construction (judgment call #3, module
+            # docstring): a half-configured pair is a wiring bug, not a
+            # legitimate drop-rung state — the legitimate one is both
+            # None.
+            raise ValueError(
+                "ConversationSummaryStore requires embeddings and settings together, or "
+                "neither — got embeddings="
+                f"{embeddings!r}, settings={settings!r}"
+            )
         self._session_factory = session_factory
         self._repo_factory = repo_factory
+        self._embeddings = embeddings
+        self._settings = settings
+        self._semantic_repo_factory = semantic_repo_factory
 
     async def save(self, summary: ConversationSummary) -> None:
         """Persist one call's durable summary. Idempotent on `session_id`
@@ -91,6 +169,11 @@ class ConversationSummaryStore:
         `created_at` on the passed value is ignored: the column is
         server-assigned (`server_default=now()`), and a retry keeps the
         original timestamp.
+
+        Also embeds `summary.summary` and inserts the matching
+        `memory_chunks` row, inside this same session (judgment call #3):
+        a failure there is isolated to its own SAVEPOINT and never
+        prevents this method's own commit below.
         """
         async with self._session_factory() as db_session:
             repo = self._repo_factory(db_session)
@@ -109,9 +192,11 @@ class ConversationSummaryStore:
                     _DISPLAY_MONEY_QUANTUM, rounding=ROUND_HALF_UP
                 ),
             )
+            await self._embed_and_insert_chunk(db_session, summary)
             # The repo never commits (base.py); this method opened the
             # session, so this method commits it — same rule CostTracker
-            # .finalize() follows.
+            # .finalize() follows. Reached even when the embed step above
+            # was skipped or failed: only its own SAVEPOINT rolled back.
             await db_session.commit()
         log.info(
             "conversation_summary_store.saved",
@@ -119,6 +204,56 @@ class ConversationSummaryStore:
             resolution=summary.resolution.value,
             turn_count=summary.turn_count,
         )
+
+    async def _embed_and_insert_chunk(
+        self, db_session: AsyncSession, summary: ConversationSummary
+    ) -> None:
+        """The embed-and-insert step judgment call #3 (module docstring)
+        describes. Never raises: every failure path — no provider
+        configured, the embeddings HTTP call itself raising, or a
+        DB-level failure on the insert — is caught here and logged, so
+        `save()`'s caller (`SessionManager.end()`, docs/09 §8) never sees
+        it and the summary row commits regardless.
+        """
+        if self._embeddings is None or self._settings is None:
+            log.info(
+                "conversation_summary_store.embed_skipped_no_provider",
+                session_id=summary.session_id,
+            )
+            return
+        try:
+            async with db_session.begin_nested():
+                (vector,) = await self._embeddings.embed([summary.summary])
+                # Validated through the domain type first (embedding
+                # width, the call_summary/user_id-required biconditional)
+                # — the same pattern scripts/seed_kb.py's `_rebuild_chunks`
+                # uses before handing a row to a repo, a safety net this
+                # environment cannot get from a live DB CHECK alone.
+                MemoryChunkDomain(
+                    kind=MemoryKind.CALL_SUMMARY,
+                    source_id=summary.session_id,
+                    content=summary.summary,
+                    embedding=vector,
+                    user_id=summary.user_id,
+                )
+                repo = self._semantic_repo_factory(db_session, self._settings)
+                await repo.add_call_summary(
+                    source_id=summary.session_id,
+                    content=summary.summary,
+                    embedding=vector,
+                    user_id=summary.user_id,
+                )
+        except Exception:
+            # Judgment call #3: a caught-and-logged skip, not a retry
+            # queue — docs/09 §8's "embedding outage queues the
+            # memory_chunks insert for retry" is honored at the scope
+            # this task owns (never block the summary row), not by
+            # building the queue itself.
+            log.warning(
+                "conversation_summary_store.embed_failed_skipped",
+                session_id=summary.session_id,
+                exc_info=True,
+            )
 
     async def get(self, session_id: str) -> ConversationSummary | None:
         """One call's durable summary, or `None` if the post-call pipeline

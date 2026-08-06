@@ -154,7 +154,7 @@ from app.agent.cost_tracker import CostTracker
 from app.agent.llm_router import LLMRouter
 from app.agent.prompt_builder import PromptBuilder
 from app.agent.safety_layer import SafetyLayer
-from app.agent.session_manager import SessionManager
+from app.agent.session_manager import SessionManager, SummaryPipelineDeps
 from app.agent.tool_executor import ToolExecutor
 from app.config import Settings
 from app.context.context_compressor import ContextCompressor
@@ -175,7 +175,9 @@ from app.domain.types import (
     ToolResult,
     UsageEvent,
 )
+from app.memory.conversation_summary_store import ConversationSummaryStore
 from app.memory.session_memory import SessionMemory
+from app.memory.summarizer import Summarizer
 from app.models.orm import CallCost, Conversation, ConversationTurn, MerchantLimit, ToolInvocation
 from app.obs.tracing import (
     SPAN_CONTEXT_BUILD,
@@ -515,7 +517,31 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         recording_executor = _RecordingToolExecutor(real_tool_executor)
         recording_safety = _RecordingSafetyLayer(real_safety)
         cost_tracker = CostTracker(settings, session_factory=sessionmaker, redis=redis_client)
-        session_manager = SessionManager(sessionmaker, redis_client)
+
+        # post-call-summary-profile-wiring task: mirrors production
+        # wiring (app/voice/run.py's `_build_summary_pipeline`) with no
+        # OPENAI_API_KEY configured in `settings` above, so
+        # ConversationSummaryStore embeds nothing here — the same
+        # drop-rung-1 posture production takes when the key is unset.
+        conversation_summary_store = ConversationSummaryStore(sessionmaker)
+
+        def summarizer_factory() -> Summarizer:
+            return Summarizer(
+                cast(LLMRouterProto, llm_router),
+                session_memory,
+                cost_tracker=CostTracker(
+                    settings, session_factory=sessionmaker, redis=redis_client
+                ),
+            )
+
+        session_manager = SessionManager(
+            sessionmaker,
+            redis_client,
+            summary_pipeline=SummaryPipelineDeps(
+                summarizer_factory=summarizer_factory,
+                conversation_summary_store=conversation_summary_store,
+            ),
+        )
 
         session = await session_manager.create(
             user_id=seed_module.MERCHANT_ID, screen_context=None, recent_events=[]

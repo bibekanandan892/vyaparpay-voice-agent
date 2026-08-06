@@ -20,15 +20,30 @@ than a forgotten keyword argument, and
 appears. The guard is a review aid backed by a test, not a language-level
 guarantee — do not read it as more.
 
-**Writes are absent on purpose.** `SemanticMemoryProto` assigns indexing
-(KB seed, post-call embed + insert) to this repo rather than to the
-retriever, so that a later batch adding a write path widens *this* class
-and not the read interface the scoping argument depends on staying narrow.
-That batch has not run: `add`/`update` come from `SqlAlchemyRepository` and
-nothing here overrides them yet. `get()` is likewise inherited and
-deliberately unused — a keyed fetch by primary key is not a semantic
-search and is not scoped by `memory_scope`; it exists because the base
-class provides it, not because retrieval needs it.
+**Writes are absent on purpose — until the post-call-summary-profile-
+wiring task, which is the batch this note anticipated.** `SemanticMemoryProto`
+assigns indexing (KB seed, post-call embed + insert) to this repo rather
+than to the retriever, so that a later batch adding a write path widens
+*this* class and not the read interface the scoping argument depends on
+staying narrow. `add_call_summary()` below is that write path: the ONE
+new method, added for the ONE new caller
+(`app/memory/conversation_summary_store.py`'s post-call embed step) —
+`get()` is still refused, and `search()`'s read-side scoping argument is
+untouched. `add`/`update` remain the plain inherited
+`SqlAlchemyRepository` ones; `add_call_summary` is a thin, validated
+wrapper over `add`, not a third write path.
+
+**Why the `MemoryChunk` ORM row is built here and nowhere else.**
+`tests/data/repositories/test_semantic_repo.py`'s own
+`test_semantic_repo_is_the_only_module_in_app_that_reaches_memory_chunks`
+enforces that this file — plus `app/models/orm.py`, which declares the
+table — is the only place in `app/` allowed to import
+`app.models.orm.MemoryChunk`. A caller that constructed the ORM row
+itself and handed it to a generic `add()` would be a second reader of
+that name; `add_call_summary()` takes the caller's primitive fields
+instead (`source_id`/`content`/`embedding`/`user_id`) and builds the row
+internally, so `app/memory/conversation_summary_store.py` never imports
+the ORM class at all.
 """
 
 from __future__ import annotations
@@ -94,6 +109,42 @@ class SemanticRepo(SqlAlchemyRepository[MemoryChunk]):
             "SemanticRepo.get() is not available: a primary-key fetch bypasses "
             "memory_scope() and would read across merchants. Use search(), or add "
             "a principal-scoped fetch method if one is genuinely needed."
+        )
+
+    async def add_call_summary(
+        self, *, source_id: str, content: str, embedding: Embedding, user_id: str
+    ) -> MemoryChunk:
+        """Insert one `kind='call_summary'` row — the post-call embed
+        stage's write path (docs/09 §8), and the module docstring's "the
+        batch this note anticipated" write. The sole caller is
+        `ConversationSummaryStore._embed_and_insert_chunk`.
+
+        `user_id` is required here, not optional the way
+        `app.domain.types.MemoryChunk`'s own field is (that type also
+        accepts `None`, for a `kb_article`) — this method only ever
+        builds a `call_summary` row, which `ck_memory_chunks_user_scope`
+        requires a non-null `user_id` for, so a narrower signature here
+        is what stops a caller passing `None` by mistake and silently
+        writing a row unreachable by its own owner (docs/09 §6.1's
+        biconditional, restated on `MemoryChunk`'s own docstring).
+
+        Deliberately does not re-validate through
+        `app.domain.types.MemoryChunk` itself — the caller already does
+        (the same "validate through the domain type first" pattern
+        `scripts/seed_kb.py`'s `_rebuild_chunks` uses), and duplicating
+        it here would check the same invariants twice for no new
+        coverage. What this method owns is the ORM construction: it is
+        the one place in `app/` allowed to import the `MemoryChunk`
+        class (see the module docstring).
+        """
+        return await self.add(
+            MemoryChunk(
+                kind=MemoryKind.CALL_SUMMARY.value,
+                source_id=source_id,
+                content=content,
+                embedding=list(embedding),
+                user_id=user_id,
+            )
         )
 
     async def search(
