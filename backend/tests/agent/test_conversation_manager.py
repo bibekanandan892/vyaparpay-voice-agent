@@ -180,6 +180,8 @@ class FakeCostTracker:
         self.over = False
         self.stt_seconds = 0.0
         self.tts_chars = 0
+        self.pending_media_usd = Decimal("0")
+        self.media_takes = 0
 
     def record_turn(self, usage: dict[str, Any], model: str, span: Span) -> TurnCost:
         self.recorded.append((usage, model))
@@ -201,6 +203,14 @@ class FakeCostTracker:
 
     def record_tts_text(self, characters: int) -> None:
         self.tts_chars += characters
+
+    def take_unpublished_media_cost(self) -> Decimal:
+        """Mirrors the real watermark: hands back what has not been
+        taken yet and never the same delta twice, so a test can tell a
+        drained publish apart from a repeated one."""
+        self.media_takes += 1
+        delta, self.pending_media_usd = self.pending_media_usd, Decimal("0")
+        return delta
 
 
 class FakeSessionMemory(SessionMemory):
@@ -318,6 +328,66 @@ async def test_usage_cost_lands_in_session_memory() -> None:
     await manager.on_stt_final("hi")
 
     assert memory.costs == [Decimal("0.001")]
+
+
+# ---------------------------------------------------------------------------
+# Media usage forwarding (docs/16 §5 components) — the voice worker drives
+# these two methods through the `app.voice.worker.Brain` seam
+# ---------------------------------------------------------------------------
+
+
+async def test_record_stt_audio_reaches_this_calls_cost_tracker() -> None:
+    """The worker meters STT audio and hands it to the brain; the brain
+    holds the only per-call `CostTracker`. Without this the forwarding
+    body could be `pass` and nothing in the suite would notice."""
+    manager, _, _, tracker = _manager(FakeRouter())
+
+    manager.record_stt_audio(12.5)
+    manager.record_stt_audio(2.5)
+
+    assert tracker.stt_seconds == 15.0
+
+
+async def test_record_tts_text_reaches_this_calls_cost_tracker() -> None:
+    manager, _, _, tracker = _manager(FakeRouter())
+
+    manager.record_tts_text(120)
+    manager.record_tts_text(80)
+
+    assert tracker.tts_chars == 200
+
+
+async def test_media_cost_rides_along_on_the_running_cost_publish() -> None:
+    """`session:{id}.cost_usd` is what docs/15 §6's cost-cap watchdog
+    reads, and it is the only per-call total another process can see.
+    Publishing `turn_cost.cost_usd` alone would leave it ~3x low, so the
+    media drained since the last round must be in the same delta."""
+    router = FakeRouter()
+    router.script(_text_events("Ok."))
+    tracker = FakeCostTracker()
+    tracker.pending_media_usd = Decimal("0.017")
+    manager, _, memory, _ = _manager(router, tracker=tracker)
+
+    await manager.on_stt_final("hi")
+
+    assert memory.costs == [Decimal("0.001") + Decimal("0.017")]
+    assert tracker.media_takes == 1
+
+
+async def test_media_cost_is_drained_not_re_added_on_the_next_turn() -> None:
+    """The watermark is the whole point: a second turn with no new media
+    must publish LLM spend only, or the counter compounds."""
+    router = FakeRouter()
+    router.script(_text_events("One."), _text_events("Two."))
+    tracker = FakeCostTracker()
+    tracker.pending_media_usd = Decimal("0.017")
+    manager, _, memory, _ = _manager(router, tracker=tracker)
+
+    await manager.on_stt_final("first")
+    await manager.on_stt_final("second")
+
+    assert memory.costs == [Decimal("0.018"), Decimal("0.001")]
+    assert tracker.media_takes == 2
 
 
 async def test_call_open_trigger_turn_appends_no_user_message() -> None:

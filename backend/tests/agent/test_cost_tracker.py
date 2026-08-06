@@ -10,6 +10,7 @@ $5/M out, $0.10/M cached-in.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, cast
 
@@ -278,8 +279,11 @@ def test_over_budget_default_cap_matches_the_dollar_runaway_guard(
 ) -> None:
     tracker = _Harness(settings).tracker
     # 400k uncached prompt tokens at $3/M = $1.20 — past the $1 default
-    # cap (which equals settings.call_cost_cap_usd, the value production
-    # callers pass explicitly).
+    # cap. `settings.call_cost_cap_usd` happens to hold the same value,
+    # but no production caller passes it: `ConversationManager` takes
+    # this default, so the setting is inert (see its comment in
+    # app/config.py). This asserts the two agree, not that the setting
+    # is wired.
     tracker.record_turn(
         {"prompt_tokens": 400_000, "completion_tokens": 0}, _DIALOGUE_MODEL, _start_span()
     )
@@ -408,9 +412,13 @@ async def test_finalize_prices_stt_audio_per_minute_from_the_rounded_seconds(
     """docs/16 §2/§5: Deepgram Nova-3 at $0.0077/min. The stored
     `stt_seconds` INT and the stored `stt_usd` must reproduce each other
     (tracker judgment call #8), so the fractional accumulator is rounded
-    once and the price computed from the rounded value."""
+    once and the price computed from the rounded value.
+
+    The expected figures are written out rather than recomputed from
+    `settings`: recomputing `seconds * rate / 60` here would just be
+    `_stt_usd()`'s body transcribed, and would survive any rate change.
+    """
     harness = _Harness(settings)
-    # 90.4 s accumulated across chunks; ROUND_HALF_UP -> 90 s billed.
     harness.tracker.record_stt_audio(90.0)
     harness.tracker.record_stt_audio(0.4)
 
@@ -420,9 +428,29 @@ async def test_finalize_prices_stt_audio_per_minute_from_the_rounded_seconds(
     assert row["stt_seconds"] == 90
     # 90 s = 1.5 min x $0.0077 = $0.01155 exactly.
     assert row["stt_usd"] == Decimal("0.011550")
-    assert row["stt_usd"] == (
-        Decimal(row["stt_seconds"]) * settings.stt_usd_per_audio_minute / Decimal("60")
-    )
+
+
+@pytest.mark.parametrize(
+    ("accumulated", "billed"),
+    [
+        (90.4, 90),  # below the half — every rounding mode agrees
+        (90.5, 91),  # ON the half — only ROUND_HALF_UP/HALF_EVEN-odd give 91
+        (90.6, 91),
+    ],
+)
+async def test_stt_seconds_rounds_half_up(
+    settings: Settings, accumulated: float, billed: int
+) -> None:
+    """Pins the rounding MODE, not just that rounding happens. The 90.5
+    case is the one that discriminates: HALF_DOWN, HALF_EVEN, FLOOR and
+    DOWN all give 90 there, so a fixture that only ever tests 90.4 lets
+    the mode be changed silently."""
+    harness = _Harness(settings)
+    harness.tracker.record_stt_audio(accumulated)
+
+    await harness.tracker.finalize(f"sess_round_{billed}")
+
+    assert harness.repo.upserts[0]["stt_seconds"] == billed
 
 
 async def test_finalize_prices_tts_characters_at_the_configured_rate(
@@ -471,22 +499,60 @@ def test_record_methods_reject_negative_usage(
         getattr(tracker, method)(value)
 
 
-async def test_finalize_names_the_stages_that_did_not_run(settings: Settings) -> None:
-    """Judgment call #6: `call_costs` has no stage-ran column, so a $0
-    component is ambiguous in the row alone. finalize()'s log resolves it
-    — a stage that reported usage (even $0 of it) is `recorded`, one that
-    never called its method is `unrecorded`."""
+async def _finalized_log(harness: _Harness, session_id: str) -> dict[str, Any]:
+    with capture_logs() as logs:
+        await harness.tracker.finalize(session_id)
+    return next(entry for entry in logs if entry["event"] == "cost_tracker.finalized")
+
+
+@pytest.mark.parametrize(
+    ("stage", "record"),
+    [
+        ("llm", lambda t: t.record_turn(_DIALOGUE_USAGE, _DIALOGUE_MODEL, _start_span())),
+        ("stt", lambda t: t.record_stt_audio(0.0)),
+        ("tts", lambda t: t.record_tts_text(0)),
+        ("embeddings", lambda t: t.record_embedding_tokens(0)),
+    ],
+)
+async def test_each_stage_marks_itself_recorded_even_reporting_zero(
+    settings: Settings, stage: str, record: Callable[[CostTracker], object]
+) -> None:
+    """Every one of the four `record_*` seams must set its own marker,
+    and a ZERO report still counts as "this stage reported" — that is the
+    distinction `unrecorded_stages` exists to draw (judgment call #6).
+    Parametrized because a per-stage marker that was never wired up would
+    otherwise hide behind whichever stage the test happened to use."""
+    harness = _Harness(settings)
+    record(harness.tracker)
+
+    finalized = await _finalized_log(harness, f"sess_stage_{stage}")
+
+    assert finalized["recorded_stages"] == [stage]
+    assert stage not in finalized["unrecorded_stages"]
+    assert sorted(finalized["unrecorded_stages"] + [stage]) == sorted(
+        ["llm", "stt", "tts", "embeddings"]
+    )
+
+
+async def test_finalize_separates_a_stage_reporting_zero_from_one_reporting_nothing(
+    settings: Settings,
+) -> None:
+    """The row cannot draw this distinction — `call_costs` has no
+    stage-ran column, and both cases write $0. Note what the log does NOT
+    claim: a stage that never ran and a stage whose metering is broken
+    both simply never call their method, so they are indistinguishable
+    here. The reader supplies that context (on a voice call, `stt`/`tts`
+    in `unrecorded_stages` is a wiring alarm)."""
     harness = _Harness(settings)
     harness.tracker.record_turn(_DIALOGUE_USAGE, _DIALOGUE_MODEL, _start_span())
     harness.tracker.record_tts_text(0)  # ran, spoke nothing
 
-    with capture_logs() as logs:
-        await harness.tracker.finalize("sess_stages")
+    finalized = await _finalized_log(harness, "sess_stages")
 
-    finalized = next(entry for entry in logs if entry["event"] == "cost_tracker.finalized")
     assert finalized["recorded_stages"] == ["llm", "tts"]
     assert finalized["unrecorded_stages"] == ["stt", "embeddings"]
-    # Both stages read $0 in the row; only the log tells them apart.
+    # Identical $0 in the row for the reported-zero and never-reported
+    # stages; only the log fields above tell them apart.
     row = harness.repo.upserts[0]
     assert row["tts_usd"] == Decimal("0")
     assert row["stt_usd"] == Decimal("0")
@@ -607,9 +673,17 @@ async def test_canonical_call_lands_within_a_cent_of_the_docs16_line_items(
     assert cents(row["stt_usd"]) == Decimal("0.04")  # docs/16 §5: $0.04
     assert cents(row["llm_utility_usd"]) == Decimal("0.01")  # docs/16 §5: $0.01
     assert cents(row["tts_usd"]) == Decimal("0.15")  # docs/16 §5: $0.15
-    assert row["embeddings_usd"] < Decimal("0.001")  # docs/16 §5: <$0.001
+    # docs/16 §5 says "<$0.001". Asserted as an exact figure, not against
+    # that bound: zero satisfies the bound, so `< 0.001` would pass with
+    # the embeddings line deleted entirely.
+    assert row["embeddings_usd"] == Decimal("0.000040")
 
     assert cents(row["llm_dialogue_usd"]) == Decimal("0.08")  # docs/16 §5 says $0.09
+    # NOT a behavioural assertion — this expression reads only config
+    # constants and never touches cost_tracker.py. It is the derivation
+    # of the gap, written executably so the $0.00483 in the docstring
+    # cannot drift from the rates it is derived from. The line below it
+    # is the behavioural one: it reads the row.
     cache_write_premium = (
         Decimal("1400")
         * settings.llm_dialogue_input_usd_per_mtok
@@ -631,7 +705,11 @@ async def test_canonical_call_makes_tts_the_largest_line_item(settings: Settings
     await harness.tracker.finalize("sess_canonical_tts")
     row = harness.repo.upserts[0]
 
-    components = {
+    # Exact component equality, not `max(...) == "tts_usd"` plus a >=50%
+    # share: both of those survive a large TTS underprice (TTS stays the
+    # largest line item until it is cut by roughly half), which is
+    # exactly the drift this test is supposed to catch.
+    assert {
         key: row[key]
         for key in (
             "stt_usd",
@@ -641,8 +719,16 @@ async def test_canonical_call_makes_tts_the_largest_line_item(settings: Settings
             "tts_usd",
             "turn_infra_usd",
         )
+    } == {
+        "stt_usd": Decimal("0.038500"),
+        "llm_dialogue_usd": Decimal("0.080400"),
+        "llm_utility_usd": Decimal("0.012000"),
+        "embeddings_usd": Decimal("0.000040"),
+        "tts_usd": Decimal("0.150000"),
+        "turn_infra_usd": Decimal("0"),
     }
-    assert max(components, key=lambda key: components[key]) == "tts_usd"
+    # docs/16 §5's observation, restated as the ordering it implies.
+    assert row["tts_usd"] > row["llm_dialogue_usd"] + row["llm_utility_usd"]
     assert row["tts_usd"] / row["total_usd"] >= Decimal("0.50")
 
 
@@ -682,3 +768,69 @@ def test_budget_guard_trips_on_runaway_media_spend_with_no_extra_llm_turns(
     tracker.record_stt_audio(3_600.0)  # a one-hour held-open line
     tracker.record_tts_text(15_000)
     assert tracker.over_budget() is True
+
+
+# ----------------------------------------------------------------------
+# take_unpublished_media_cost — the cross-process counter's media half
+# ----------------------------------------------------------------------
+
+
+def test_take_unpublished_media_cost_returns_the_delta_since_the_last_take(
+    settings: Settings,
+) -> None:
+    """Judgment call #9. `ConversationManager` folds this into the
+    `session:{id}.cost_usd` read-modify-write it already awaits per LLM
+    round, so it must hand back only what is NEW — returning the running
+    media total instead would compound the counter every turn."""
+    tracker = _Harness(settings).tracker
+
+    tracker.record_stt_audio(60.0)  # 1 min x $0.0077
+    assert tracker.take_unpublished_media_cost() == Decimal("0.0077")
+
+    tracker.record_tts_text(2_300)  # + $0.1499999993
+    assert tracker.take_unpublished_media_cost() == Decimal("0.1499999993")
+
+
+def test_take_unpublished_media_cost_is_zero_when_nothing_new_was_metered(
+    settings: Settings,
+) -> None:
+    tracker = _Harness(settings).tracker
+    tracker.record_tts_text(1_000)
+    tracker.take_unpublished_media_cost()
+
+    assert tracker.take_unpublished_media_cost() == Decimal("0")
+
+
+def test_taking_the_media_delta_never_changes_the_authoritative_total(
+    settings: Settings,
+) -> None:
+    """The watermark is publish-tracking only. `call_total()` and the
+    finalized row must be identical whether or not anyone drained —
+    otherwise the Redis guard rail would silently deduct from the
+    ledger."""
+    drained = _Harness(settings).tracker
+    untouched = _Harness(settings).tracker
+    for tracker in (drained, untouched):
+        _record_canonical_call(tracker)
+    drained.take_unpublished_media_cost()
+
+    assert drained.call_total() == untouched.call_total()
+    assert drained.take_unpublished_media_cost() == Decimal("0")
+
+
+def test_summed_media_deltas_equal_the_finalized_media_components(
+    settings: Settings,
+) -> None:
+    """What reaches Redis across a call must reconcile with what reaches
+    Postgres, or the two per-call totals diverge silently — the exact
+    failure this drain exists to prevent."""
+    harness = _Harness(settings)
+    published = Decimal("0")
+    harness.tracker.record_stt_audio(120.0)
+    published += harness.tracker.take_unpublished_media_cost()
+    harness.tracker.record_tts_text(2_300)
+    harness.tracker.record_embedding_tokens(2_000)
+    published += harness.tracker.take_unpublished_media_cost()
+
+    assert published == Decimal("0.0154") + Decimal("0.1499999993") + Decimal("0.00004")
+    assert published == harness.tracker.call_total()  # no LLM turns recorded

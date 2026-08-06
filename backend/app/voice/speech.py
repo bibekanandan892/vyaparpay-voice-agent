@@ -42,9 +42,12 @@ Judgment calls, flagged per house style:
    (docs/16 §5 prices ElevenLabs per character). Counted *before* the
    stream opens, because a sentence whose stream dies part-way
    (judgment call 2) was still submitted and is still billed. What is
-   counted is `len(sentence.text)`; the provider's own protocol frames
-   and its fallback-voice retry are outside this class's view — see
-   `CostTracker.record_tts_text` for exactly which way that skews.
+   counted is `len(sentence.text)`. Because `TtsProvider.synthesize` is
+   an async generator function, nothing has been sent to the vendor at
+   the moment of counting — the socket opens on the first `anext()` in
+   `_synthesize_sentence`'s `async for` below — so the count can come
+   out over OR under the invoice; `CostTracker.record_tts_text`
+   enumerates every case.
 
 Docs: docs/06 §4.2/§6.3/§9, docs/13 §4. Tests: driven through
 VoiceAgentWorker in tests/voice/test_worker.py.

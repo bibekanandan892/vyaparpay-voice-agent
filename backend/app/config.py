@@ -131,6 +131,13 @@ class Settings(BaseSettings):
 
     session_ttl_seconds: int = 86400
     rate_limit_sessions_per_min: int = 5
+    # INERT as of Phase-5 B7: no production code reads this field (only
+    # tests/agent/test_cost_tracker.py compares against it). The single
+    # budget check in `app/` is `ConversationManager._run_turn`'s
+    # `over_budget()` call, which takes `CostTrackerProto`'s own
+    # `cap_usd=Decimal("1.00")` default. docs/04 §3 and docs/15 §6 both
+    # publish `CALL_COST_CAP_USD` as the knob, so lowering it in env
+    # today changes nothing — wire it through before relying on it.
     call_cost_cap_usd: Decimal = Decimal("1.00")
 
     # --- Phase-3 voice (docs/06) — every field below is optional-with-

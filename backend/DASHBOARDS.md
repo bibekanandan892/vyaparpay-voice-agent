@@ -59,9 +59,13 @@ Work down this list — it is ordered by how often each one is the cause.
    (`app/api/routes/sessions.py` judgment call 1), but no subscriber to
    that channel exists in `app/voice/`, and `CallSession.close()` does
    not finalize either. So a voice call currently produces spans and
-   Redis turn records but **no cost row** — the cost board will be empty
-   for it however long it ran. Wiring the worker's post-call pipeline is
-   a separate task from pricing the components.
+   **nothing else durable**: no cost row, and no `session:{id}:turns`
+   records either — `RedisClient.append_turn` has exactly one caller,
+   inside `finalize()` itself, so the per-turn ledger dies with the
+   process too. (`ConversationManager` writes the 8-turn `transcript`
+   field on the `session:{id}` hash; that is a different key and a
+   rolling window, not the ledger.) Wiring the worker's post-call
+   pipeline is a separate task from pricing the components.
 3. **No call has completed.** Check "Calls finalized (window)" on the cost
    board and "Recent turns" on the latency board. Those two panels exist
    specifically to tell *no traffic* apart from *no data*.
@@ -200,7 +204,7 @@ that used a tool undercounts.
 
 `call_costs` has no such problem: `CostTracker.finalize()` writes
 `input_tokens=sum(t.input_tokens for t in self._turns)` and the analogous
-cost sums (`cost_tracker.py:359-388`), and the `ck_call_costs_total_usd`
+cost sums (`cost_tracker.py:440-468`), and the `ck_call_costs_total_usd`
 CHECK constraint (`app/models/orm.py:323-326`) forces the component columns to
 agree with `total_usd`. That is the table docs/16 §5's ≈$0.30 figure is
 about.
@@ -314,12 +318,12 @@ are the ones the dashboards actually use:
 | `turn` (inner) | `turn.affirmed` | `app/agent/conversation_manager.py:272` |
 | `turn` (inner) | `turn.over_budget` | `app/agent/conversation_manager.py:299` |
 | `turn` (inner) | `turn.tool_loop_bound_hit` | `app/agent/conversation_manager.py:366` |
-| `turn` (inner) | `turn.output_blocked` | `app/agent/conversation_manager.py:485` |
-| `turn` (inner) | `input_tokens` | `app/agent/cost_tracker.py:213` |
-| `turn` (inner) | `output_tokens` | `app/agent/cost_tracker.py:214` |
-| `turn` (inner) | `cost_usd` | `app/agent/cost_tracker.py:215` |
-| `turn` (inner) | `model` | `app/agent/cost_tracker.py:216` |
-| `turn` (inner) | `cost_estimated` | `app/agent/cost_tracker.py:219` |
+| `turn` (inner) | `turn.output_blocked` | `app/agent/conversation_manager.py:493` |
+| `turn` (inner) | `input_tokens` | `app/agent/cost_tracker.py:249` |
+| `turn` (inner) | `output_tokens` | `app/agent/cost_tracker.py:250` |
+| `turn` (inner) | `cost_usd` | `app/agent/cost_tracker.py:251` |
+| `turn` (inner) | `model` | `app/agent/cost_tracker.py:252` |
+| `turn` (inner) | `cost_estimated` | `app/agent/cost_tracker.py:255` |
 | `stt.final` | `is_endpoint` | `app/voice/worker.py:422` |
 | `stt.final` | `stt_ms` | `app/voice/worker.py:429` |
 | `stt.final` | `text_len` | `app/voice/worker.py:430` |

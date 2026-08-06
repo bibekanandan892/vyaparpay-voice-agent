@@ -427,7 +427,15 @@ class ConversationManager:
         #11's `_MAX_REPLY_CHARS` ValueError."""
         if isinstance(event, UsageEvent):
             turn_cost = self._cost_tracker.record_turn(event.usage, event.model, span)
-            await self._session_memory.add_cost(self._session.session_id, turn_cost.cost_usd)
+            # `session:{id}.cost_usd` is the field docs/15 §6's cost-cap
+            # watchdog is specified against, and the only per-call total
+            # another process can read. Publishing LLM spend alone would
+            # leave it ~3x under the real figure (docs/16 §5: LLM is about
+            # a third of a call), so the media metered since the last
+            # round rides along on this same read-modify-write — see
+            # CostTracker judgment call #9 for the residual lag.
+            delta = turn_cost.cost_usd + self._cost_tracker.take_unpublished_media_cost()
+            await self._session_memory.add_cost(self._session.session_id, delta)
         elif (calls := getattr(event, "tool_calls", None)) is not None:
             # Judgment call #1: task 4.3's reassembled-batch event,
             # matched structurally.
