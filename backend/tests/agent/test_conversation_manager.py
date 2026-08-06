@@ -11,6 +11,7 @@ coupling that would force a merge order between the two PRs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -42,6 +43,7 @@ from app.domain.types import (
     UsageEvent,
 )
 from app.memory.session_memory import SessionMemory
+from app.memory.summarizer import Summarizer
 
 # ---------------------------------------------------------------------------
 # Fakes (Protocol-shaped, scripted per test)
@@ -244,6 +246,28 @@ class FakeRegistry:
         return [{"type": "function", "function": {"name": "t"}}]
 
 
+class FakeSummarizer(Summarizer):
+    """Subclasses the concrete Summarizer purely for the type (mirrors
+    `FakeSessionMemory` above) — records `observe_turn`/`kick` calls
+    instead of really buffering/scheduling. What the fold algorithm
+    itself does with what it's handed is tests/memory/test_summarizer.py's
+    job; this file only proves ConversationManager calls these two
+    methods at all, with the right `turn_no`/`messages`/`session_id`
+    (summarizer-turn-loop-wiring task, ConversationManager's own
+    judgment call #13)."""
+
+    def __init__(self) -> None:  # deliberately no super().__init__
+        self.observed: list[tuple[int, tuple[Message, ...]]] = []
+        self.kicked: list[tuple[str, int]] = []
+
+    def observe_turn(self, turn_no: int, messages: Sequence[Message]) -> None:
+        self.observed.append((turn_no, tuple(messages)))
+
+    def kick(self, session_id: str, turn_count: int) -> bool:
+        self.kicked.append((session_id, turn_count))
+        return True
+
+
 def _session() -> Session:
     from datetime import UTC, datetime
 
@@ -263,10 +287,12 @@ def _manager(
     memory: FakeSessionMemory | None = None,
     tracker: FakeCostTracker | None = None,
     builder: FakeContextBuilder | None = None,
+    summarizer: FakeSummarizer | None = None,
 ) -> tuple[ConversationManager, FakeToolExecutor, FakeSessionMemory, FakeCostTracker]:
     executor = executor or FakeToolExecutor()
     memory = memory or FakeSessionMemory()
     tracker = tracker or FakeCostTracker()
+    summarizer = summarizer or FakeSummarizer()
     manager = ConversationManager(
         session=_session(),
         context_builder=builder or FakeContextBuilder(),
@@ -275,6 +301,7 @@ def _manager(
         tool_executor=executor,
         safety_layer=safety or FakeSafetyLayer(),
         cost_tracker=tracker,
+        summarizer=summarizer,
         session_memory=memory,
         tool_registry=FakeRegistry(),
     )
@@ -696,3 +723,130 @@ async def test_max_reply_chars_guard_closes_the_stream_synchronously() -> None:
 
     assert reply == _TURN_FAILURE_APOLOGY
     assert router.closed_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Rolling-summary wiring (summarizer-turn-loop-wiring task, module
+# docstring judgment call #13) — the first real call site for
+# `Summarizer.observe_turn`/`kick`.
+# ---------------------------------------------------------------------------
+
+
+async def test_observe_turn_and_kick_fire_with_the_turn_no_and_session_id() -> None:
+    router = FakeRouter()
+    router.script(_text_events("Hello Rajesh."))
+    summarizer = FakeSummarizer()
+    manager, _, _, _ = _manager(router, summarizer=summarizer)
+
+    await manager.on_stt_final("my payment failed")
+
+    assert [turn_no for turn_no, _ in summarizer.observed] == [1]
+    assert summarizer.kicked == [("s1", 1)]
+
+
+async def test_observe_turn_buffers_the_real_utterance_and_final_screened_reply() -> None:
+    """The buffered pair is the caller's raw utterance (not a
+    PromptBuilder-rendered/templated string) and the SAME reply text the
+    transcript got — not the model's raw, pre-screening output."""
+    router = FakeRouter()
+    router.script(_text_events("card 1234"))
+    safety = FakeSafetyLayer()
+    safety.verdict = SafetyVerdict(allowed=True, safe_text="card ****")
+    summarizer = FakeSummarizer()
+    manager, _, memory, _ = _manager(router, safety=safety, summarizer=summarizer)
+
+    reply = await manager.on_stt_final("what's my card number?")
+
+    assert reply == "card ****"
+    turn_no, messages = summarizer.observed[0]
+    assert turn_no == 1
+    assert messages == (
+        Message(role=Role.USER, content="what's my card number?"),
+        Message(role=Role.ASSISTANT, content="card ****"),
+    )
+    # The exact pair the transcript itself received (memory.appended),
+    # proving there is no second, diverging copy of the reply text.
+    assert messages[0].content == memory.appended[0].content
+    assert messages[-1].content == memory.appended[-1].content
+
+
+async def test_observe_turn_includes_the_tool_round_messages() -> None:
+    """docs/09 §4.2 requires tool calls and their outcomes to survive a
+    fold verbatim — this proves they actually reach `observe_turn`, not
+    just the user/assistant pair."""
+    router = FakeRouter()
+    call = _call("get_wallet_balance", "c1")
+    router.script(
+        [ToolCallsBatch(tool_calls=(call,)), *_text_events()],
+        _text_events("Your balance is fine."),
+    )
+    summarizer = FakeSummarizer()
+    manager, _, _, _ = _manager(router, summarizer=summarizer)
+
+    await manager.on_stt_final("do I have money?")
+
+    turn_no, messages = summarizer.observed[0]
+    assert turn_no == 1
+    assert messages[0] == Message(role=Role.USER, content="do I have money?")
+    assert messages[-1] == Message(role=Role.ASSISTANT, content="Your balance is fine.")
+    # Between the two: the assistant's tool_calls message and the tool
+    # result message _run_tool_loop appended.
+    middle = messages[1:-1]
+    assert any(m.role is Role.ASSISTANT and m.tool_calls is not None for m in middle)
+    assert any(m.role is Role.TOOL and m.tool_call_id == "c1" for m in middle)
+
+
+async def test_observe_turn_excludes_the_rendered_call_open_trigger() -> None:
+    """The call-open turn's rendered final message is `PromptBuilder`'s
+    synthetic `CALL_OPEN_TRIGGER`, not the caller's actual (empty)
+    utterance — the buffered turn must hold the real, empty utterance,
+    never the synthetic system-directed prose."""
+    router = FakeRouter()
+    router.script(_text_events("Hi, how can I help?"))
+    summarizer = FakeSummarizer()
+    manager, _, _, _ = _manager(router, summarizer=summarizer)
+
+    await manager.on_stt_final("")
+
+    turn_no, messages = summarizer.observed[0]
+    assert turn_no == 1
+    assert messages[0] == Message(role=Role.USER, content="")
+    assert "SYSTEM TRIGGER" not in "".join(m.content or "" for m in messages)
+
+
+async def test_observe_turn_and_kick_fire_on_critical_path_failure_too() -> None:
+    """A critical-path exception still buffers a (degraded) turn — the
+    turn happened and consumed a `turn_no`, so skipping it would leave a
+    hole a later fold can't distinguish from data loss. No tool-round
+    messages survive (they were never assembled), unlike the success
+    path."""
+    router = FakeRouter()  # nothing scripted — stream would assert if reached
+    builder = FakeContextBuilder()
+    builder.raises = RuntimeError("db exploded")
+    summarizer = FakeSummarizer()
+    manager, _, _, _ = _manager(router, builder=builder, summarizer=summarizer)
+
+    reply = await manager.on_stt_final("help")
+
+    assert reply == _TURN_FAILURE_APOLOGY
+    turn_no, messages = summarizer.observed[0]
+    assert turn_no == 1
+    assert messages == (
+        Message(role=Role.USER, content="help"),
+        Message(role=Role.ASSISTANT, content=_TURN_FAILURE_APOLOGY),
+    )
+    assert summarizer.kicked == [("s1", 1)]
+
+
+async def test_observe_turn_and_kick_fire_once_per_turn_with_increasing_turn_no() -> None:
+    router = FakeRouter()
+    router.script(_text_events("a"), _text_events("b"), _text_events("c"))
+    summarizer = FakeSummarizer()
+    manager, _, _, _ = _manager(router, summarizer=summarizer)
+
+    await manager.on_stt_final("one")
+    await manager.on_stt_final("two")
+    await manager.on_stt_final("three")
+
+    assert [turn_no for turn_no, _ in summarizer.observed] == [1, 2, 3]
+    assert summarizer.kicked == [("s1", 1), ("s1", 2), ("s1", 3)]

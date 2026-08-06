@@ -15,13 +15,25 @@ pytest.importorskip("aiortc", reason="[voice] extra not installed")
 import asyncio  # noqa: E402
 import time  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
+from decimal import Decimal  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
 from aiortc import RTCConfiguration, RTCPeerConnection  # noqa: E402
 
 import app.voice.run as run_module  # noqa: E402
 from app.data.redis_client import SESSION_CONTROL_END, RedisClient  # noqa: E402
-from app.domain.types import EndReason, Session, SessionState  # noqa: E402
+from app.domain.types import (  # noqa: E402
+    EndReason,
+    Message,
+    ModelTier,
+    Role,
+    Session,
+    SessionState,
+    TaskKind,
+    TokenEvent,
+    TurnCost,
+    UsageEvent,
+)
 from app.domain.voice import SignalMessage  # noqa: E402
 from app.voice.run import (  # noqa: E402
     KNOWLEDGE_PREFETCH_TIMEOUT_S,
@@ -208,7 +220,9 @@ async def test_on_call_ended_finalizes_then_ends_with_the_literal_session_id_and
 
     monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
 
-    async def _end(session_id: str, reason: EndReason) -> None:
+    async def _end(
+        session_id: str, reason: EndReason, *, real_summarizer: object = None
+    ) -> None:
         calls.append(("end", session_id, reason.value))
 
     stack = _make_stack(AsyncMock())
@@ -238,7 +252,9 @@ async def test_on_call_ended_forwards_the_error_reason_unchanged(
 
     monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
 
-    async def _end(session_id: str, reason: EndReason) -> None:
+    async def _end(
+        session_id: str, reason: EndReason, *, real_summarizer: object = None
+    ) -> None:
         calls.append(("end", session_id, reason.value))
 
     stack = _make_stack(AsyncMock())
@@ -285,7 +301,9 @@ async def test_on_call_ended_retries_a_transient_end_failure_and_recovers(
 
     attempts = {"n": 0}
 
-    async def _end(session_id: str, reason: EndReason) -> None:
+    async def _end(
+        session_id: str, reason: EndReason, *, real_summarizer: object = None
+    ) -> None:
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise RuntimeError("transient db blip")
@@ -319,7 +337,9 @@ async def test_on_call_ended_raises_after_exhausting_end_retries(
     monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
     monkeypatch.setattr(run_module.asyncio, "sleep", AsyncMock())
 
-    async def _always_fails(session_id: str, reason: EndReason) -> None:
+    async def _always_fails(
+        session_id: str, reason: EndReason, *, real_summarizer: object = None
+    ) -> None:
         raise RuntimeError("db is down")
 
     stack = _make_stack(AsyncMock())
@@ -352,7 +372,9 @@ async def test_on_call_ended_logs_a_distinct_alert_worthy_event_when_end_is_neve
     monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
     monkeypatch.setattr(run_module.asyncio, "sleep", AsyncMock())
 
-    async def _always_fails(session_id: str, reason: EndReason) -> None:
+    async def _always_fails(
+        session_id: str, reason: EndReason, *, real_summarizer: object = None
+    ) -> None:
         raise RuntimeError("db is down")
 
     stack = _make_stack(AsyncMock())
@@ -373,6 +395,189 @@ async def test_on_call_ended_logs_a_distinct_alert_worthy_event_when_end_is_neve
         attempts=3,
         exc_info=True,
     )
+
+
+# --------------------------------------------------------------------------
+# summarizer-turn-loop-wiring task: `_make_brain_factory` now also builds a
+# real per-call `Summarizer`, shares it with `ConversationManager`, and
+# `on_call_ended` must drain it before `finalize()` — the orphaned-fold fix
+# `Summarizer`'s own class docstring asks for.
+# --------------------------------------------------------------------------
+
+
+class _BlockingRouter:
+    """`LLMRouterProto` double whose stream parks on an `asyncio.Event`
+    the test owns — the same shape tests/memory/test_summarizer.py's own
+    `_BlockingRouter` uses, reproduced locally here (not imported) so
+    this file stays independent of that module's private test helpers.
+    Exists so a test can observe the window in which a fold has been
+    scheduled but has NOT produced anything yet — the only state that
+    distinguishes "kicked off the turn path" from "awaited on it"."""
+
+    def __init__(self, reply: str = "folded summary") -> None:
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+        self._reply = reply
+
+    def route(self, task: TaskKind) -> ModelTier:
+        return ModelTier.UTILITY if task is TaskKind.UTILITY else ModelTier.DIALOGUE
+
+    def stream(
+        self,
+        messages: list[Message],
+        *,
+        tier: ModelTier,
+        tools: list[dict[str, object]] | None = None,
+        ttft_deadline_s: float = 1.5,
+    ) -> object:
+        return self._events()
+
+    async def _events(self) -> object:
+        self.started.set()
+        await self.gate.wait()
+        yield TokenEvent(delta={"content": self._reply})
+        yield UsageEvent(model="anthropic/claude-haiku-4-5", usage={"prompt_tokens": 100})
+
+
+async def test_the_real_summarizer_and_conversation_manager_share_one_cost_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Point 5 of the summarizer-turn-loop-wiring task: a fold's cost
+    must land in the SAME `CostTracker` instance `finalize()` reads, not
+    a second one nothing reads. Proven by construction count — exactly
+    one `CostTracker` must be built per call, and both collaborators must
+    hold that SAME instance (identity, not just equal-looking mocks)."""
+    constructed: list[object] = []
+
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            constructed.append(self)
+
+        async def finalize(self, session_id: str) -> None:
+            pass
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+    stack = _make_stack(AsyncMock())
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+
+    assert len(constructed) == 1
+    assert built.brain._cost_tracker is constructed[0]  # noqa: SLF001
+    assert built.brain._summarizer._cost_tracker is constructed[0]  # noqa: SLF001
+
+
+async def test_on_call_ended_drains_an_in_flight_fold_before_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single most important test in this task: the orphaned-fold
+    hazard, stated by `Summarizer`'s own class docstring — the default
+    `task_factory` (`asyncio.create_task`) schedules a fold OUTSIDE any
+    `TaskGroup`, so without something explicitly awaiting it, an
+    in-flight fold keeps running after call teardown and its eventual
+    `cost_tracker.record_turn()` call (inside `_consume`, when the usage
+    frame arrives) lands AFTER `finalize()` already upserted `call_costs`
+    — orphaned, landing nowhere.
+
+    Proves the fix: `on_call_ended`'s `summarizer.drain()` call blocks
+    until the in-flight fold finishes, and that happens BEFORE
+    `finalize()` runs. This is proven two ways, either of which alone
+    would fail on the pre-fix code (`await cost_tracker.finalize(...)`
+    called with no `drain()` first): first, `on_call_ended` must still
+    be RUNNING (not done) while the fold is parked on the gate — without
+    `drain()`, `finalize()`/`end()` have no blocking call to wait on and
+    the whole coroutine completes almost immediately, so `end_task.done()`
+    would already be `True` at the `assert not end_task.done()` line, and
+    `order` would already contain "finalize" before the gate is ever
+    released. Second, once the gate opens, `record_turn` must appear in
+    `order` strictly BEFORE `finalize` — the fold's cost actually landed
+    in the tracker's running total before the total was read."""
+    order: list[str] = []
+
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def record_turn(self, usage: object, model: str, span: object) -> TurnCost:
+            order.append("record_turn")
+            return TurnCost(
+                model=model, input_tokens=0, output_tokens=0, cost_usd=Decimal("0.0023")
+            )
+
+        async def finalize(self, session_id: str) -> None:
+            order.append("finalize")
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+
+    # `_BrainStack` is frozen — built directly here (not via `_make_stack`)
+    # so `llm_router`/`session_memory` can be the controllable doubles
+    # this test needs, rather than mutated after construction.
+    router = _BlockingRouter()
+    session_manager = AsyncMock()
+    session_manager.attach.return_value = _SESSION
+    stack = _BrainStack(
+        session_manager=session_manager,
+        session_memory=AsyncMock(),
+        context_builder=AsyncMock(),  # type: ignore[arg-type]
+        prompt_builder=MagicMock(),
+        tool_executor=MagicMock(),
+        safety_layer=MagicMock(),
+        llm_router=router,  # type: ignore[arg-type]
+    )
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+    summarizer = built.brain._summarizer  # noqa: SLF001
+
+    # Populate the buffer and kick a fold exactly the way the turn loop
+    # does (ConversationManager's own judgment call #13), then hold it
+    # mid-stream — simulating hang-up landing while a fold is in flight.
+    for turn_no in range(1, 10):
+        summarizer.observe_turn(turn_no, [Message(role=Role.USER, content=f"line {turn_no}")])
+    assert summarizer.kick("sess_1", 9) is True
+    await asyncio.wait_for(router.started.wait(), timeout=2.0)
+
+    end_task = asyncio.create_task(built.on_call_ended(EndReason.HANGUP))
+    await asyncio.sleep(0)  # let on_call_ended run up to `await summarizer.drain()`
+    assert not end_task.done(), (
+        "on_call_ended finished without waiting for the in-flight fold — "
+        "the drain() fix is missing or was skipped"
+    )
+    assert order == []  # finalize() has not run yet either
+
+    router.gate.set()  # release the fold's model call
+    await asyncio.wait_for(end_task, timeout=5.0)
+
+    assert order == ["record_turn", "finalize"]
+    assert summarizer.summary is not None  # the fold actually completed, not orphaned
+
+
+async def test_on_call_ended_passes_the_real_summarizer_to_session_manager_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tail-turn-gap closure (session_manager.py judgment call #12):
+    `end()` must receive the SAME real per-call `Summarizer`
+    `ConversationManager` was buffering turns into — not a fresh one — so
+    its final `fold_pending()` call reaches real content."""
+
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def finalize(self, session_id: str) -> None:
+            pass
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+
+    stack = _make_stack(AsyncMock())
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+    await built.on_call_ended(EndReason.HANGUP)
+
+    stack.session_manager.end.assert_awaited_once()
+    _, kwargs = stack.session_manager.end.await_args
+    assert kwargs["real_summarizer"] is built.brain._summarizer  # noqa: SLF001
 
 
 # --------------------------------------------------------------------------

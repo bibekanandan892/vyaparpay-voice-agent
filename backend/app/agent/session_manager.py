@@ -151,26 +151,35 @@ rather than silently guessed at:
     `app/memory/user_profile.py`'s own house rule against LLM inference
     where a tool-confirmed or structural fact already answers the
     question.
-12. **A fresh per-call `Summarizer`'s buffer is empty today, and that is
-    not a rare edge case — it is the only reachable one.** Grepped the
-    whole `app/` tree: nothing constructs a `Summarizer` in production
-    code, and `ConversationManager`'s turn loop never calls
-    `observe_turn()`/`kick()` — the in-call rolling-fold wiring this
-    class's `Summarizer.fold_pending()` seam assumes upstream is a
-    separate, unbuilt task, out of this one's scope (this task's brief
-    is explicit that the new logic belongs inside `end()`, not
-    `ConversationManager`). Consequently `fold_pending(thru_turn=N)` on
-    the fresh `Summarizer` `SummaryPipelineDeps.summarizer_factory`
-    produces will return `None` for every call until that separate
-    wiring lands — `_save_summary` falls back to whatever
-    `SessionMemory.get_summary()` already holds (the last in-call fold,
-    if one ever ran) and, failing that too, skips the summary/embed
-    stage with a distinctly greppable log rather than fabricating text.
-    Stated plainly because it bears on the milestone this task serves
-    (docs/17 §2.5's "returning-caller proof"): until the rolling-fold
-    wiring lands separately, no call in this codebase produces a real
-    summary through this path, so nothing is ever embedded, and the
-    milestone cannot be demonstrated end-to-end from this task alone.
+12. **RESOLVED by the summarizer-turn-loop-wiring task — kept here,
+    updated, because the fallback chain it left behind is still exactly
+    what runs today.** This judgment call originally read: "a fresh
+    per-call `Summarizer`'s buffer is empty today, and that is not a
+    rare edge case — it is the only reachable one," because nothing
+    constructed a `Summarizer` in production and `ConversationManager`'s
+    turn loop never called `observe_turn()`/`kick()`. Both are now true:
+    `app/voice/run.py::_make_brain_factory` builds one real per-call
+    `Summarizer` alongside each call's `ConversationManager`
+    (`ConversationManager`'s own judgment call #13) and
+    `scripts/demo_cli.py` does the same. `end()` now accepts that real
+    instance as the optional, keyword-only `real_summarizer` parameter
+    below — passed by `on_call_ended` (`_make_brain_factory`) and by
+    `demo_cli.py`'s `_run` — and `_save_summary` folds through IT
+    instead of a throwaway `SummaryPipelineDeps.summarizer_factory()`
+    double when one is supplied. Because the real instance was buffering
+    turns for the whole call, `fold_pending(thru_turn=<final turn
+    count>)` on it folds exactly the tail turns after the last rolling
+    fold's boundary (docs/09 §4.1's up-to-5-turn remainder) — the seam
+    this class's own docstring names for that purpose, finally reachable
+    with real content. The three-deep fallback this judgment call
+    already described stays exactly as useful as it always was, for the
+    cases where no real instance is available: no `real_summarizer`
+    passed (`SummaryPipelineDeps.summarizer_factory()`'s fresh, empty
+    instance) -> `SessionMemory.get_summary()` (the last rolling fold, if
+    one landed) -> skip the stage with a greppable log. A caller that
+    still does not thread the real instance through (a future HTTP-facing
+    `end()` caller, say) degrades to exactly this judgment call's
+    original behavior, not a crash.
 13. **Profile `extraction` is deferred, deliberately, not silently
     dropped.** `UserProfileMemory.merge_post_call(extraction=...)` needs
     a Haiku-based extraction step against a closed JSON schema — real,
@@ -311,12 +320,18 @@ class SummaryPipelineDeps:
 
     `summarizer_factory` returns a FRESH `Summarizer` on every call,
     never a shared instance — mirrors that class's own "one instance per
-    call" contract. `SessionManager` cannot reach the real per-call
-    instance a live call would have used (nothing constructs one in
-    production yet, judgment call #12), so the factory is the seam that
-    makes this testable without coupling to that gap: production wiring
-    builds a real closure over its own `LLMRouter`/`SessionMemory`/
-    `CostTracker`, tests inject a factory returning a scripted double.
+    call" contract. Judgment call #12 (module docstring, updated by the
+    summarizer-turn-loop-wiring task): this factory is now the FALLBACK,
+    not the primary path — `end()`'s optional `real_summarizer` argument
+    is how a caller that actually has the live call's per-call instance
+    hands it over, so its buffered tail turns get folded instead of
+    nothing. The factory stays because two things still need it: a
+    caller with no real instance to offer (the `SessionManager` in
+    `app/api/routes/sessions.py`, if it is ever wired to `end()`, or any
+    caller that predates this task's change), and every existing test in
+    `tests/agent/test_session_manager.py` that exercises the fallback
+    chain on its own terms without standing up a real per-call
+    `Summarizer`.
     """
 
     summarizer_factory: Callable[[], Summarizer]
@@ -537,7 +552,9 @@ class SessionManager:
         async with self._transaction() as db:
             await self._get_existing(db, session_id)
 
-    async def end(self, session_id: str, reason: EndReason) -> None:
+    async def end(
+        self, session_id: str, reason: EndReason, *, real_summarizer: Summarizer | None = None
+    ) -> None:
         """Idempotent close (docs/05 §3.1) + the Phase-2 slice of the
         post-call drain (docs/09 §8): mark the conversation ended
         (`ConversationRepo.end`), then drain `session:{id}:turns` into
@@ -551,7 +568,18 @@ class SessionManager:
         always-present signal that `CostTracker.finalize()` already ran.
         Its absence means a caller invoked `end()` before `finalize()`,
         which would otherwise silently drain an empty/stale turn list;
-        that ordering bug raises a `RuntimeError` here instead."""
+        that ordering bug raises a `RuntimeError` here instead.
+
+        `real_summarizer` is optional and keyword-only — added by the
+        summarizer-turn-loop-wiring task, so `SessionManagerProto`'s
+        frozen two-argument signature (app/domain/interfaces.py) still
+        matches every existing caller. When supplied, it is the SAME
+        per-call `Summarizer` instance the live call's `ConversationManager`
+        was buffering turns into (judgment call #12, module docstring) —
+        `end()`'s summary stage folds through it instead of a fresh,
+        empty throwaway, so the tail turns after the last rolling fold's
+        boundary actually get folded in. `None` (the default) reproduces
+        this class's original, still-correct fallback chain exactly."""
         try:
             async with self._transaction() as db:
                 repo = ConversationRepo(db)
@@ -661,6 +689,7 @@ class SessionManager:
             duration_s=duration_s if duration_s is not None else 0,
             call_cost=call_cost,
             invocations=invocations,
+            real_summarizer=real_summarizer,
         )
 
     # ------------------------------------------------------------------
@@ -677,6 +706,7 @@ class SessionManager:
         duration_s: int,
         call_cost: CallCost,
         invocations: Sequence[ToolInvocation],
+        real_summarizer: Summarizer | None = None,
     ) -> None:
         """The summary/embed stage (judgment call #10's optional
         `SummaryPipelineDeps`) and the profile-merge stage (needs no
@@ -699,6 +729,7 @@ class SessionManager:
                     intents=intents,
                     tools_used=tools_used,
                     invocations=invocations,
+                    real_summarizer=real_summarizer,
                 )
             except Exception:
                 log.warning(
@@ -736,6 +767,7 @@ class SessionManager:
         intents: tuple[str, ...],
         tools_used: tuple[str, ...],
         invocations: Sequence[ToolInvocation],
+        real_summarizer: Summarizer | None = None,
     ) -> None:
         """Fold the final summary (judgment call #12's honest ceiling),
         classify resolution (#11), and save it — `ConversationSummaryStore
@@ -749,14 +781,24 @@ class SessionManager:
             reason=reason, pending_confirm=pending_confirm, invocations=invocations
         )
 
-        summarizer = pipeline.summarizer_factory()
+        # Judgment call #12 (module docstring, updated): fold through the
+        # REAL per-call instance when the caller supplied one — it has
+        # been buffering this call's turns since turn 1, so this reaches
+        # the tail turns after the last rolling fold's boundary. Falls
+        # back to a fresh, empty throwaway otherwise (the original #12
+        # behavior, still correct for a caller with no real instance).
+        summarizer = (
+            real_summarizer if real_summarizer is not None else pipeline.summarizer_factory()
+        )
         rolling = await summarizer.fold_pending(session_id, thru_turn=turn_count)
         if rolling is None:
-            # Judgment call #12: the fresh Summarizer's buffer is empty
-            # today (nothing wires observe_turn()/kick() into the turn
-            # loop yet) — fall back to whatever the last in-call fold
-            # already wrote, so this picks up real content for free the
-            # moment that separate wiring lands.
+            # Either the throwaway fallback's buffer is empty (no
+            # observe_turn/kick reached it — expected, it's throwaway),
+            # or the real instance had nothing left to fold (every turn
+            # up to `turn_count` was already covered by an earlier
+            # rolling fold, e.g. `turn_count` lands exactly on a fold
+            # boundary). Either way, fall back to whatever the last
+            # in-call fold already wrote.
             rolling = await self._session_memory.get_summary(session_id)
         if rolling is None:
             log.info(

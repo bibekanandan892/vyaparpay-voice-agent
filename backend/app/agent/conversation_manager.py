@@ -99,6 +99,46 @@ Judgment calls, flagged per house style rather than silently guessed at:
     with contextlib.aclosing(stream)` closes it synchronously, in THIS
     frame, on every exit path — normal completion, that exception, or
     any other.
+13. **`Summarizer.observe_turn()`/`kick()` are called once per turn, at
+   the very end of `on_stt_final`, on both the success and the
+   critical-path-failure branch** (summarizer-turn-loop-wiring task —
+   the first real call site for either method; `session_manager.py`'s
+   own judgment call #12 documented, whole-tree-grep-confirmed, that
+   nothing called them before this). `_run_turn` assembles the turn's
+   buffered messages itself: the caller's raw `text` (NOT
+   `PromptBuilder`'s rendered final message — that is the synthetic
+   `CALL_OPEN_TRIGGER` on the call-open turn, and the buffer should
+   hold the real, mostly-empty utterance instead), whatever
+   `_run_tool_loop` appended to the rendered message list for a tool
+   round (an assistant tool-calls message plus each tool's result
+   message — exactly what docs/09 §4.2 requires a fold to preserve
+   verbatim), and the final, SCREENED reply text (the same string
+   `_append_assistant_turn` puts in the transcript). Captured by
+   slicing `messages` from the length recorded just before
+   `_run_tool_loop` runs — the rendered list's own final entry (the
+   templated user message) sits one index below that mark and is
+   deliberately excluded, since the real `text` is used instead. On a
+   critical-path failure `_run_turn` never returns, so `on_stt_final`'s
+   except-handler buffers the degraded pair (utterance + apology)
+   instead — no tool-round data survives an exception raised before
+   the tool loop finished assembling it, which only widens a later
+   fold's coverage rather than leaving a hole (`Summarizer`'s own
+   judgment call #3 already tolerates a wider-than-usual fold; it never
+   tolerates a narrower one). `kick()` runs unconditionally right after
+   `observe_turn()` on every turn — its own `should_fold` is what
+   decides whether THIS turn is a fold point, so nothing here
+   re-implements that decision.
+
+   Called at the tail of `on_stt_final`, not from inside
+   `VoiceAgentWorker`'s TTS dispatch itself, even though docs/09 §4.1
+   rule 4 says "after turn N's TTS dispatch": for the voice path this
+   fires one layer earlier than the real TTS audio (`SpeechDispatcher`
+   runs after `Brain.on_stt_final` returns). `kick()` only *schedules*
+   a background fold and performs no I/O of its own, so the
+   millisecond it fires relative to audio playback has no correctness
+   consequence — moving it any closer to the real dispatch would need
+   a `Brain` Protocol change this class's own transport-blind boundary
+   (module docstring, opening paragraph) exists to avoid.
 """
 
 from __future__ import annotations
@@ -134,6 +174,7 @@ from app.domain.types import (
 )
 from app.memory.session_memory import SessionMemory
 from app.memory.short_term import ShortTermMemory
+from app.memory.summarizer import Summarizer
 from app.obs.logging import get_logger
 from app.obs.tracing import SPAN_TURN, get_tracer, safe_set_attribute
 
@@ -176,11 +217,14 @@ class ConversationManager:
     boundary docs/05 §1.1 exists to keep this class transport-blind).
 
     Collaborators arrive as their frozen Protocols (docs/04 §4's DI
-    split) with one exception: `session_memory` is the concrete
-    `SessionMemory` class, since no `SessionMemoryProto` exists in
-    `app/domain/interfaces.py` — this class never constructs any of its
-    collaborators, so the E2E harness swaps any of them (via a subclass,
-    for `session_memory`) for a fake without touching this file.
+    split) with two exceptions: `session_memory` and `summarizer` are the
+    concrete `SessionMemory`/`Summarizer` classes, since neither has a
+    Protocol in `app/domain/interfaces.py` (`Summarizer`'s own module
+    docstring, judgment call #7, explains why: freezing a shape nothing
+    implemented yet would have pre-empted this wiring task) — this class
+    never constructs any of its collaborators, so the E2E harness swaps
+    any of them (via a subclass, for `session_memory`/`summarizer`) for a
+    fake without touching this file.
     """
 
     def __init__(
@@ -194,6 +238,7 @@ class ConversationManager:
         safety_layer: SafetyLayerProto,
         cost_tracker: CostTrackerProto,
         session_memory: SessionMemory,
+        summarizer: Summarizer,
         tool_registry: ToolRegistry,
     ) -> None:
         self._session = session
@@ -204,6 +249,7 @@ class ConversationManager:
         self._safety_layer = safety_layer
         self._cost_tracker = cost_tracker
         self._session_memory = session_memory
+        self._summarizer = summarizer
         self._tool_registry = tool_registry
         self._principal = SessionUser(user_id=session.user_id)
         self.state: TurnState = TurnState.LISTENING
@@ -240,7 +286,7 @@ class ConversationManager:
             # can't cause a duplicate.
             await self._append_user_turn(text)
             try:
-                reply = await self._run_turn(text, span)
+                reply, turn_messages = await self._run_turn(text, span)
             except Exception:
                 log.error(
                     "turn_failed",
@@ -250,9 +296,23 @@ class ConversationManager:
                 )
                 safe_set_attribute(span, "turn.failed", True)
                 reply = _TURN_FAILURE_APOLOGY
+                # Judgment call #13: the degraded pair only — no tool-round
+                # data survived an exception raised before `_run_turn`
+                # finished assembling it (see the module docstring).
+                turn_messages = (
+                    Message(role=Role.USER, content=text),
+                    Message(role=Role.ASSISTANT, content=reply),
+                )
                 await self._append_assistant_turn(reply)
             finally:
                 self.state = TurnState.LISTENING
+        # Judgment call #13 (module docstring): buffer this turn and maybe
+        # kick a rolling fold, after the reply is fully finalized (apology
+        # included) and right before it is handed back to the caller —
+        # the CLI harness and VoiceAgentWorker both call `on_stt_final`,
+        # so this wires the rolling summary for both transports at once.
+        self._summarizer.observe_turn(self._turn_no, turn_messages)
+        self._summarizer.kick(self._session.session_id, self._turn_no)
         return reply
 
     async def on_barge_in(self) -> None:
@@ -263,7 +323,7 @@ class ConversationManager:
     # The critical path (docs/05 §2, numbered arrows)
     # ------------------------------------------------------------------
 
-    async def _run_turn(self, text: str, span: Span) -> str:
+    async def _run_turn(self, text: str, span: Span) -> tuple[str, tuple[Message, ...]]:
         # Affirmation first (judgment call #6): the classification pairs
         # THIS utterance with the pending confirm as it stood when the
         # user spoke, before any of this turn's executions mutate it.
@@ -281,6 +341,15 @@ class ConversationManager:
 
         tools = self._tool_registry.to_openai_tools()
         tier = self._llm_router.route(TaskKind.DIALOGUE)
+
+        # Judgment call #13 (module docstring): everything `_run_tool_loop`
+        # appends to `messages` from this point on is a tool round's
+        # assistant/tool messages — exactly the "tool messages between
+        # them" `Summarizer.observe_turn` wants. The mark is taken BEFORE
+        # the call so the rendered list's own final entry (the templated
+        # user message, which is `CALL_OPEN_TRIGGER` on the call-open
+        # turn) is excluded from the slice below.
+        tool_round_start = len(messages)
 
         reply_text = await self._run_tool_loop(
             messages, tools=tools, tier=tier, affirmed=affirmed, stm=stm, span=span
@@ -301,7 +370,16 @@ class ConversationManager:
         # Judgment call #8: best-effort — a failure here must never
         # discard an already-computed, correct reply_text.
         await self._append_assistant_turn(reply_text)
-        return reply_text
+
+        # Judgment call #13: the real utterance (not the rendered/
+        # templated one), the tool round's messages, and the final
+        # SCREENED reply — the same text the transcript just got.
+        turn_messages = (
+            Message(role=Role.USER, content=text),
+            *messages[tool_round_start:],
+            Message(role=Role.ASSISTANT, content=reply_text),
+        )
+        return reply_text, turn_messages
 
     async def _run_tool_loop(
         self,

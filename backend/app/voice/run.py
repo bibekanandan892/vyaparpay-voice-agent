@@ -172,15 +172,21 @@ def _build_summary_pipeline(
     `SessionManager` with, since nothing called `end()`'s new stage before
     this task wired it.
 
-    `summarizer_factory` builds a FRESH `Summarizer` per call
-    (`SessionManager`'s own judgment call #12: nothing keeps the real
-    per-call instance addressable, because nothing constructs one on the
-    turn path yet either — a separate, unbuilt task). Its `cost_tracker`
-    is a throwaway `CostTracker`, never `finalize()`d: the real per-call
-    tracker already finalized and committed `call_costs` before `end()`
-    runs, and a fold that only fires once the buffer-population wiring
-    lands would need its own accounting story then, not invented here on
-    spec for a path that cannot execute yet (judgment call #12).
+    `summarizer_factory` builds a FRESH `Summarizer` per call —
+    `SessionManager`'s own judgment call #12, updated by the
+    summarizer-turn-loop-wiring task: `_make_brain_factory` below now DOES
+    construct a real per-call `Summarizer` and thread it through to
+    `end()` as `real_summarizer`, so in the one real production call
+    path this factory is a fallback that is not actually reached
+    (`_save_summary` prefers `real_summarizer` when one is supplied).
+    It stays because `SessionManagerProto`'s `end()` is still callable
+    with none — a future caller that does not have a live per-call
+    instance to offer, and the existing `tests/agent/test_session_manager
+    .py` suite that exercises this exact fallback deliberately, on its
+    own terms. Its `cost_tracker` is a throwaway `CostTracker`, never
+    `finalize()`d: it would only matter if this factory's `Summarizer`
+    were ever actually folded through, and it deliberately is not, on
+    the one path that reaches it today.
 
     `conversation_summary_store` embeds through the SAME `embeddings`
     instance `ContextBuilder`'s retrieval prefetch already uses above —
@@ -266,7 +272,11 @@ def _build_brain_stack(
 
 
 async def _end_with_retry(
-    session_manager: SessionManager, session_id: str, reason: EndReason
+    session_manager: SessionManager,
+    session_id: str,
+    reason: EndReason,
+    *,
+    real_summarizer: Summarizer | None = None,
 ) -> None:
     """post-call-pipeline-wiring HIGH fix: `SessionManager.end()` failing
     AFTER `CostTracker.finalize()` already committed leaves `call_costs`
@@ -281,10 +291,17 @@ async def _end_with_retry(
     ERROR-level event — distinct from a generic worker-crash log — so it
     is greppable/alertable rather than indistinguishable from routine
     shutdown noise, before re-raising so the existing task-failure
-    visibility (`CallSession._log_worker_crash`) still sees it too."""
+    visibility (`CallSession._log_worker_crash`) still sees it too.
+
+    `real_summarizer` (summarizer-turn-loop-wiring task) is threaded
+    straight through to every retry attempt of `end()` unchanged — it is
+    the same real per-call `Summarizer` on every attempt, never
+    reconstructed, since a retry here is recovering from a transient
+    Postgres blip, not from anything about the summarizer itself
+    (session_manager.py judgment call #12)."""
     for attempt in range(1, _END_RETRY_ATTEMPTS + 1):
         try:
-            await session_manager.end(session_id, reason)
+            await session_manager.end(session_id, reason, real_summarizer=real_summarizer)
             return
         except Exception:
             if attempt >= _END_RETRY_ATTEMPTS:
@@ -321,7 +338,18 @@ def _make_brain_factory(
     `session_id` (cost_tracker.py has no such lookup), so the closure
     that finalizes it must be minted in the same place and carried down
     to `VoiceAgentWorker` alongside the `ConversationManager` it
-    also feeds."""
+    also feeds.
+
+    Since the summarizer-turn-loop-wiring task, the same reasoning
+    extends to a per-call `Summarizer`: built here, sharing this SAME
+    `cost_tracker` (so a fold's ~$0.0023, docs/09 §4.1, lands in the one
+    `CostTracker` instance `finalize()` will actually read — this class's
+    own judgment call #5 argues for it directly), and handed to
+    `ConversationManager` as its `summarizer` constructor argument
+    (that class's judgment call #13) so the turn loop's
+    `observe_turn()`/`kick()` calls buffer into and fold through the
+    real thing, not a throwaway. `on_call_ended` closes over it too, for
+    the orphaned-fold fix below."""
 
     async def build(session_id: str) -> BuiltBrain:
         session = await stack.session_manager.attach(session_id)
@@ -355,6 +383,23 @@ def _make_brain_factory(
         except TimeoutError:
             log.warning("voice_worker.knowledge_prefetch_timeout", session_id=session_id)
         cost_tracker = CostTracker(settings, session_factory=sessionmaker, redis=redis)
+        # summarizer-turn-loop-wiring task: same `cost_tracker` instance
+        # `conversation_manager` below is holding (this function's own
+        # docstring). Built with the DEFAULT `task_factory`
+        # (`asyncio.create_task`) deliberately — `Summarizer`'s own class
+        # docstring documents that passing the call's `TaskGroup.
+        # create_task` instead would need one to already exist, and
+        # `VoiceAgentWorker.run()` builds this whole brain via
+        # `_brain_factory()` BEFORE it opens `async with
+        # asyncio.TaskGroup() as tg:` (worker.py) — there is no group to
+        # pass yet. `on_call_ended`'s `summarizer.drain()` below is the
+        # other documented fix for the same hazard, and it has no such
+        # ordering conflict.
+        summarizer = Summarizer(
+            stack.llm_router,  # type: ignore[arg-type]
+            stack.session_memory,
+            cost_tracker=cost_tracker,
+        )
         conversation_manager = ConversationManager(
             session=session,
             context_builder=stack.context_builder,
@@ -364,6 +409,7 @@ def _make_brain_factory(
             tool_executor=stack.tool_executor,
             safety_layer=stack.safety_layer,
             cost_tracker=cost_tracker,
+            summarizer=summarizer,
             session_memory=stack.session_memory,
             tool_registry=registry,
         )
@@ -373,10 +419,25 @@ def _make_brain_factory(
             `SessionManager.end()` raises if `finalize()` has not already
             written a `call_costs` row) — run exactly once, from
             `VoiceAgentWorker.run()`'s `finally` (worker.py), for every
-            hangup path. Closes over `cost_tracker` and `session_id`
-            above and `stack.session_manager` (process-long), which is
-            why this closure — not a fresh SessionManager/CostTracker
-            lookup — is what travels to the worker.
+            hangup path. Closes over `cost_tracker`, `summarizer`, and
+            `session_id` above and `stack.session_manager` (process-long),
+            which is why this closure — not a fresh SessionManager/
+            CostTracker/Summarizer lookup — is what travels to the worker.
+
+            `summarizer.drain()` runs FIRST, before `finalize()` —
+            the orphaned-fold fix `Summarizer`'s own class docstring
+            asks for: the turn loop's last `kick()` may still have a
+            fold running in the background (default `task_factory`,
+            see above) when the call ends, and that fold calls
+            `cost_tracker.record_turn()` (via `_consume`) on this SAME
+            `cost_tracker` when it completes. Draining BEFORE
+            `finalize()` guarantees that call already happened, so the
+            fold's ~$0.0023 (docs/09 §4.1) is in the running total
+            `finalize()` upserts into `call_costs` — never orphaned onto
+            a call whose cost row already committed. `drain()` never
+            raises (its own docstring) and is a no-op when nothing is in
+            flight, so this costs nothing on the (overwhelmingly common)
+            call that never fires a fold at hang-up.
 
             `end()` gets a bounded retry (`_end_with_retry`, HIGH fix)
             because it is the one that can leave a session permanently
@@ -386,9 +447,18 @@ def _make_brain_factory(
             would double-append already-flushed Redis records on retry
             (cost_tracker.py's `_turn_records_flushed` flag only guards
             against re-entry AFTER a clean completion), which is a
-            different, deeper problem this task does not own fixing."""
+            different, deeper problem this task does not own fixing.
+            `real_summarizer=summarizer` (session_manager.py judgment
+            call #12) is how `end()`'s final `fold_pending()` reaches
+            this call's actually-buffered tail turns instead of a fresh,
+            empty instance — by the time this runs, `drain()` above has
+            already let any in-flight fold shed what it covered, so the
+            buffer holds exactly the turns still owed a fold."""
+            await summarizer.drain()
             await cost_tracker.finalize(session_id)
-            await _end_with_retry(stack.session_manager, session_id, reason)
+            await _end_with_retry(
+                stack.session_manager, session_id, reason, real_summarizer=summarizer
+            )
 
         return BuiltBrain(brain=conversation_manager, on_call_ended=on_call_ended)
 

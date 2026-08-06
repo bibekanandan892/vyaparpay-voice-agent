@@ -125,17 +125,18 @@ tests/models/test_orm.py itself already establishes for this project.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
 import re
 import subprocess
 import sys
-from collections.abc import Generator
+from collections.abc import Coroutine, Generator
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from opentelemetry import trace as otel_trace
@@ -298,6 +299,46 @@ def _tool_round(
             usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
         ),
     )
+
+
+def _inert_fold_task_factory(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """summarizer-turn-loop-wiring task: `ConversationManager` now
+    requires a real `Summarizer` (that class's own judgment call #13),
+    and this 9-turn canonical script legitimately crosses
+    `FIRST_FOLD_TURN` (turn 9) — `kick()` WILL fire for real once wired.
+
+    This test's whole point, and everything it pins — the turn/tool-audit
+    rows, the exact `_EXPECTED_STREAM_CALLS` arithmetic (module docstring
+    note #3), and especially the exhaustive span-accounting assertion at
+    the end of this function — is the Phase-2 conversation/persistence
+    path, not the rolling summarizer. That has its own dedicated unit
+    suite (tests/memory/test_summarizer.py) and its own dedicated,
+    NOT-Docker-gated end-to-end proof that a real fold lands in
+    `SessionMemory` (tests/agent/test_summarizer_turn_loop_wiring.py) —
+    which can actually be run and observed green in this environment,
+    unlike this file (Docker note above). Letting the fold run for real
+    here would need a THIRD `FakeLLM` script entry and two more spans
+    (`summary.fold`, plus its own `llm.total`/`llm.ttft`) folded into
+    this file's exact-count assertions, for no additional coverage the
+    dedicated test doesn't already give — and there is no way to verify
+    that arithmetic change locally without Docker.
+
+    This factory keeps `kick()`'s own scheduling behavior real and
+    observable (it still returns `True`, still respects the
+    single-flight guard, still marks `_in_flight`) while discarding the
+    actual fold coroutine before it ever calls the model or opens a
+    span: `coro.close()` is what silences Python's "coroutine was never
+    awaited" warning for an abandoned coroutine, and the replacement
+    no-op coroutine is what gives `_in_flight` something real to resolve
+    on its own. `SessionManager.end()` is deliberately called without
+    `real_summarizer=` below for the identical reason — passing it would
+    call `fold_pending()` directly, bypassing this factory entirely."""
+    coro.close()
+
+    async def _noop() -> None:
+        return None
+
+    return asyncio.ensure_future(_noop())
 
 
 # --------------------------------------------------------------------------
@@ -548,6 +589,19 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         )
         session_id = session.session_id
 
+        # summarizer-turn-loop-wiring task: the real per-call Summarizer,
+        # sharing `cost_tracker` — mirrors app/voice/run.py's
+        # `_make_brain_factory` exactly. `task_factory` is
+        # `_inert_fold_task_factory` (see that function's own docstring
+        # for why this specific, heavily-pinned test needs the fold's
+        # scheduling to be real but its execution to be inert).
+        summarizer = Summarizer(
+            cast(LLMRouterProto, llm_router),
+            session_memory,
+            cost_tracker=cost_tracker,
+            task_factory=_inert_fold_task_factory,
+        )
+
         manager = ConversationManager(
             session=session,
             context_builder=context_builder,
@@ -560,6 +614,7 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
             tool_executor=recording_executor,
             safety_layer=recording_safety,
             cost_tracker=cost_tracker,
+            summarizer=summarizer,
             session_memory=session_memory,
             tool_registry=registry,
         )
@@ -841,6 +896,16 @@ async def test_canonical_conversation_resolves_end_to_end(database_url: str) -> 
         # ==============================================================
         # Call end: finalize cost, then end the session (post-call drain).
         # ==============================================================
+        # `summarizer.drain()` before `finalize()` mirrors production
+        # ordering (app/voice/run.py's `on_call_ended`) — harmless here
+        # since `_inert_fold_task_factory` already made turn 9's `kick()`
+        # resolve to a no-op task, but keeping the same call shape this
+        # test's collaborators would see in production is worth the one
+        # extra line. `session_manager.end()` is deliberately called
+        # WITHOUT `real_summarizer=` — see `_inert_fold_task_factory`'s
+        # docstring for why passing it here would bypass that factory and
+        # run a real, unscripted fold.
+        await summarizer.drain()
         await cost_tracker.finalize(session_id)
         redis_turns_before_end = await redis_client.get_turns(session_id)
         await session_manager.end(session_id, EndReason.HANGUP)

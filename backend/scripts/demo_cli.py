@@ -67,6 +67,21 @@ Judgment calls, flagged per house style:
    empty user message instead of re-triggering the call-open convention.
    A human pressing Enter with nothing typed is an ordinary slip in an
    interactive REPL, not a scenario worth handing to the LLM.
+6. **`summarizer.drain()` runs BEFORE `cost_tracker.finalize()`**
+   (summarizer-turn-loop-wiring task), extending judgment call #2's
+   ordering rather than replacing it: the turn loop's last `kick()`
+   (`ConversationManager`'s own judgment call #13) may still have a
+   fold running in the background when `/end`/EOF/Ctrl-C fires, and that
+   fold calls `cost_tracker.record_turn()` on this SAME `cost_tracker`
+   when it completes. Draining first guarantees that landed before
+   `finalize()` reads the running total — otherwise the fold's ~$0.0023
+   (docs/09 §4.1) is orphaned onto a call whose `call_costs` row already
+   committed, the exact hazard `Summarizer`'s own class docstring warns
+   about. `summarizer` (this call's real per-call instance, shared with
+   `ConversationManager` via `_build_manager`) is also threaded through
+   to `session_manager.end()` as `real_summarizer`, mirroring
+   app/voice/run.py's `on_call_ended` exactly — session_manager.py's
+   judgment call #12.
 """
 
 from __future__ import annotations
@@ -137,7 +152,7 @@ def _build_collaborators(
     sessionmaker: async_sessionmaker[AsyncSession],
     redis_client: RedisClient,
 ) -> tuple[SessionManager, SessionMemory, ContextBuilder, PromptBuilder, ToolExecutor,
-           SafetyLayer, CostTracker, LLMRouter]:
+           SafetyLayer, CostTracker, LLMRouter, Summarizer]:
     """Every Batch-4/5 agent-brain component, wired to the same shared
     singletons (extracted from `_run` after review — MEDIUM: the
     combined function exceeded the house 50-line limit, the same
@@ -190,9 +205,13 @@ def _build_collaborators(
     )
 
     def summarizer_factory() -> Summarizer:
-        # See SessionManager's judgment call #12: a fresh, throwaway
-        # Summarizer/CostTracker per end() call — nothing on the turn
-        # path populates a real per-call Summarizer's buffer yet.
+        # `SessionManager` judgment call #12's FALLBACK factory (updated
+        # by the summarizer-turn-loop-wiring task): a fresh, throwaway
+        # Summarizer/CostTracker, used by `_save_summary` only when no
+        # `real_summarizer` is supplied to `end()`. `_run` below builds
+        # and threads through the REAL one instead, sharing `summarizer`
+        # (this function's own return value) — so on the one call path
+        # this harness actually drives, this factory is never reached.
         return Summarizer(
             llm_router,  # type: ignore[arg-type]
             session_memory,
@@ -207,6 +226,17 @@ def _build_collaborators(
             conversation_summary_store=conversation_summary_store,
         ),
     )
+    # summarizer-turn-loop-wiring task: the REAL per-call Summarizer,
+    # sharing `cost_tracker` with the `ConversationManager` `_build_manager`
+    # builds below — mirrors app/voice/run.py's `_make_brain_factory`
+    # exactly, for the same reason (that module's own docstring): a
+    # fold's cost must land in the SAME CostTracker instance `finalize()`
+    # reads, not a second one nothing reads.
+    summarizer = Summarizer(
+        llm_router,  # type: ignore[arg-type]
+        session_memory,
+        cost_tracker=cost_tracker,
+    )
     return (
         session_manager,
         session_memory,
@@ -216,6 +246,7 @@ def _build_collaborators(
         safety_layer,
         cost_tracker,
         llm_router,
+        summarizer,
     )
 
 
@@ -228,6 +259,7 @@ def _build_manager(
     safety_layer: SafetyLayer,
     cost_tracker: CostTracker,
     session_memory: SessionMemory,
+    summarizer: Summarizer,
 ) -> ConversationManager:
     return ConversationManager(
         session=session,
@@ -240,6 +272,7 @@ def _build_manager(
         tool_executor=tool_executor,
         safety_layer=safety_layer,
         cost_tracker=cost_tracker,
+        summarizer=summarizer,
         session_memory=session_memory,
         tool_registry=registry,
     )
@@ -264,6 +297,7 @@ async def _run(user_id: str) -> None:
             safety_layer,
             cost_tracker,
             llm_router,
+            summarizer,
         ) = _build_collaborators(settings, http, sessionmaker, redis_client)
 
         session = await session_manager.create(user_id, None, [])
@@ -278,6 +312,7 @@ async def _run(user_id: str) -> None:
             safety_layer,
             cost_tracker,
             session_memory,
+            summarizer,
         )
 
         # Call-open trigger (docs/11-prompt-engineering.md §4's turn-1
@@ -289,8 +324,19 @@ async def _run(user_id: str) -> None:
         repl_turns = await _repl(manager)
         turn_count = 1 + repl_turns  # + the greeting turn above
 
+        # summarizer-turn-loop-wiring task: drain BEFORE finalize, same
+        # ordering and same reason as app/voice/run.py's `on_call_ended` —
+        # an in-flight fold's `record_turn` must land in `cost_tracker`
+        # before `finalize()` reads it, or that fold's spend is orphaned
+        # (Summarizer's own class docstring).
+        await summarizer.drain()
         await cost_tracker.finalize(session.session_id)
-        await session_manager.end(session.session_id, EndReason.HANGUP)
+        # real_summarizer=summarizer (session_manager.py judgment call
+        # #12): end()'s final fold_pending() reaches this call's actually
+        # -buffered tail turns instead of a fresh, empty instance.
+        await session_manager.end(
+            session.session_id, EndReason.HANGUP, real_summarizer=summarizer
+        )
         print(
             f"[call ended] turns={turn_count} "
             f"cost=${cost_tracker.call_total():.6f} "
