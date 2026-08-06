@@ -178,6 +178,8 @@ class FakeCostTracker:
     def __init__(self) -> None:
         self.recorded: list[tuple[dict[str, Any], str]] = []
         self.over = False
+        self.stt_seconds = 0.0
+        self.tts_chars = 0
 
     def record_turn(self, usage: dict[str, Any], model: str, span: Span) -> TurnCost:
         self.recorded.append((usage, model))
@@ -193,6 +195,12 @@ class FakeCostTracker:
 
     async def finalize(self, session_id: str) -> None:  # pragma: no cover - unused
         raise NotImplementedError
+
+    def record_stt_audio(self, seconds: float) -> None:
+        self.stt_seconds += seconds
+
+    def record_tts_text(self, characters: int) -> None:
+        self.tts_chars += characters
 
 
 class FakeSessionMemory(SessionMemory):

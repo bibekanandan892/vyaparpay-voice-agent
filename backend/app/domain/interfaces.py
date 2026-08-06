@@ -335,12 +335,25 @@ class SemanticMemoryProto(Protocol):
 
 
 class CostTrackerProto(Protocol):
-    """docs/05 §3.8 — signatures verbatim from the doc."""
+    """docs/05 §3.8 — the first four signatures verbatim from the doc.
+
+    `record_stt_audio`/`record_tts_text` are additions, not doc
+    signatures: docs/05 §3.8 was written when the cost row had only LLM
+    components to fill, and STT minutes and TTS characters are not
+    derivable from an LLM usage frame (`CostTracker` judgment call #6).
+    They live on this Protocol because `ConversationManager` forwards
+    them from the voice worker's media stages to the call's cost ledger,
+    so they must be part of the seam it depends on. The embeddings
+    equivalent is deliberately absent — `ConversationManager` has no
+    embeddings stage to forward, so it stays a `CostTracker` method.
+    """
 
     def record_turn(self, usage: dict[str, Any], model: str, span: Span) -> TurnCost: ...
     def call_total(self) -> Decimal: ...
     def over_budget(self, cap_usd: Decimal = Decimal("1.00")) -> bool: ...
     async def finalize(self, session_id: str) -> None: ...
+    def record_stt_audio(self, seconds: float) -> None: ...
+    def record_tts_text(self, characters: int) -> None: ...
 
 
 class SessionManagerProto(Protocol):

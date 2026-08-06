@@ -209,6 +209,22 @@ class ConversationManager:
         self.state: TurnState = TurnState.LISTENING
         self._turn_no = 0
 
+    def record_stt_audio(self, seconds: float) -> None:
+        """Media-stage usage forwarded to this call's cost ledger.
+
+        This class owns the per-call `CostTracker`, and the `Brain` seam
+        (app/voice/worker.py) is the only wire between the voice worker's
+        media stages and it — so STT audio duration and TTS character
+        counts arrive here. They are usage quantities, not transport
+        detail: nothing about SDP, RTP, or codecs crosses this boundary,
+        so docs/05 §1.1's transport-blind rule still holds.
+        """
+        self._cost_tracker.record_stt_audio(seconds)
+
+    def record_tts_text(self, characters: int) -> None:
+        """See `record_stt_audio`."""
+        self._cost_tracker.record_tts_text(characters)
+
     async def on_stt_final(self, text: str) -> str:
         """Opens a turn, runs docs/05 §2's critical path, returns the
         finalized reply. Never raises — a critical-path failure returns

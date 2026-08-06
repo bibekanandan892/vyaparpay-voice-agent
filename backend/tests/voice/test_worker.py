@@ -709,3 +709,83 @@ async def test_interrupted_turn_span_records_the_interruption(
     turn_spans = [s for s in worker_spans.get_finished_spans() if s.name == SPAN_TURN]
     assert len(turn_spans) == 1
     assert _attrs(turn_spans[0])["interrupted"] is True
+
+
+# --------------------------------------------------------------------------
+# Billable media usage reaches the brain's cost ledger (docs/16 §5)
+# --------------------------------------------------------------------------
+
+
+async def test_stt_audio_handed_to_the_provider_is_metered_to_the_brain(
+    settings: Settings,
+) -> None:
+    """Deepgram is billed per audio-minute, so the worker reports the
+    duration of the PCM the provider actually consumed. Asserted against
+    `FakeStt.audio` rather than against what the test pushed: those two
+    agree only if the metering sits on the generator the provider
+    iterates (stt_supervisor judgment call 5)."""
+    rig = Rig(settings)
+    rig.brain.script("Understood.")
+    await rig.start()
+    try:
+        await _open_turn(rig, "How much did I take yesterday?")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the agent transcript final",
+        )
+    finally:
+        await rig.stop()
+
+    consumed_bytes = sum(len(chunk) for chunk in rig.stt.audio)
+    assert consumed_bytes > 0  # the assertion below is vacuous otherwise
+    # 16 kHz mono s16 = 32,000 bytes/s (audio_ingress).
+    assert rig.brain.stt_seconds == pytest.approx(consumed_bytes / 32_000)
+
+
+async def test_tts_characters_submitted_are_metered_to_the_brain(
+    settings: Settings,
+) -> None:
+    """ElevenLabs is billed per submitted character. Asserted against
+    `FakeTts.calls` — the exact texts the provider received — so a
+    counter that drifted from what was actually synthesized fails."""
+    rig = Rig(settings)
+    rig.brain.script("First sentence. Second one.")
+    await rig.start()
+    try:
+        await _open_turn(rig, "What happened to my payment?")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the agent transcript final",
+        )
+    finally:
+        await rig.stop()
+
+    assert rig.tts.calls == [("First sentence.", 0), ("Second one.", 1)]
+    assert rig.brain.tts_chars == sum(len(text) for text, _ in rig.tts.calls)
+
+
+async def test_a_sentence_whose_tts_stream_dies_is_still_billed(
+    settings: Settings,
+) -> None:
+    """speech.py judgment call 6: characters are counted at dispatch, so
+    §9's skip-and-continue does not silently erase a sentence the vendor
+    already charged for."""
+    rig = Rig(settings)
+    rig.brain.script("Alpha one. Beta two.")
+    rig.tts.script(
+        "Beta two.",
+        fake_tts_chunk("Beta two."),
+        fail_after=1,
+        error=ConnectionError("elevenlabs stream aborted"),
+    )
+    await rig.start()
+    try:
+        await _open_turn(rig, "Give me the summary.")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the reply to finish",
+        )
+    finally:
+        await rig.stop()
+
+    assert rig.brain.tts_chars == len("Alpha one.") + len("Beta two.")

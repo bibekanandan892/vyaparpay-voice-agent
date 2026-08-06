@@ -64,6 +64,25 @@ class Settings(BaseSettings):
     llm_utility_cached_input_usd_per_mtok: Decimal = Decimal("0.10")
     llm_utility_output_usd_per_mtok: Decimal = Decimal("5.00")
 
+    # Non-LLM provider pricing (docs/16 §5's per-call cost table), same
+    # config-not-constants rule as the LLM rates above.
+    #
+    # STT and embeddings have unit prices stated verbatim in docs/16 §2's
+    # stack table ("~$0.0077/min" for Deepgram Nova-3, "$0.02/M tokens"
+    # for text-embedding-3-small), and docs/16 §6 exports the embeddings
+    # rate as config-driven.
+    #
+    # TTS does NOT: no doc in this repo states an ElevenLabs per-character
+    # rate. docs/16 §5 states only the pair "~2,300 chars -> $0.15", so
+    # this default is *derived* from that pair (0.15 / 2300 * 1e6 =
+    # 65.217391 per million chars) so the ledger agrees with canon by
+    # construction. That is the same treatment backend/DASHBOARDS.md gives
+    # its USD->INR rate, and for the same reason. A deployment with a real
+    # ElevenLabs contract overrides it from env.
+    stt_usd_per_audio_minute: Decimal = Decimal("0.0077")
+    tts_usd_per_mchar: Decimal = Decimal("65.217391")
+    embeddings_usd_per_mtok: Decimal = Decimal("0.02")
+
     # --- Phase-5 memory (docs/09 §6) ---
 
     # Embeddings provider (docs/04 §4's fourth provider). Optional-with-
