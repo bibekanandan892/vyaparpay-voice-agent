@@ -86,6 +86,28 @@ _INJECTION_PATTERNS: Final = tuple(
 
 _NEUTRALIZED_TEMPLATE: Final = "[neutralized: injection heuristics matched in {slot}]"
 
+
+def looks_injected(text: str) -> bool:
+    """Whether `text` matches an imperative injection heuristic above.
+
+    Public and module-level so the memory-slot renderers
+    (`app/memory/slots.py`) can screen durable stored text against the
+    *same* pattern list rather than growing a second copy that drifts.
+
+    Deliberately NOT the whole of `SafetyLayer._looks_injected`: that
+    method also flags any registered tool name appearing verbatim, on the
+    reasoning that "screen labels have no legitimate reason to name
+    internal tools". Stored memory does. `user_profiles.open_issues` is
+    composed by post-call pipeline code from tool outcomes (docs/09 §5.2),
+    so an issue summary naming `request_limit_increase` is the field
+    working as designed, and a KB article about raising a limit may name
+    the same tool. Applying the tool-name half there would false-positive
+    on correct content, which for a durable store is the expensive
+    direction — see `app/memory/slots.py` for what the remedy is and why
+    it is per-entry.
+    """
+    return any(pattern.search(text) for pattern in _INJECTION_PATTERNS)
+
 # --------------------------------------------------------------------------
 # Output checks (docs/05 §3.6 rows 3-4; docs/10 §1 invariant 1)
 # --------------------------------------------------------------------------
@@ -211,7 +233,7 @@ class SafetyLayer:
         """Imperative patterns OR a registered tool name appearing
         verbatim in slot text — screen labels have no legitimate reason
         to name internal tools (docs/05 §3.6 row 2)."""
-        if any(pattern.search(text) for pattern in _INJECTION_PATTERNS):
+        if looks_injected(text):
             return True
         lowered = text.lower()
         return any(registered.name.lower() in lowered for registered in self._registry.all())
@@ -427,4 +449,4 @@ def _mask_pii(text: str) -> str:
     return masked
 
 
-__all__ = ["SafetyLayer"]
+__all__ = ["SafetyLayer", "looks_injected"]

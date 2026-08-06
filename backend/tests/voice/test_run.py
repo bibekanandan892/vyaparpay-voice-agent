@@ -13,11 +13,29 @@ import pytest
 pytest.importorskip("aiortc", reason="[voice] extra not installed")
 
 import asyncio  # noqa: E402
+import time  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
 from aiortc import RTCConfiguration, RTCPeerConnection  # noqa: E402
 
+from app.domain.types import Session, SessionState  # noqa: E402
 from app.domain.voice import SignalMessage  # noqa: E402
-from app.voice.run import PlaceholderCallSession  # noqa: E402
+from app.voice.run import (  # noqa: E402
+    KNOWLEDGE_PREFETCH_TIMEOUT_S,
+    PlaceholderCallSession,
+    _BrainStack,
+    _build_brain_stack,
+    _make_brain_factory,
+)
+from tests.conftest import SettingsFactory  # noqa: E402
+
+_SESSION = Session(
+    session_id="sess_1",
+    user_id="usr_rajesh01",
+    state=SessionState.IN_CALL,
+    started_at=datetime(2026, 7, 24, 14, 14, tzinfo=UTC),
+)
 
 
 async def _real_offer_sdp() -> str:
@@ -68,3 +86,90 @@ async def test_close_before_any_offer_does_not_hang_or_raise() -> None:
     _egress_task is still None then, and close() must handle that."""
     session = PlaceholderCallSession("sess-close-early", _noop_signal, ice_servers=())
     await asyncio.wait_for(session.close(), timeout=2)
+
+
+# --------------------------------------------------------------------------
+# Brain factory: the call-setup retrieval prefetch (Phase-5 memory wiring).
+#
+# These exist because an unwired collaborator is the failure mode this
+# repo has already shipped once — a capture pipeline that was silently
+# dead in production for a whole phase. A prefetch nobody calls looks
+# exactly like a prefetch that found nothing.
+# --------------------------------------------------------------------------
+
+
+def _make_stack(context_builder: object) -> _BrainStack:
+    session_manager = AsyncMock()
+    session_manager.attach.return_value = _SESSION
+    return _BrainStack(
+        session_manager=session_manager,
+        session_memory=MagicMock(),
+        context_builder=context_builder,  # type: ignore[arg-type]
+        prompt_builder=MagicMock(),
+        tool_executor=MagicMock(),
+        safety_layer=MagicMock(),
+        llm_router=MagicMock(),
+    )
+
+
+async def test_brain_factory_prefetches_knowledge_once_for_the_attached_session() -> None:
+    context_builder = AsyncMock()
+    factory = _make_brain_factory(
+        MagicMock(), MagicMock(), MagicMock(), _make_stack(context_builder)
+    )
+
+    await factory("sess_1")
+
+    # The whole Session object, not just its id: a prefetch handed a
+    # different session — or a synthesized one — would scope retrieval to
+    # the wrong merchant, and that is the failure this asserts against.
+    context_builder.prefetch_knowledge.assert_awaited_once_with(_SESSION)
+
+
+def test_brain_stack_wires_an_embeddings_provider_when_a_key_is_configured(
+    settings_factory: SettingsFactory,
+) -> None:
+    """The other half of the wiring nobody was exercising: `_build_brain_stack`
+    is what decides whether retrieval is available at all."""
+    stack = _build_brain_stack(
+        settings_factory(), MagicMock(), MagicMock(), MagicMock()
+    )
+
+    assert stack.context_builder._embeddings is not None  # noqa: SLF001
+
+
+def test_brain_stack_boots_with_no_openai_key_and_disables_retrieval(
+    settings_factory: SettingsFactory,
+) -> None:
+    """Security review L7. `Settings.openai_api_key` is optional and
+    `OpenAIEmbeddings` fail-fasts on a missing one, so constructing it
+    unconditionally would take the whole worker down at startup rather
+    than degrading the RAG slot — docs/09 §11's drop-rung 1 says the
+    opposite. Asserted as `is None`, the state `prefetch_knowledge` checks,
+    not merely "construction did not raise"."""
+    stack = _build_brain_stack(
+        settings_factory(openai_api_key=None), MagicMock(), MagicMock(), MagicMock()
+    )
+
+    assert stack.context_builder._embeddings is None  # noqa: SLF001
+
+
+async def test_a_hanging_prefetch_cannot_block_call_setup_forever() -> None:
+    """The bound exists because this runs on the path a merchant is
+    waiting on. Asserted against wall-clock time, so removing the
+    `wait_for` fails it rather than merely changing a log line."""
+
+    class HangingContextBuilder:
+        async def prefetch_knowledge(self, session: object) -> None:
+            await asyncio.sleep(60)
+
+    factory = _make_brain_factory(
+        MagicMock(), MagicMock(), MagicMock(), _make_stack(HangingContextBuilder())
+    )
+
+    started = time.perf_counter()
+    brain = await asyncio.wait_for(factory("sess_1"), timeout=KNOWLEDGE_PREFETCH_TIMEOUT_S + 5)
+    elapsed = time.perf_counter() - started
+
+    assert brain is not None  # the call proceeds without a knowledge slot
+    assert elapsed < KNOWLEDGE_PREFETCH_TIMEOUT_S + 2

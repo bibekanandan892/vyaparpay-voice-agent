@@ -87,6 +87,7 @@ from app.obs.logging import configure_logging, get_logger
 from app.obs.tracing import setup_observability
 from app.providers.deepgram import DeepgramStt
 from app.providers.elevenlabs import ElevenLabsTts
+from app.providers.openai_embeddings import OpenAIEmbeddings
 from app.providers.openrouter import OpenRouterLLM
 from app.tools.registry import configure as configure_tools
 from app.tools.registry import registry
@@ -97,6 +98,11 @@ from app.voice.silero import SileroVad
 from app.voice.worker import Brain
 
 log = get_logger(__name__)
+
+# Bound on the call-setup retrieval prefetch (see `_make_brain_factory`).
+# Chosen here against docs/02 §3.1's ≤1.5 s p50 call-setup budget, which
+# the prefetch runs concurrently with; no doc fixes this number.
+KNOWLEDGE_PREFETCH_TIMEOUT_S = 1.0
 
 
 class PlaceholderCallSession(CallSession):
@@ -142,8 +148,26 @@ def _build_brain_stack(
     # Phase-4 T3: ContextBuilder's slot-4/5 deps — EventLog wraps the same
     # `redis` singleton, ContextCompressor is stateless (its own docstring:
     # "one instance is safely shared across sessions/requests").
+    #
+    # Phase-5: `embeddings`/`settings` are the call-setup retrieval
+    # prefetch's collaborators (slot 7). `OpenAIEmbeddings` takes the same
+    # pooled `http` client `OpenRouterLLM` above does and is process-long
+    # by its own contract. It is constructed only when a key is
+    # configured: `Settings.openai_api_key` is optional so this worker
+    # boots without one (config.py's stated design), and passing `None`
+    # here is how ContextBuilder is told retrieval is unavailable — the
+    # supported drop-rung-1 state of docs/09 §11, not a silent failure.
+    # Slot 6 needs no new dependency: the rolling summary is a field of
+    # the `session_memory` already wired above.
+    embeddings = OpenAIEmbeddings(http, settings) if settings.openai_api_key else None
     context_builder = ContextBuilder(
-        sessionmaker, session_memory, redis, EventLog(redis), ContextCompressor()
+        sessionmaker,
+        session_memory,
+        redis,
+        EventLog(redis),
+        ContextCompressor(),
+        embeddings=embeddings,
+        settings=settings,
     )
     safety_layer = SafetyLayer(registry)
     tool_executor = ToolExecutor(
@@ -173,6 +197,35 @@ def _make_brain_factory(
 
     async def build(session_id: str) -> Brain:
         session = await stack.session_manager.attach(session_id)
+        # Judgment call 7 (Phase-5): the call-setup retrieval prefetch
+        # (docs/02 §3.1) runs here, once, between attach and the first
+        # turn. This is the dead time that diagram puts it in — the brain
+        # is built while the client is still negotiating ICE/DTLS, and
+        # `VoiceAgentWorker` does not run a turn until media flows.
+        #
+        # Awaited, not `create_task`d, and bounded: awaiting keeps the
+        # ordering deterministic (either the slot is ready before turn 1
+        # or it demonstrably was not) and avoids a detached task whose
+        # failure would surface nowhere, while the bound keeps a slow
+        # embeddings vendor from eating the ≤1.5 s p50 setup budget
+        # docs/02 §3.1 owns. The 1 s figure is a choice made here against
+        # that budget, not a number any doc fixes.
+        #
+        # `prefetch_knowledge` never raises (its own docstring), so the
+        # only thing that can escape is the timeout, and on timeout the
+        # call proceeds with an empty knowledge slot — drop-rung 1,
+        # docs/08 §5.2. What is NOT claimed: that the slot is populated
+        # before the first word. A timeout, a missing key, or a merchant
+        # whose screen carried no error all leave it empty, and
+        # `ContextBuilder` renders that honestly rather than as absence
+        # of fact.
+        try:
+            await asyncio.wait_for(
+                stack.context_builder.prefetch_knowledge(session),
+                timeout=KNOWLEDGE_PREFETCH_TIMEOUT_S,
+            )
+        except TimeoutError:
+            log.warning("voice_worker.knowledge_prefetch_timeout", session_id=session_id)
         cost_tracker = CostTracker(settings, session_factory=sessionmaker, redis=redis)
         return ConversationManager(
             session=session,
