@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
 from aiortc import RTCConfiguration, RTCPeerConnection  # noqa: E402
 
-from app.domain.types import Session, SessionState  # noqa: E402
+import app.voice.run as run_module  # noqa: E402
+from app.data.redis_client import SESSION_CONTROL_END, RedisClient  # noqa: E402
+from app.domain.types import EndReason, Session, SessionState  # noqa: E402
 from app.domain.voice import SignalMessage  # noqa: E402
 from app.voice.run import (  # noqa: E402
     KNOWLEDGE_PREFETCH_TIMEOUT_S,
@@ -27,8 +29,10 @@ from app.voice.run import (  # noqa: E402
     _BrainStack,
     _build_brain_stack,
     _make_brain_factory,
+    _run_session_control_subscriber,
 )
 from tests.conftest import SettingsFactory  # noqa: E402
+from tests.support.fake_redis import FakeRedis  # noqa: E402
 
 _SESSION = Session(
     session_id="sess_1",
@@ -173,3 +177,172 @@ async def test_a_hanging_prefetch_cannot_block_call_setup_forever() -> None:
 
     assert brain is not None  # the call proceeds without a knowledge slot
     assert elapsed < KNOWLEDGE_PREFETCH_TIMEOUT_S + 2
+
+
+# --------------------------------------------------------------------------
+# Post-call-pipeline-wiring: `_make_brain_factory`'s `on_call_ended`
+# closure must finalize THIS call's CostTracker before ending the session,
+# with the literal session_id/reason it was invoked with — the ordering
+# `SessionManager.end()` itself enforces by raising `RuntimeError` when
+# violated (session_manager.py judgment call 9).
+# --------------------------------------------------------------------------
+
+
+async def test_on_call_ended_finalizes_then_ends_with_the_literal_session_id_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patches `CostTracker` itself (rather than trying to drive the real
+    one through mocked Postgres/Redis) so this test is purely about what
+    `run.py`'s own wiring code does: call `finalize(session_id)` BEFORE
+    `end(session_id, reason)`, on the SAME `CostTracker` instance
+    `ConversationManager` is holding, with values that are literal here —
+    never derived by calling back into the factory's own recorded args."""
+    calls: list[tuple[str, ...]] = []
+
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def finalize(self, session_id: str) -> None:
+            calls.append(("finalize", session_id))
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+
+    async def _end(session_id: str, reason: EndReason) -> None:
+        calls.append(("end", session_id, reason.value))
+
+    stack = _make_stack(AsyncMock())
+    stack.session_manager.end.side_effect = _end
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+    await built.on_call_ended(EndReason.HANGUP)
+
+    assert calls == [("finalize", "sess_1"), ("end", "sess_1", "hangup")]
+
+
+async def test_on_call_ended_forwards_the_error_reason_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second, independent case for the reason argument specifically —
+    proves `on_call_ended` doesn't hardcode HANGUP or otherwise drop the
+    reason the worker computed."""
+    calls: list[tuple[str, ...]] = []
+
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def finalize(self, session_id: str) -> None:
+            calls.append(("finalize", session_id))
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+
+    async def _end(session_id: str, reason: EndReason) -> None:
+        calls.append(("end", session_id, reason.value))
+
+    stack = _make_stack(AsyncMock())
+    stack.session_manager.end.side_effect = _end
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+    await built.on_call_ended(EndReason.ERROR)
+
+    assert calls == [("finalize", "sess_1"), ("end", "sess_1", "error")]
+
+
+# --------------------------------------------------------------------------
+# The session_control:{id} subscriber — the missing half of docs/13 §2.2's
+# operator DELETE (sessions.py's own judgment call 1: agent-api publishes
+# "end" into a channel nothing was ever listening on).
+# --------------------------------------------------------------------------
+
+
+class _SpyServer:
+    """`SignalingServer`-shaped double: records `close_one()` calls
+    without needing a real signaling stack — the subscriber's OWN
+    behavior (parse the channel, filter the message, call close_one) is
+    what this proves; close_one()'s own correctness has its own tests in
+    tests/voice/test_signaling_server.py."""
+
+    def __init__(self, *, closed_return: bool = True) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._closed_return = closed_return
+
+    async def close_one(self, session_id: str, *, reason: str) -> bool:
+        self.calls.append((session_id, reason))
+        return self._closed_return
+
+
+async def test_session_control_subscriber_closes_the_session_on_end_message() -> None:
+    fake_redis = FakeRedis()
+    redis = RedisClient(fake_redis, session_ttl_seconds=60)  # type: ignore[arg-type]
+    server = _SpyServer()
+
+    task = asyncio.create_task(_run_session_control_subscriber(redis, server))  # type: ignore[arg-type]
+    try:
+        await asyncio.sleep(0)  # let the subscriber's psubscribe land first
+        await redis.publish_session_control("sess_1", SESSION_CONTROL_END)
+        for _ in range(50):
+            if server.calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    # The literal (session_id, reason) pair — not re-derived from the
+    # subscriber's own call — and nothing else on the channel.
+    assert server.calls == [("sess_1", "operator_hangup")]
+
+
+async def test_session_control_subscriber_ignores_non_end_messages() -> None:
+    fake_redis = FakeRedis()
+    redis = RedisClient(fake_redis, session_ttl_seconds=60)  # type: ignore[arg-type]
+    server = _SpyServer()
+
+    task = asyncio.create_task(_run_session_control_subscriber(redis, server))  # type: ignore[arg-type]
+    try:
+        await asyncio.sleep(0)
+        await redis.publish_session_control("sess_1", "some-other-message")
+        # A real message right after — if the subscriber were wedged by
+        # the ignored one, this would never arrive either.
+        await redis.publish_session_control("sess_2", SESSION_CONTROL_END)
+        for _ in range(50):
+            if server.calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert server.calls == [("sess_2", "operator_hangup")]
+
+
+async def test_session_control_subscriber_survives_a_handler_exception() -> None:
+    """House rule: one bad message must not take the whole subscriber (and
+    therefore every future operator hang-up on this worker) down with it."""
+    fake_redis = FakeRedis()
+    redis = RedisClient(fake_redis, session_ttl_seconds=60)  # type: ignore[arg-type]
+
+    class _ExplodingThenSpyServer(_SpyServer):
+        async def close_one(self, session_id: str, *, reason: str) -> bool:
+            if session_id == "sess-boom":
+                raise RuntimeError("boom")
+            return await super().close_one(session_id, reason=reason)
+
+    server = _ExplodingThenSpyServer()
+    task = asyncio.create_task(_run_session_control_subscriber(redis, server))  # type: ignore[arg-type]
+    try:
+        await asyncio.sleep(0)
+        await redis.publish_session_control("sess-boom", SESSION_CONTROL_END)
+        await redis.publish_session_control("sess_2", SESSION_CONTROL_END)
+        for _ in range(50):
+            if server.calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert server.calls == [("sess_2", "operator_hangup")]

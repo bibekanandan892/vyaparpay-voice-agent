@@ -30,8 +30,9 @@ below rather than redefined, per the plan's single-error-vocabulary rule.
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 import orjson
@@ -93,6 +94,19 @@ def _session_control_channel(session_id: str) -> str:
     # publishes here and the voice-worker that owns the peer connection
     # reacts. Same colon-delimited namespace discipline as the keys above.
     return f"session_control:{_reject_key_delimiter(session_id, field='session_id')}"
+
+
+# The pattern the voice-worker process psubscribes to once, for its whole
+# lifetime, to hear every session's control channel on one connection
+# rather than opening a subscription per live call.
+_SESSION_CONTROL_PATTERN: Final = "session_control:*"
+
+# The one control message DELETE /v1/sessions/{id} publishes (sessions.py's
+# own judgment call 1: "One word, no envelope"). Defined here, not in
+# sessions.py, because this module already owns every fact about the
+# channel's name and shape; sessions.py imports and re-exports it rather
+# than defining a second copy that could drift.
+SESSION_CONTROL_END: Final = "end"
 
 
 def _idempotency_key(session_id: str, tool_name: str, turn_no: int) -> str:
@@ -358,6 +372,36 @@ class RedisClient:
         """
         return int(await self._redis.publish(_session_control_channel(session_id), message))
 
+    async def subscribe_session_control(self) -> AsyncIterator[tuple[str, str]]:
+        """The read side of `publish_session_control()`: every
+        `session_control:{id}` message published while this generator is
+        alive, as `(session_id, message)` pairs — one process-wide
+        `PSUBSCRIBE session_control:*` rather than a subscription per live
+        call, since the voice-worker does not know which session ids it
+        will own until calls arrive.
+
+        An unbounded generator by design: the caller (run.py's subscriber
+        loop) owns its lifetime and ends it by cancelling the task that is
+        iterating it, which unwinds through this `finally` and closes the
+        pubsub connection. Messages on channels that are not
+        `session_control:*` never reach here — the psubscribe pattern is
+        the only filter, enforced by the server, not by this generator.
+        """
+        pubsub = self._redis.pubsub()
+        await pubsub.psubscribe(_SESSION_CONTROL_PATTERN)
+        try:
+            async for message in pubsub.listen():
+                if message.get("type") != "pmessage":
+                    # subscribe/psubscribe confirmations and any other
+                    # pubsub bookkeeping frame — not a published control
+                    # message.
+                    continue
+                channel = _as_str(message["channel"]) or ""
+                session_id = channel.removeprefix("session_control:")
+                yield session_id, _as_str(message["data"]) or ""
+        finally:
+            await pubsub.aclose()
+
 
 async def enforce_rate(redis: Redis, user_id: str, *, limit: int, window_s: int = 60) -> None:
     """Sliding-window rate limiter, reproduced verbatim from docs/04 §6 —
@@ -383,4 +427,4 @@ async def enforce_rate(redis: Redis, user_id: str, *, limit: int, window_s: int 
         raise RateLimitedError(retry_after=window_s)
 
 
-__all__ = ["RedisClient", "enforce_rate"]
+__all__ = ["SESSION_CONTROL_END", "RedisClient", "enforce_rate"]

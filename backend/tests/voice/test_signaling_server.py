@@ -499,6 +499,96 @@ async def test_close_all_sends_bye_and_tears_down(server, redis_client):
 
 
 # ---------------------------------------------------------------------------
+# close_one() — the operator-DELETE convergence point (post-call-pipeline-
+# wiring task): the single-session primitive close_all() also reduces to,
+# and the session_control:{id} subscriber (run.py) calls directly.
+# ---------------------------------------------------------------------------
+
+
+async def test_close_one_closes_a_live_session_and_sends_bye(server, redis_client):
+    sig_server, created = server
+    transport = FakeTransport()
+    task = await _connect(sig_server, transport, token=await _mint_and_store(redis_client))
+
+    result = await sig_server.close_one(SESSION_ID, reason="operator_hangup")
+    await asyncio.wait_for(task, timeout=2)
+
+    assert result is True
+    byes = [e for e in transport.envelopes() if e["type"] == SIG_TYPE_BYE]
+    assert byes == [{"v": 1, "type": "bye", "payload": {"reason": "operator_hangup"}}]
+    assert created[0].closed
+    assert transport.closed
+    assert sig_server.active_sessions == ()
+
+
+async def test_close_one_on_an_unknown_session_is_a_safe_no_op(server):
+    """A repeat operator DELETE, or one that lands after the call already
+    ended some other way (docs/13 §2.2: "a repeat call returns the same
+    body"), must not raise or touch anything — this is the routine case,
+    not an error, per the subscriber's own docstring."""
+    sig_server, created = server
+
+    result = await sig_server.close_one("no-such-session", reason="operator_hangup")
+
+    assert result is False
+    assert created == []
+    assert sig_server.active_sessions == ()
+
+
+async def test_close_one_racing_the_clients_own_bye_never_double_processes(
+    server, redis_client
+):
+    """The literal race the double-invocation guard is about: an operator
+    DELETE landing while the client is independently hanging up. Whichever
+    of `close_one()` and `handle_connection`'s own bye-triggered finally
+    pops `_active` first is the one that actually tears the call down —
+    proven here by close_one() running BEFORE the fed bye frame is ever
+    read off the transport (feeding a frame only queues it; nothing yields
+    to the connection task until this test itself awaits), so close_one()
+    wins the pop deterministically and the client's still-queued bye must
+    not cause a second real teardown or raise when handle_connection's own
+    finally runs afterward."""
+    sig_server, created = server
+    transport = FakeTransport()
+    task = await _connect(sig_server, transport, token=await _mint_and_store(redis_client))
+
+    transport.feed(_frame("bye", {"reason": "user_hangup"}))  # queued, not yet read
+    result = await sig_server.close_one(SESSION_ID, reason="operator_hangup")
+    await asyncio.wait_for(task, timeout=2)
+
+    assert result is True, "close_one popped the live call before the queued bye was read"
+    assert created[0].closed
+    assert transport.closed
+    assert sig_server.active_sessions == ()
+    # The queued bye never got a chance to run its own teardown a second
+    # time — only one bye envelope went out, close_one()'s.
+    byes = [e for e in transport.envelopes() if e["type"] == SIG_TYPE_BYE]
+    assert byes == [{"v": 1, "type": "bye", "payload": {"reason": "operator_hangup"}}]
+
+
+async def test_close_one_after_the_client_already_said_bye_is_a_safe_no_op(
+    server, redis_client
+):
+    """The other ordering of the same race: the client's bye is processed
+    (and `_active` popped by `handle_connection`'s own finally) before the
+    operator DELETE's close_one() runs — e.g. pub/sub delivery lagging a
+    fast client hangup. close_one() must find nothing and report False,
+    not raise."""
+    sig_server, created = server
+    transport = FakeTransport()
+    task = await _connect(sig_server, transport, token=await _mint_and_store(redis_client))
+
+    transport.feed(_frame("bye", {"reason": "user_hangup"}))
+    await asyncio.wait_for(task, timeout=2)  # the client's own bye fully processed first
+
+    result = await sig_server.close_one(SESSION_ID, reason="operator_hangup")
+
+    assert result is False
+    assert created[0].closed  # already closed by the client-bye path
+    assert sig_server.active_sessions == ()
+
+
+# ---------------------------------------------------------------------------
 # handle_websocket adapter (path + query parsing)
 # ---------------------------------------------------------------------------
 

@@ -102,7 +102,7 @@ from app.config import Settings
 from app.context.context_compressor import ContextCompressor
 from app.context.event_log import EventLog
 from app.context.snapshot_ingestor import SnapshotIngestor
-from app.data.redis_client import RedisClient
+from app.data.redis_client import SESSION_CONTROL_END, RedisClient
 from app.data.repositories import ConversationRepo, ToolAuditRepo
 from app.domain.types import SessionState, SessionUser, ToolInvocationStatus
 from app.domain.voice import SessionCredentials
@@ -114,9 +114,11 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 # The control message DELETE publishes on `session_control:{id}` for the
-# voice-worker (judgment call 1). One word, no envelope: this channel
-# carries operator intent, not the docs/13 §6 signaling protocol.
-SESSION_CONTROL_END: Final = "end"
+# voice-worker (judgment call 1) — one word, no envelope: this channel
+# carries operator intent, not the docs/13 §6 signaling protocol. Defined
+# in redis_client.py (the module that owns the channel's name and shape)
+# and re-exported here so existing callers/tests importing it from this
+# route module keep working.
 
 # docs/13 §2.3's `resolution.type` for the canonical incident's outcome.
 _RESOLUTION_LIMIT_INCREASE: Final = "limit_increase_requested"

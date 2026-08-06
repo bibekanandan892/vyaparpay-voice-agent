@@ -54,11 +54,20 @@ Judgment calls, flagged per house style:
    §6.1 sequence puts the 10 s loop on the client, and the server's
    liveness signal is the connection itself.
 8. **Every teardown path converges**: client `bye`, transport EOF,
-   transport error, and server shutdown all run the same finally block —
-   unregister, `peer.close()`, close the transport. `close_all()` (run.py
-   SIGTERM) additionally sends a `bye {reason: agent_hangup}` first so a
-   live client learns the call ended cleanly (docs/13 §6's bye is
-   bidirectional).
+   transport error, server shutdown, and operator `DELETE
+   /v1/sessions/{id}` all run the same finally-block shape — unregister,
+   `peer.close()`, close the transport — which is what lets
+   `VoiceAgentWorker.run()`'s own finally (worker.py) be the ONE place
+   that runs finalize+end for every hangup, regardless of which side
+   the goodbye started. `close_all()` (run.py SIGTERM) and `close_one()`
+   (run.py's `session_control:{id}` subscriber, the operator-DELETE
+   path) additionally send a `bye {reason}` first so a live client
+   learns the call ended cleanly (docs/13 §6's bye is bidirectional).
+   `close_one()` pops from `_active` before any await (its own
+   docstring), so it and `handle_connection`'s own finally can race the
+   same session id without both tearing it down — the same "pop-then-
+   close, `peer.close()` is idempotent" safety `close_all()` already
+   relied on, generalized to the single-session case.
 """
 
 from __future__ import annotations
@@ -261,20 +270,48 @@ class SignalingServer:
             return False
         return True
 
+    async def close_one(self, session_id: str, *, reason: str) -> bool:
+        """Bye + close exactly one live call, by session_id — the
+        single-session primitive both `close_all()` (shutdown, below) and
+        the `session_control:{id}` subscriber (run.py, the operator-DELETE
+        path per docs/13 §2.2) reduce to.
+
+        Pops from `_active` FIRST, synchronously, before any `await`: this
+        is the single-owner gate against the exact race the operator path
+        introduces — a `DELETE` landing while the client is independently
+        sending its own `bye` (or disconnecting). Whichever of the two
+        pops the entry first is the one that tears it down; the other
+        finds `None` here and no-ops. This mirrors `close_all()`'s
+        existing, documented safety against racing `handle_connection`'s
+        own `finally` (judgment call 8: "both sides pop-then-close and
+        `peer.close()` is idempotent") — this method is just that same
+        guarantee, callable for one session instead of all of them.
+
+        Returns `False` (no-op) when no call was live for this
+        `session_id` — already ended, unknown id, or lost the race —
+        `True` when this call actually closed one. The caller (the
+        subscriber loop) treats `False` as ordinary, not an error: pub/sub
+        redelivery and a repeat operator DELETE (docs/13 §2.2: "a repeat
+        call returns the same body") both produce it routinely."""
+        call = self._active.pop(session_id, None)
+        if call is None:
+            return False
+        try:
+            await self._send(
+                call.transport, SignalMessage(type=SIG_TYPE_BYE, payload={"reason": reason})
+            )
+        except Exception:
+            log.warning("signaling.bye_send_failed", session_id=session_id, reason=reason)
+        await self._close_peer(call.peer, session_id)
+        await self._close_transport(call.transport, _WS_GOING_AWAY, reason)
+        return True
+
     async def close_all(self, *, reason: str = "agent_hangup") -> None:
         """Graceful shutdown (judgment call 8): bye every live client, close
         every peer and transport. Safe to race the per-connection finally —
         both sides pop-then-close and `peer.close()` is idempotent."""
-        for session_id, call in list(self._active.items()):
-            self._active.pop(session_id, None)
-            try:
-                await self._send(call.transport, SignalMessage(
-                    type=SIG_TYPE_BYE, payload={"reason": reason}
-                ))
-            except Exception:
-                log.warning("signaling.shutdown_bye_failed", session_id=session_id)
-            await self._close_peer(call.peer, session_id)
-            await self._close_transport(call.transport, _WS_GOING_AWAY, "server shutting down")
+        for session_id in list(self._active):
+            await self.close_one(session_id, reason=reason)
 
     # ------------------------------------------------------------------
     # Message routing

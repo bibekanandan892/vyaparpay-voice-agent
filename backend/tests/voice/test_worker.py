@@ -37,6 +37,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E4
 from opentelemetry.util._once import Once  # noqa: E402
 
 from app.config import Settings  # noqa: E402
+from app.domain.types import EndReason  # noqa: E402
 from app.domain.voice import (  # noqa: E402
     DC_TYPE_AGENT_STATE,
     DC_TYPE_TRANSCRIPT_FINAL,
@@ -59,7 +60,7 @@ from app.voice import worker as worker_module  # noqa: E402
 from app.voice.audio_egress import FlushResult  # noqa: E402
 from app.voice.audio_ingress import VAD_HOP_BYTES  # noqa: E402
 from app.voice.stt_supervisor import SttSupervisor  # noqa: E402
-from app.voice.worker import REASK_TEXT, VoiceAgentWorker  # noqa: E402
+from app.voice.worker import REASK_TEXT, BuiltBrain, VoiceAgentWorker  # noqa: E402
 from tests.fakes import (  # noqa: E402
     FAKE_TTS_MS_PER_CHAR,
     FakeBrain,
@@ -169,6 +170,7 @@ class Rig:
         *,
         egress: FakeEgress | None = None,
         stt_final_timeout_s: float = 0.2,
+        vad: VadModel | None = None,
     ) -> None:
         from app.voice.audio_ingress import AudioIngress
 
@@ -177,9 +179,14 @@ class Rig:
         self.stt = FakeStt()
         self.tts = FakeTts()
         self.brain = FakeBrain()
-        self.vad = FakeVad()
+        self.vad = vad if vad is not None else FakeVad()
         self.clock = _FakeClock()
         self.messages: list[DataChannelMessage] = []
+        # Post-call-pipeline-wiring: what `on_call_ended(reason)` was
+        # invoked with, in call order — empty until the worker's `run()`
+        # actually returns (`rig.stop()` or a crash), never computed by
+        # calling back into the worker itself.
+        self.on_call_ended_calls: list[EndReason] = []
         self.worker = VoiceAgentWorker(
             "sess-worker",
             ingress=self.ingress,
@@ -199,8 +206,11 @@ class Rig:
         )
         self._task: asyncio.Task[None] | None = None
 
-    async def _build_brain(self) -> FakeBrain:
-        return self.brain
+    async def _build_brain(self) -> BuiltBrain:
+        return BuiltBrain(brain=self.brain, on_call_ended=self._on_call_ended)
+
+    async def _on_call_ended(self, reason: EndReason) -> None:
+        self.on_call_ended_calls.append(reason)
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self.worker.run(), name="rig-worker")
@@ -853,3 +863,88 @@ async def test_audio_queued_but_never_consumed_is_not_billed(settings: Settings)
     # this the test could not tell the two metering sites apart.
     assert 0 < consumed_bytes < 3 * VAD_HOP_BYTES
     assert sum(metered) == pytest.approx(consumed_bytes / 32_000)
+
+
+# --------------------------------------------------------------------------
+# Post-call finalize+end wiring (docs/05 §3.1, docs/09 §8;
+# post-call-pipeline-wiring task) — `run()`'s `finally` must call
+# `on_call_ended(reason)` exactly once, with a literal expected reason,
+# for both the graceful-stop path and a genuine worker crash.
+# --------------------------------------------------------------------------
+
+
+class _CrashingVad:
+    """`VadModel` double that raises on its very first `prob()` call — a
+    deliberate, purpose-built "worker crash" trigger (an exception
+    genuinely escaping the task group), distinct from every graceful
+    teardown path this file's other tests already cover. Not `FakeVad`
+    running dry by accident: this exists so the crash is the test's
+    stated intent, not a side effect of under-scripting a fake."""
+
+    def prob(self, frame_30ms: bytes) -> float:
+        raise RuntimeError("vad model crashed")
+
+
+async def test_graceful_stop_calls_on_call_ended_with_hangup(settings: Settings) -> None:
+    """Client bye / transport EOF / transport error / operator-close all
+    reduce to the same thing from the worker's point of view: the ingress
+    fan-outs end and the task group exits normally. That must run the
+    post-call hook exactly once, with the literal `EndReason.HANGUP` —
+    not a value re-derived from the code under test."""
+    rig = Rig(settings)
+    rig.brain.script("Understood.")
+    await rig.start()
+    try:
+        await _open_turn(rig, "What happened to my payment?")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the agent transcript final",
+        )
+    finally:
+        await rig.stop()
+
+    assert rig.on_call_ended_calls == [EndReason.HANGUP]
+
+
+async def test_worker_crash_calls_on_call_ended_with_error(settings: Settings) -> None:
+    """A real exception escaping the task group — here, the VAD model
+    itself raising mid-frame — must still finalize the call (turns that
+    already ran spent real money) and must flip the reason to the
+    literal `EndReason.ERROR`, not silently disappear as a bare task
+    failure with no `call_costs` row and no `conversations.state` flip."""
+    rig = Rig(settings, vad=cast(VadModel, _CrashingVad()))
+    await rig.start()
+
+    rig.ingress.push_pcm(HOP_PCM, sample_rate=16_000)  # the crashing frame
+
+    # asyncio.TaskGroup wraps the vad_loop task's RuntimeError in an
+    # ExceptionGroup (Python 3.11+) even though only one child failed.
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await asyncio.wait_for(rig._task, timeout=5)  # noqa: SLF001
+    assert any(isinstance(e, RuntimeError) for e in exc_info.value.exceptions)
+
+    assert rig.on_call_ended_calls == [EndReason.ERROR]
+
+
+async def test_on_call_ended_failure_is_not_swallowed(settings: Settings) -> None:
+    """House rule: never silently swallow an error. If the post-call hook
+    itself raises (e.g. Postgres down at hang-up, docs/09 §11), `run()`
+    must propagate it rather than returning as if the call finalized
+    cleanly — the caller (CallSession's worker task) is what surfaces
+    this loudly today (`_log_worker_crash`), and it can only do that if
+    the exception actually reaches the task."""
+    rig = Rig(settings)
+
+    async def _exploding_on_call_ended(reason: EndReason) -> None:
+        raise RuntimeError("postgres is down")
+
+    async def _build_brain() -> BuiltBrain:
+        return BuiltBrain(brain=rig.brain, on_call_ended=_exploding_on_call_ended)
+
+    rig.worker._brain_factory = _build_brain  # type: ignore[attr-defined]  # noqa: SLF001
+
+    await rig.start()
+    rig.ingress.close()
+
+    with pytest.raises(RuntimeError, match="postgres is down"):
+        await asyncio.wait_for(rig._task, timeout=5)  # noqa: SLF001
