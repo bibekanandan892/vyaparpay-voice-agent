@@ -109,16 +109,28 @@ Judgment calls made in this module, flagged per house style:
      alone. It is being read here as the *memory* layer it is, layered
      over registration data that doc's example does not mention;
      docs/11 §4's rendered line is reproduced either way.
-   - docs/11 §1 annotates the slot "NO balances/statuses here — those
-     are tool-only", and an issue summary can carry rupee figures
-     (docs/09 §5.1's canonical entry is "Daily limit increase requested:
-     ₹25,000 → ₹50,000"). The two docs genuinely pull against each other
-     and docs/09 owns this field, so the summary renders as stored. What
-     keeps that safe is not this module: `SafetyLayer.screen_output`
-     blocks any turn whose reply voices a rupee amount or reference id
-     absent from that turn's tool results (docs/10 §1 invariant 1), so a
-     figure the model reads here cannot be spoken without a tool call
-     that returned it.
+   - docs/11 §1 annotates the slot "NO balances/**statuses** here — those
+     are tool-only", while docs/09 §5.1 shows `open_issues` rendering
+     into it with both a status and rupee figures. The conflict is real
+     and it is split rather than resolved wholesale: the **status is not
+     rendered**, the summary is. `app/memory/slots.render_open_issues`
+     carries the full argument — short version, the status is the only
+     part that asserts how things stand *now*, it can be days stale
+     because only the post-call merge writes this row, and there is no
+     mechanical check over it.
+
+     An earlier version of this note claimed `SafetyLayer.screen_output`
+     was the backstop that made rendering safe. **That was false and it
+     was load-bearing**, so it is corrected here rather than quietly
+     deleted (security review HIGH-2): `screen_output` matches *digit*
+     amounts and fully-formed reference ids only — `safety_layer.py`'s own
+     honesty note 3 says word forms are out of scope, and this is a voice
+     agent whose persona tells the model to speak numbers as words, so
+     "raise your limit to fifty thousand" passes it untouched. It has no
+     status check whatsoever. Nothing enforced protects what this slot
+     puts in front of the model; what is left is the header
+     `render_open_issues` writes, which is a prompt-level mitigation and
+     is described as one.
 
 8. **Slot 6 is a per-turn Redis read; slot 7 is not a per-turn pgvector
    query.** docs/06 §4.1 spells out what the 15/40 ms `context.build`
@@ -174,6 +186,29 @@ does not own, which is the same reason slot 7's prefetch had to land in
 Redis. What this task did add is a second Postgres query per turn, on
 the same session and therefore serial with the first.
 
+## What this wiring actually does in a deployed system today
+
+Nothing writes any of the three sources, so the wiring is live and its
+inputs are not. Verified by grep at the time of writing, not assumed:
+
+- `Summarizer` is constructed nowhere outside its own module, so
+  `SessionMemory.get_summary` returns `None` and slot 6 renders `""` on
+  every turn of every call.
+- Nothing inserts `memory_chunks` — not `scripts/seed.py`, not migration
+  0002 — so retrieval returns no rows and slot 7 renders
+  `KNOWLEDGE_UNAVAILABLE` on every turn.
+- `UserProfileMemory.merge_post_call` has no caller in `app/`, so every
+  `user_profiles` read returns the empty profile and slot 3 renders the
+  merchants line alone.
+
+So the observable effect of this commit on a running call is: the
+slot-tag escape applied to every slot, and **+132 uncached tokens per
+turn** of "retrieval produced nothing" in slot 7. That is worth stating
+plainly because it moves the severity of everything else — the injection
+and staleness surfaces are dormant until a writer lands, while the two
+things that *are* live are the escape and the `ctx:{session_id}:knowledge`
+key's tenant scoping, which is why those carry the strongest tests.
+
 ## What was and was not measured against the 40 ms budget
 
 The in-process cost of `build()` was benchmarked before and after this
@@ -211,7 +246,6 @@ from app.config import Settings
 from app.context.context_compressor import TIMELINE_MAX_EVENTS, ContextCompressor
 from app.context.event_log import EventLog
 from app.context.redis_keys import CTX_TTL_SECONDS, _ctx_key, _ctx_knowledge_key
-from app.context.token_estimate import estimate_tokens
 from app.data.redis_client import RedisClient
 from app.data.repositories.merchant_repo import MerchantRepo
 from app.data.repositories.semantic_repo import SemanticRepo
@@ -223,6 +257,7 @@ from app.memory.session_memory import SessionMemory
 from app.memory.slots import (
     KNOWLEDGE_UNAVAILABLE,
     PROFILE_SLOT_BUDGET,
+    _rendered_tokens,
     render_knowledge_slot,
     render_open_issues,
     render_summary_slot,
@@ -312,7 +347,7 @@ def _compose_profile_slot(merchant: Merchant, profile: UserProfile) -> str:
     """
     identity = _format_profile(merchant)
     issues = render_open_issues(
-        profile.open_issues, token_budget=PROFILE_SLOT_BUDGET - estimate_tokens(identity)
+        profile.open_issues, token_budget=PROFILE_SLOT_BUDGET - _rendered_tokens(identity)
     )
     return f"{identity}\n{issues}" if issues else identity
 
@@ -468,9 +503,16 @@ class ContextBuilder:
                 # the two slots this task added; the budget is not
                 # enforced by truncation here (judgment call #8's note on
                 # slot 6, `app/memory/slots.py` on slot 7).
-                summary_tokens = estimate_tokens(memory_summary)
+                #
+                # Measured post-escape, like every other budget check
+                # (`slots._rendered_tokens`): the escape expands, so an
+                # estimate taken on the pre-escape string would understate
+                # what the model is actually sent, which for a *trace
+                # attribute* is worse than for a budget — it is the number
+                # an operator would use to explain a cost regression.
+                summary_tokens = _rendered_tokens(memory_summary)
                 safe_set_attribute(span, "memory_summary_tokens", summary_tokens)
-                safe_set_attribute(span, "knowledge_tokens", estimate_tokens(knowledge))
+                safe_set_attribute(span, "knowledge_tokens", _rendered_tokens(knowledge))
                 if summary_tokens > SUMMARY_TOKEN_BUDGET:
                     # Same policy as the write side (`Summarizer`'s
                     # judgment call #4): warn, never truncate — a cut here

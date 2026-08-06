@@ -87,6 +87,13 @@ existing decision rather than inventing one:
   a mid-string cut would land inside the rupee amounts and reference ids
   docs/09 §4.2 requires be preserved verbatim. This module returns the
   text; `ContextBuilder` records the estimate and warns.
+
+Every budget check goes through `_rendered_tokens`, which measures the
+**escaped** string — the one `PromptBuilder` will actually emit. Taking
+the budget before escaping was a real gap (security review M6): the
+escape expands, so a slot measured at 300 tokens reached the model at
+487. This module never escapes; it only measures the same function
+`PromptBuilder._render_slot` applies.
 """
 
 from __future__ import annotations
@@ -94,6 +101,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final
 
+from app.agent.prompt_builder import escape_slot_tags
 from app.agent.safety_layer import looks_injected
 from app.context.token_estimate import CHARS_PER_TOKEN, SAFETY_MARGIN, estimate_tokens
 from app.domain.types import (
@@ -104,12 +112,30 @@ from app.domain.types import (
     RollingSummary,
 )
 
-# docs/11 §1's slot budgets. `SUMMARY_SLOT_BUDGET` is not redefined here:
-# `Summarizer.SUMMARY_TOKEN_BUDGET` is the same number for the same slot
-# and importing it keeps one definition, so the writer and the reader
-# cannot disagree about what fits.
+# docs/11 §1's slot budgets for the two slots this module renders whole.
+# Slot 6's budget is NOT restated here — `ContextBuilder` imports
+# `Summarizer.SUMMARY_TOKEN_BUDGET` for it, because the fold that writes
+# the summary and the read that renders it must agree on one number, and
+# the writer already owns it.
 PROFILE_SLOT_BUDGET: Final = 200
 KNOWLEDGE_SLOT_BUDGET: Final = 300
+
+
+def _rendered_tokens(text: str) -> int:
+    """Estimated tokens of `text` **as `PromptBuilder` will render it**.
+
+    Security review M6: `escape_slot_tags` expands content (up to ~1.62x
+    on a string that is all tag tokens, and the content here is
+    merchant-influenceable), so a budget taken on the pre-escape string
+    is a budget on something that never reaches the model. A knowledge
+    slot measured at exactly 300 tokens rendered at 487.
+
+    This module does not escape — `PromptBuilder._render_slot` is still
+    the only place that does, so there is no double-escaping — it only
+    measures the same function's output, which is what keeps the
+    measurement and the rendering from drifting apart.
+    """
+    return estimate_tokens(escape_slot_tags(text))
 
 _ELLIPSIS: Final = "…"
 
@@ -139,8 +165,19 @@ _WORD_BOUNDARY_WINDOW: Final = 32
 # The cap applies to the WHOLE rendered entry, prefix included — a
 # `[past call 0.75] ` prefix is 17 characters that have to come from
 # somewhere, and taking them off the body is the only place they can.
+#
+# The header and the `RETRIEVAL_TOP_K` newlines that join everything come
+# off the top for the same reason: whatever the entries do not get is
+# what the slot spends elsewhere. `render_knowledge_slot` explains why
+# the header earns its ~28 tokens.
+KNOWLEDGE_HEADER: Final = (
+    "Support excerpts, retrieved once at call open for the caller's screen; "
+    "not refreshed since:"
+)
 _SLOT_CHAR_BUDGET: Final = int(KNOWLEDGE_SLOT_BUDGET * CHARS_PER_TOKEN / SAFETY_MARGIN)
-_ENTRY_CHAR_BUDGET: Final = (_SLOT_CHAR_BUDGET - (RETRIEVAL_TOP_K - 1)) // RETRIEVAL_TOP_K
+_ENTRY_CHAR_BUDGET: Final = (
+    _SLOT_CHAR_BUDGET - len(KNOWLEDGE_HEADER) - RETRIEVAL_TOP_K
+) // RETRIEVAL_TOP_K
 
 # The rendered prefix per retrieved chunk. docs/11 §4's worked example
 # shows `[kb 0.83] ...` for a KB article and shows nothing at all for a
@@ -176,24 +213,42 @@ KNOWLEDGE_UNAVAILABLE: Final = (
 )
 
 
+# The profile slot's issue header. Fixed string, so slot 3 stays
+# byte-stable within a call. It states the two things the entries below
+# cannot state for themselves: that each was open when its call ended,
+# and that nothing has re-checked it since. See `render_open_issues` for
+# why the stored `status` is not rendered at all.
+OPEN_ISSUES_HEADER: Final = (
+    "Open issues recorded on earlier calls. Each was open when that call ended and "
+    "nothing has re-checked it since, so do not state or imply its current status — "
+    "call the matching tool first:"
+)
+
+
 def _truncate_to_chars(text: str, max_chars: int) -> str:
     """Trim `text` to at most `max_chars`, at a word boundary, marking the
     cut with a trailing ellipsis.
 
     The ellipsis is inside the budget, not added on top of it, so the
-    result really is `<= max_chars` — an off-by-one here would be
-    invisible until three at-budget entries pushed the slot over.
+    result really is `<= max_chars` at every input — including the
+    degenerate end, where a budget smaller than the ellipsis itself takes
+    a hard cut rather than emitting a marker longer than the allowance
+    (security review L3: the previous version returned 2 characters for
+    `max_chars=1`). Unreachable at today's `_ENTRY_CHAR_BUDGET`, and
+    fixed rather than documented because the invariant is what three
+    at-budget entries fitting the slot rests on.
 
     Honest limit: a word-boundary cut still cuts. A KB chunk truncated
     here loses its tail, and a rupee amount sitting in that tail is lost
     with it. That is acceptable for slot 7 specifically — retrieved
-    knowledge is advisory (docs/08 §5.2 drop-rung 1) and the model is
-    barred from voicing an amount no tool returned (docs/10 §1 invariant
-    1) — and it is exactly why slot 6 is NOT truncated.
+    knowledge is advisory (docs/08 §5.2 drop-rung 1) — and it is exactly
+    why slot 6 is NOT truncated.
     """
     if len(text) <= max_chars:
         return text
-    head = text[: max(1, max_chars - len(_ELLIPSIS))]
+    if max_chars <= len(_ELLIPSIS):
+        return text[:max_chars]
+    head = text[: max_chars - len(_ELLIPSIS)]
     boundary = head.rfind(" ", max(0, len(head) - _WORD_BOUNDARY_WINDOW))
     if boundary > 0:
         head = head[:boundary]
@@ -220,23 +275,63 @@ def render_open_issues(issues: Sequence[OpenIssue], *, token_budget: int) -> str
     honest rendering: unlike slot 7, an absent open issue really does mean
     "this merchant has no issue we opened", because the profile is read
     whole from one row rather than retrieved by similarity.
+
+    ---
+    ## `status` is deliberately NOT rendered (security review HIGH-2)
+
+    The first version rendered `- {summary} ({status}, opened {date})` and
+    justified the risk by claiming `SafetyLayer.screen_output` would block
+    the model from voicing anything it read here. **That claim was wrong**,
+    and it was load-bearing — it was the whole basis for resolving a real
+    conflict between docs/09 §5.1 (which shows `open_issues` rendering
+    into this slot) and docs/11 §1 (which says "NO balances/statuses
+    here") in favour of rendering. What `screen_output` actually does:
+
+    - It extracts **digit** amounts (`₹50,000`, `Rs 50,000`) and
+      fully-formed reference ids, and requires each to appear in this
+      turn's tool results.
+    - It does **not** recognise word forms. `safety_layer.py`'s own
+      honesty note 3 says so outright. "raise your limit to fifty
+      thousand" passes. This system is a *voice* agent whose persona
+      instructs the model to speak numbers as words, so the word form is
+      not an edge case here — it is the default output shape.
+    - It has **no status check at all**. Nothing stops the model reading
+      `pending` and voicing it.
+
+    So there is no enforced control over a status read from this slot, and
+    `status` is the one field in the entry that purports to describe
+    *current* state. `user_profiles` is written only by the post-call
+    merge (docs/09 §1's placement table), so a stored `pending` can be
+    arbitrarily stale — days old, and possibly approved since. Telling a
+    merchant their request "is still pending" when it was granted last
+    week is a worse failure than saying nothing.
+
+    Dropping it costs nothing docs/09 §5.1 asks for: the payoff that
+    section names is "Hi Rajesh — checking on your limit increase?", which
+    needs the *topic*, not the state. The summary carries the topic; the
+    status only carried a claim we cannot stand behind.
+
+    The summary itself is still rendered, and its own residual risk is
+    stated rather than papered over: the canonical entry contains
+    "₹25,000 → ₹50,000", the model can voice that in word form, and
+    nothing mechanical stops it. What makes that acceptable and the status
+    not is tense — the summary is a record of what was asked for on a past
+    call, which is true whatever happened since, while a status asserts
+    how things stand now. The header below says exactly that to the model.
+    It is a prompt-level mitigation, not a control; a check that blocked
+    turns on status words was rejected because the vocabulary is unbounded
+    and `screen_output` fails closed, so its false positives kill turns.
     """
-    if token_budget <= 0:
-        return ""
     kept = [issue for issue in reversed(issues) if not looks_injected(issue.summary)]
     if not kept:
         return ""
 
-    lines = [
-        f"- {issue.summary} ({issue.status}, opened {issue.opened_at.date().isoformat()})"
-        for issue in kept
-    ]
-    header = "Open issues from earlier calls:"
-    while lines and estimate_tokens("\n".join([header, *lines])) > token_budget:
+    lines = [f"- {issue.summary} (opened {issue.opened_at.date().isoformat()})" for issue in kept]
+    while lines and _rendered_tokens("\n".join([OPEN_ISSUES_HEADER, *lines])) > token_budget:
         lines.pop()
     if not lines:
         return ""
-    return "\n".join([header, *lines])
+    return "\n".join([OPEN_ISSUES_HEADER, *lines])
 
 
 def render_summary_slot(summary: RollingSummary | None) -> str:
@@ -284,18 +379,34 @@ def render_knowledge_slot(results: Sequence[RetrievedMemory]) -> str:
     so the loop only engages for a caller that asked `retrieve()` for a
     larger `k`. It drops from the tail, which is the least similar,
     because the repo returns nearest-first.
+
+    The header is not decoration. `ContextBuilder.prefetch_knowledge`
+    runs retrieval **once, at call setup**, off the screen the merchant
+    called from, and the topic-shift re-query docs/05 §3.7 asks for is
+    not implemented (no intent classifier exists yet). So a merchant who
+    opens on `PaymentScreen` and then asks about settlements is shown
+    payment excerpts for the rest of the call — confidently irrelevant
+    text, which is a different and worse failure than the empty slot
+    `KNOWLEDGE_UNAVAILABLE` was written for, because nothing about the
+    excerpts themselves reveals they were chosen for a different
+    question. Until re-query lands, saying so in the slot is the only
+    thing that tells the model.
     """
     entries = [_render_entry(result) for result in results if not looks_injected(result.content)]
-    while entries and estimate_tokens("\n".join(entries)) > KNOWLEDGE_SLOT_BUDGET:
+    while entries and _rendered_tokens("\n".join([KNOWLEDGE_HEADER, *entries])) > (
+        KNOWLEDGE_SLOT_BUDGET
+    ):
         entries.pop()
     if not entries:
         return KNOWLEDGE_UNAVAILABLE
-    return "\n".join(entries)
+    return "\n".join([KNOWLEDGE_HEADER, *entries])
 
 
 __all__ = [
+    "KNOWLEDGE_HEADER",
     "KNOWLEDGE_SLOT_BUDGET",
     "KNOWLEDGE_UNAVAILABLE",
+    "OPEN_ISSUES_HEADER",
     "PROFILE_SLOT_BUDGET",
     "render_knowledge_slot",
     "render_open_issues",
