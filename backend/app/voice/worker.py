@@ -96,9 +96,11 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Final, Literal, Protocol
 
 from app.config import Settings
+from app.domain.types import EndReason
 from app.domain.voice import (
     DC_TYPE_AGENT_STATE,
     DC_TYPE_TRANSCRIPT_FINAL,
@@ -156,6 +158,37 @@ class Brain(Protocol):
     def record_tts_text(self, characters: int) -> None: ...
 
 
+@dataclass(frozen=True)
+class BuiltBrain:
+    """What `brain_factory()` hands back: the turn machine plus the
+    post-call hook that runs `CostTracker.finalize()` then
+    `SessionManager.end()` for this call (docs/05 §3.1, docs/09 §8),
+    exactly once, from `run()`'s `finally` below.
+
+    `on_call_ended` travels bundled with `brain`, not as a separately
+    injected constructor parameter, because both are built together —
+    and must stay together — inside `app/voice/run.py`'s
+    `_make_brain_factory`: that closure constructs this call's own
+    `CostTracker` right before building the `ConversationManager` that
+    holds it, and `CostTracker.finalize()` reads *that specific
+    instance's* in-memory accumulators, not a fresh lookup keyed by
+    `session_id` (cost_tracker.py has no such lookup — the running
+    total only ever lives on the one instance that recorded it). Threading
+    two independently-obtained callables down to this worker would risk
+    a `on_call_ended` closing over a different `CostTracker` than the one
+    `brain` is actually billing turns to.
+
+    Deliberately NOT a member of the `Brain` Protocol itself: finalize/end
+    are session-lifecycle concerns owned by `SessionManager`/`CostTracker`,
+    one level above the agent-brain (docs/05 §1.1's transport-blind
+    boundary is about audio/transport detail, but the boundary this
+    class respects is about ownership — `ConversationManager` has never
+    known about `SessionManager.end()` and should not start now)."""
+
+    brain: Brain
+    on_call_ended: Callable[[EndReason], Awaitable[None]]
+
+
 class SttStreamDied(RuntimeError):
     """The provider stream failed while a turn was waiting on its final."""
 
@@ -190,7 +223,7 @@ class VoiceAgentWorker:
         stt: SttProvider,
         tts: TtsProvider,
         vad: VadModel,
-        brain_factory: Callable[[], Awaitable[Brain]],
+        brain_factory: Callable[[], Awaitable[BuiltBrain]],
         send_message: Callable[[DataChannelMessage], None],
         settings: Settings,
         now_ms: Callable[[], int] = _now_epoch_ms,
@@ -247,17 +280,58 @@ class VoiceAgentWorker:
 
     async def run(self) -> None:
         """Run the call's loops until the ingress fan-outs end (the peer
-        closed ingress) and every in-flight turn task finished."""
-        self._brain = await self._brain_factory()
+        closed ingress) and every in-flight turn task finished, then run
+        this call's post-call finalize+end exactly once (docs/05 §3.1,
+        docs/09 §8) — this is the convergence point every hangup path
+        (client bye, transport EOF/error, operator DELETE, worker crash)
+        reduces to, because closing the peer ends the ingress fan-outs
+        gracefully and `run()` is a single task that only ever executes
+        once per call: `on_call_ended` firing here cannot race a second
+        invocation of itself, no matter how many times a racing close
+        path calls `CallSession.close()`/`peer.close()` (both idempotent,
+        signaling.py judgment call 8).
+
+        Reason defaults to HANGUP — every graceful teardown (the ingress
+        fan-outs simply ending) takes this path, client- and
+        operator-initiated alike; docs/13 §2.2 itself calls the operator
+        DELETE an "explicit hang-up". It flips to ERROR only when a real
+        exception escapes the task group — a genuine worker crash, not a
+        cancellation from being torn down (`asyncio.CancelledError` is a
+        `BaseException`, not an `Exception`, so it is not caught here and
+        the reason stays HANGUP) — because turns that already ran before
+        the crash spent real STT/TTS/LLM money that still belongs in
+        `call_costs`, and `SessionManager.end()` still needs to flip
+        `conversations.state` so the call does not hang as `in_call`
+        forever."""
+        built = await self._brain_factory()
+        self._brain = built.brain
         log.info("worker.started", session_id=self._session_id)
+        reason = EndReason.HANGUP
         try:
             async with asyncio.TaskGroup() as tg:
                 self._tg = tg
                 tg.create_task(self._vad_loop(), name=f"worker:vad:{self._session_id}")
                 tg.create_task(self._supervisor.run(), name=f"worker:stt:{self._session_id}")
+        except Exception:
+            reason = EndReason.ERROR
+            raise
         finally:
             self._tg = None
-            log.info("worker.stopped", session_id=self._session_id, turns=self._turn_no)
+            log.info(
+                "worker.stopped",
+                session_id=self._session_id,
+                turns=self._turn_no,
+                reason=reason.value,
+            )
+            try:
+                await built.on_call_ended(reason)
+            except Exception:
+                log.exception(
+                    "worker.post_call_finalize_failed",
+                    session_id=self._session_id,
+                    reason=reason.value,
+                )
+                raise
 
     # ------------------------------------------------------------------
     # Billable media usage -> the brain's per-call cost ledger
@@ -537,6 +611,7 @@ __all__ = [
     "REASK_TEXT",
     "STT_FINAL_TIMEOUT_S",
     "Brain",
+    "BuiltBrain",
     "SttStreamDied",
     "VoiceAgentWorker",
 ]

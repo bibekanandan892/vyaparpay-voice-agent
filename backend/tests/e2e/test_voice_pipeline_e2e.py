@@ -62,6 +62,7 @@ from websockets.asyncio.server import serve  # noqa: E402
 from app.auth.signaling import mint_signaling_token, store_signaling_token  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.data.redis_client import RedisClient  # noqa: E402
+from app.domain.types import EndReason  # noqa: E402
 from app.domain.voice import (  # noqa: E402
     DC_TYPE_AGENT_STATE,
     DC_TYPE_TRANSCRIPT_FINAL,
@@ -80,6 +81,7 @@ from app.domain.voice import (  # noqa: E402
 from app.voice.call_session import CallDeps, CallSession  # noqa: E402
 from app.voice.peer_session import SendSignal  # noqa: E402
 from app.voice.signaling import SIGNALING_PATH, SignalingServer  # noqa: E402
+from app.voice.worker import BuiltBrain  # noqa: E402
 from tests.fakes import FakeBrain, FakeTts  # noqa: E402
 from tests.support.fake_redis import FakeRedis  # noqa: E402
 
@@ -302,9 +304,13 @@ async def test_voice_pipeline_end_to_end_through_real_signaling() -> None:
     tts = FakeTts()
     brain = FakeBrain()
     brain.script(REPLY)
+    on_call_ended_calls: list[EndReason] = []
 
-    async def brain_factory(_session_id: str) -> FakeBrain:
-        return brain
+    async def _on_call_ended(reason: EndReason) -> None:
+        on_call_ended_calls.append(reason)
+
+    async def brain_factory(_session_id: str) -> BuiltBrain:
+        return BuiltBrain(brain=brain, on_call_ended=_on_call_ended)
 
     deps = CallDeps(
         settings=settings,
@@ -392,3 +398,10 @@ async def test_voice_pipeline_end_to_end_through_real_signaling() -> None:
     # The one-time token was burned by the real verify-and-burn path, so
     # the same URL can never be replayed (docs/13 §6.2).
     assert await redis.take_signaling_token_hash(session_id) is None
+
+    # Post-call-pipeline-wiring, proven through the REAL SignalingServer +
+    # CallSession + VoiceAgentWorker stack this file exists to exercise:
+    # tearing the call down (client.close() -> session.close() ->
+    # peer.close() -> ingress ends) ran the worker's on_call_ended
+    # exactly once, with the literal HANGUP reason a graceful close takes.
+    assert on_call_ended_calls == [EndReason.HANGUP]

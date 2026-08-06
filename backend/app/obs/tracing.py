@@ -181,7 +181,36 @@ def setup_observability(settings: Settings, *, exporter: SpanExporter | None = N
     it, letting the OTLP-vs-console selection below run as documented.
     Tests inject an `InMemorySpanExporter` here to assert on real exported
     spans instead of just "did this not raise" (`tests/obs/test_tracing.py`).
+
+    Shuts down whatever `TracerProvider` is currently installed FIRST
+    (test-suite thread-leak fix, discovered auditing an intermittent full-
+    suite stall): each call below constructs a fresh `BatchSpanProcessor`,
+    which starts its own background worker thread, and nothing was ever
+    stopping the PREVIOUS one. Production calls this exactly once per
+    process (this function's own "call once at startup" contract) so
+    `trace.get_tracer_provider()` returns the no-op default there and this
+    is a harmless no-op (`ProxyTracerProvider` has no `shutdown`). Several
+    test files deliberately call this more than once per session on
+    purpose — `tests/obs/test_tracing.py` tests this function itself
+    under different settings, `tests/api/test_middleware.py`,
+    `tests/obs/test_logging.py`, `tests/obs/test_dashboards.py`,
+    `tests/e2e/test_canonical_conversation.py`, and
+    `tests/voice/test_worker.py` each need their own exporter/settings
+    combination — and every one of those extra calls was leaking a
+    thread that outlived its test, accumulating for the rest of the
+    process's life (a whole `pytest tests` run shares one process). 60+
+    such threads accumulated by the tail of a real full-suite run in
+    this investigation, which is consistent with (though not proven to
+    be the sole cause of) the intermittent Windows ProactorEventLoop
+    stalls this project has hit before (PR #66's BatchSpanProcessor
+    leak) — cheap, safe insurance either way, since a provider this
+    function is about to replace has no further use once replaced.
     """
+    current_provider = trace.get_tracer_provider()
+    shutdown_current = getattr(current_provider, "shutdown", None)
+    if callable(shutdown_current):
+        shutdown_current()
+
     resolved_exporter = exporter if exporter is not None else (
         OTLPSpanExporter(endpoint=settings.otel_exporter_otlp_endpoint)
         if settings.otel_exporter_otlp_endpoint

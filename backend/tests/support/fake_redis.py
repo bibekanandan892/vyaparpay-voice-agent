@@ -18,6 +18,9 @@ the real `RedisClient`/`SessionMemory` stack).
 
 from __future__ import annotations
 
+import asyncio
+import fnmatch
+from collections.abc import AsyncIterator
 from typing import Any
 
 
@@ -84,6 +87,48 @@ class FakePipeline:
         return None
 
 
+class FakePubSub:
+    """Minimal stand-in for `redis.asyncio.client.PubSub`, covering only
+    the pattern-subscribe + listen shape `RedisClient.subscribe_session_control()`
+    uses: `psubscribe(pattern)` then `async for message in pubsub.listen()`,
+    yielding real redis-py's `{"type", "pattern", "channel", "data"}` frame
+    shape for a `pmessage` (and nothing else — this fake never emits the
+    `psubscribe` confirmation frame real Redis sends first, because no
+    caller in this codebase reads it).
+
+    Delivery is push-based via an `asyncio.Queue`, fed by `FakeRedis
+    .publish()` on every call whose channel matches a subscribed pattern —
+    real pub/sub semantics, not a poll. `aclose()` deregisters from the
+    store so a cancelled subscriber loop cannot receive stale sends after
+    it stopped listening.
+    """
+
+    def __init__(self, store: FakeRedis) -> None:
+        self._store = store
+        self._patterns: list[str] = []
+        self._queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+        store._pubsub_subscribers.append(self)
+
+    async def psubscribe(self, *patterns: str) -> None:
+        self._patterns.extend(patterns)
+
+    async def listen(self) -> AsyncIterator[dict[str, str]]:
+        while True:
+            yield await self._queue.get()
+
+    async def aclose(self) -> None:
+        if self in self._store._pubsub_subscribers:
+            self._store._pubsub_subscribers.remove(self)
+
+    async def _deliver(self, channel: str, message: str) -> None:
+        for pattern in self._patterns:
+            if fnmatch.fnmatchcase(channel, pattern):
+                await self._queue.put(
+                    {"type": "pmessage", "pattern": pattern, "channel": channel, "data": message}
+                )
+                return
+
+
 class FakeRedis:
     """Minimal in-memory stand-in for `redis.asyncio.Redis`."""
 
@@ -100,6 +145,12 @@ class FakeRedis:
         # back; tests that care about the "nobody listening" path set it.
         self.published: list[tuple[str, str]] = []
         self.subscribers = 0
+        # Real pub/sub subscribers created via `pubsub()`, for tests that
+        # exercise actual message delivery (e.g. RedisClient's
+        # `subscribe_session_control()`) rather than only recording what
+        # was published. Independent of `subscribers`/`published` above,
+        # which stay exactly as they were for every existing caller.
+        self._pubsub_subscribers: list[FakePubSub] = []
 
     # -- hash --------------------------------------------------------
     async def hget(self, key: str, field: str) -> str | None:
@@ -178,10 +229,22 @@ class FakeRedis:
 
     # -- pub/sub --------------------------------------------------------
     async def publish(self, channel: str, message: str) -> int:
-        """Records the (channel, message) pair and returns the configured
-        subscriber count, mirroring the real command's return value."""
+        """Records the (channel, message) pair, delivers it to any real
+        `FakePubSub` subscriber whose pattern matches (independent of the
+        manually-configured `subscribers` return value below — a test that
+        sets `subscribers = 1` to simulate "someone is listening" without
+        wiring an actual `pubsub()` consumer keeps working exactly as
+        before), and returns the configured subscriber count, mirroring
+        the real command's return value."""
         self.published.append((channel, message))
+        for sub in tuple(self._pubsub_subscribers):
+            await sub._deliver(channel, message)  # noqa: SLF001 -- same-module fake
         return self.subscribers
+
+    def pubsub(self) -> FakePubSub:
+        """`redis.asyncio.Redis.pubsub()` is a synchronous factory — the
+        subscribe calls on the object it returns are what's async."""
+        return FakePubSub(self)
 
     # -- zset (pipeline-only; mirrors the sync ops a real pipeline queues) --
     def _zremrangebyscore(self, key: str, min_: float, max_: float) -> int:
@@ -218,4 +281,4 @@ class FakeRedis:
         return FakePipeline(self)
 
 
-__all__ = ["FakePipeline", "FakeRedis"]
+__all__ = ["FakePipeline", "FakePubSub", "FakeRedis"]

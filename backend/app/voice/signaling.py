@@ -54,11 +54,36 @@ Judgment calls, flagged per house style:
    §6.1 sequence puts the 10 s loop on the client, and the server's
    liveness signal is the connection itself.
 8. **Every teardown path converges**: client `bye`, transport EOF,
-   transport error, and server shutdown all run the same finally block —
-   unregister, `peer.close()`, close the transport. `close_all()` (run.py
-   SIGTERM) additionally sends a `bye {reason: agent_hangup}` first so a
+   transport error, server shutdown, and operator `DELETE
+   /v1/sessions/{id}` all run the same finally-block shape — `peer.close()`,
+   close the transport, THEN unregister from `_active` — which is what
+   lets `VoiceAgentWorker.run()`'s own finally (worker.py) be the ONE
+   place that runs finalize+end for every hangup, regardless of which
+   side the goodbye started. `close_all()` (run.py SIGTERM) and
+   `close_one()` (run.py's `session_control:{id}` subscriber, the
+   operator-DELETE path) additionally send a `bye {reason}` first so a
    live client learns the call ended cleanly (docs/13 §6's bye is
    bidirectional).
+9. **`_active`'s entry for a session_id is removed in exactly ONE place:
+   `handle_connection`'s own `finally`, and only after `_close_peer`/
+   `_close_transport` have both been awaited to completion** — not by
+   `close_one()`/`close_all()`, which only look the entry up (never pop
+   it) so their idempotent close calls can race that finally freely.
+   This is deliberate, and load-bearing: `handle_connection`'s duplicate-
+   connection gate (`if session_id in self._active`) is the ONLY thing
+   that stops a reconnect from building a second `CallSession`/
+   `VoiceAgentWorker`/`CostTracker` for a session_id whose finalize+end
+   hasn't run yet. Popping the moment teardown STARTS (rather than once
+   it FINISHES) reopens that gate during the exact window
+   `CallSession.close()`'s bounded wait (up to `_CLOSE_TIMEOUT_S`) is
+   still running `VoiceAgentWorker.run()`'s finalize+end — a real,
+   client-triggerable race (an ordinary reconnect after a network blip),
+   not a theoretical one. The cost is reconnect latency: a legitimate
+   reconnect for the same session_id must now wait out the OLD
+   connection's full server-side teardown before a new one is accepted,
+   which is the same tradeoff judgment call 4 already made ("rejecting
+   is the only behavior that cannot corrupt a live call meanwhile") —
+   this just makes the window that rule actually covers correct.
 """
 
 from __future__ import annotations
@@ -233,9 +258,27 @@ class SignalingServer:
                 "signaling.connection_aborted", session_id=session_id, error=repr(exc)
             )
         finally:
-            self._active.pop(session_id, None)
+            # post-call-pipeline-wiring CRITICAL fix: teardown must
+            # actually COMPLETE — `_close_peer` awaits `CallSession.close()`,
+            # which awaits `VoiceAgentWorker.run()` to finish (including its
+            # own finally's finalize+end, worker.py) — before this
+            # session_id's slot in `_active` is freed. Popping first (the
+            # old order) reopened the `session_id in self._active` gate
+            # above immediately on disconnect, well before finalize+end had
+            # run; a reconnect racing that window built a SECOND
+            # CallSession/VoiceAgentWorker/CostTracker for a call whose
+            # finalize+end hadn't run yet, corrupting call_costs (a
+            # last-write-wins upsert) or crashing a worker task (colliding
+            # `conversation_turns` PKs from two independent 1-based turn
+            # sequences) or silently losing the second CostTracker's totals
+            # (SessionManager.end()'s duplicate-end no-op). Reordering is
+            # what actually closes the window: the existing docs/06 §8
+            # "single active connection per session" rejection already
+            # handles a reconnect correctly — it just needs `_active` to
+            # stay occupied for the FULL teardown, not merely the WS half.
             await self._close_peer(peer, session_id)
             await self._close_transport(transport, _WS_NORMAL, "session closed")
+            self._active.pop(session_id, None)
             log.info("signaling.disconnected", session_id=session_id)
 
     async def _authenticate(
@@ -261,20 +304,54 @@ class SignalingServer:
             return False
         return True
 
+    async def close_one(self, session_id: str, *, reason: str) -> bool:
+        """Bye + close exactly one live call, by session_id — the
+        single-session primitive both `close_all()` (shutdown, below) and
+        the `session_control:{id}` subscriber (run.py, the operator-DELETE
+        path per docs/13 §2.2) reduce to.
+
+        Deliberately does NOT remove `session_id` from `_active` — that is
+        `handle_connection`'s own `finally`'s job, and only its job (its
+        own comment explains why: the occupancy gate a reconnect checks
+        must stay armed for the FULL teardown, not just until this method
+        returns). Looked up with `.get()`, not `.pop()`, so calling this
+        twice for the same session_id (a repeat operator DELETE racing
+        the client's own bye) is safe: both `_close_peer`/`_close_transport`
+        are idempotent, so whichever caller's close lands first does the
+        real work and the other is a harmless no-op — this method's
+        contribution to "the reconnect race is closed" is that it never
+        frees the slot prematurely, not that it "wins" some race with
+        `handle_connection`'s finally (there is nothing to win: exactly
+        one place ever pops).
+
+        Returns `False` when no call was live for this `session_id` —
+        already ended, unknown id, or a redelivered/repeat message — `True`
+        when a live call was found and closed. The caller (the subscriber
+        loop) treats `False` as ordinary, not an error: pub/sub redelivery
+        and a repeat operator DELETE (docs/13 §2.2: "a repeat call returns
+        the same body") both produce it routinely."""
+        call = self._active.get(session_id)
+        if call is None:
+            return False
+        try:
+            await self._send(
+                call.transport, SignalMessage(type=SIG_TYPE_BYE, payload={"reason": reason})
+            )
+        except Exception:
+            log.warning("signaling.bye_send_failed", session_id=session_id, reason=reason)
+        await self._close_peer(call.peer, session_id)
+        await self._close_transport(call.transport, _WS_GOING_AWAY, reason)
+        return True
+
     async def close_all(self, *, reason: str = "agent_hangup") -> None:
         """Graceful shutdown (judgment call 8): bye every live client, close
         every peer and transport. Safe to race the per-connection finally —
-        both sides pop-then-close and `peer.close()` is idempotent."""
-        for session_id, call in list(self._active.items()):
-            self._active.pop(session_id, None)
-            try:
-                await self._send(call.transport, SignalMessage(
-                    type=SIG_TYPE_BYE, payload={"reason": reason}
-                ))
-            except Exception:
-                log.warning("signaling.shutdown_bye_failed", session_id=session_id)
-            await self._close_peer(call.peer, session_id)
-            await self._close_transport(call.transport, _WS_GOING_AWAY, "server shutting down")
+        `close_one()` never pops (only `handle_connection`'s own finally
+        does), so this returning does not itself guarantee `_active` is
+        empty yet; callers that need that (e.g. tests) must also await the
+        connection task(s), same as `close_one()`'s own contract."""
+        for session_id in list(self._active):
+            await self.close_one(session_id, reason=reason)
 
     # ------------------------------------------------------------------
     # Message routing

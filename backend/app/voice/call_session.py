@@ -22,7 +22,10 @@ Judgment calls, flagged per house style:
    per uplink audio stream, never shared"), so it must be constructed
    fresh per call. The brain factory is async and takes the session_id —
    the real one awaits `SessionManager.attach()` before building a
-   `ConversationManager`.
+   `ConversationManager`, and returns it bundled with this call's
+   post-call finalize+end hook as a `BuiltBrain` (worker.py) — the two
+   travel together because both close over the same per-call
+   `CostTracker` (post-call-pipeline-wiring task).
 3. **`deps=None` preserves T3.1's placeholder behavior exactly** (no-op
    drains on both fan-outs so the bounded queues never warn-log): the
    worker process must keep serving transport-only calls in environments
@@ -83,7 +86,7 @@ from app.voice.audio_egress import AudioEgress
 from app.voice.audio_ingress import AudioIngress
 from app.voice.context_dispatch import ContextDispatcher
 from app.voice.peer_session import PeerSession, SendSignal
-from app.voice.worker import Brain, VoiceAgentWorker
+from app.voice.worker import BuiltBrain, VoiceAgentWorker
 
 log = get_logger(__name__)
 
@@ -101,7 +104,7 @@ class CallDeps:
     stt: SttProvider
     tts: TtsProvider
     vad_factory: Callable[[], VadModel]
-    brain_factory: Callable[[str], Awaitable[Brain]]
+    brain_factory: Callable[[str], Awaitable[BuiltBrain]]
 
 
 async def _drain(stream: AsyncIterator[object]) -> None:

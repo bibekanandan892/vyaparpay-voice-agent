@@ -80,7 +80,8 @@ from app.context.context_compressor import ContextCompressor
 from app.context.event_log import EventLog
 from app.context.snapshot_ingestor import SnapshotIngestor
 from app.data.engine import create_engine_and_sessionmaker
-from app.data.redis_client import RedisClient
+from app.data.redis_client import SESSION_CONTROL_END, RedisClient
+from app.domain.types import EndReason
 from app.domain.voice import IceServer
 from app.memory.session_memory import SessionMemory
 from app.obs.logging import configure_logging, get_logger
@@ -95,7 +96,7 @@ from app.voice.call_session import CallDeps, CallSession
 from app.voice.peer_session import SendSignal
 from app.voice.signaling import SIGNALING_PATH, SignalingServer
 from app.voice.silero import SileroVad
-from app.voice.worker import Brain
+from app.voice.worker import BuiltBrain
 
 log = get_logger(__name__)
 
@@ -103,6 +104,27 @@ log = get_logger(__name__)
 # Chosen here against docs/02 §3.1's ≤1.5 s p50 call-setup budget, which
 # the prefetch runs concurrently with; no doc fixes this number.
 KNOWLEDGE_PREFETCH_TIMEOUT_S = 1.0
+
+# post-call-pipeline-wiring HIGH fix: bounded retry for
+# `SessionManager.end()` specifically — NOT `finalize()` — when it fails
+# after `finalize()` has already committed. `end()` is cheap and safe to
+# retry immediately (docs/05 §3.1: a second `end()` on an already-ended
+# session no-ops; the finalize-before-end check it re-runs is a no-op too,
+# since the `call_costs` row this call just wrote is still there). Total
+# worst-case added delay (0.5s + 1.0s = 1.5s of backoff across 3 attempts)
+# stays comfortably inside `CallSession._CLOSE_TIMEOUT_S` (5.0s) so a
+# retry in flight is not itself cancelled mid-attempt by the bounded
+# teardown wait it's running inside of. This does not cover a genuinely
+# down database for minutes — that needs a durable reconciliation sweep
+# (a call_costs row with no matching ended conversation, retried outside
+# any live process), which is out of scope here: it needs its own
+# composition-root decisions (which process runs it, on what schedule)
+# this wiring task does not own. What this DOES guarantee is that an
+# ordinary transient blip does not permanently wedge the session, and
+# that an unrecovered failure is loud and distinguishable from routine
+# worker-crash noise (see `_end_with_retry`'s log event below).
+_END_RETRY_ATTEMPTS = 3
+_END_RETRY_BACKOFF_S = 0.5
 
 
 class PlaceholderCallSession(CallSession):
@@ -187,15 +209,65 @@ def _build_brain_stack(
     )
 
 
+async def _end_with_retry(
+    session_manager: SessionManager, session_id: str, reason: EndReason
+) -> None:
+    """post-call-pipeline-wiring HIGH fix: `SessionManager.end()` failing
+    AFTER `CostTracker.finalize()` already committed leaves `call_costs`
+    populated but `conversations.state` never flips to `ended` — the
+    session is stuck reporting `in_call` forever (`GET
+    /v1/sessions/{id}/summary` 404s forever, and the phantom `in_call`
+    state also reopens the reconnect-token gate in `sessions.py`'s
+    `/token` endpoint for a session whose finalize+end never actually
+    finished). A transient DB blip is the common cause and is cheap and
+    safe to retry immediately (module docstring, `_END_RETRY_ATTEMPTS`);
+    an unrecovered failure after exhausting retries is logged as its own
+    ERROR-level event — distinct from a generic worker-crash log — so it
+    is greppable/alertable rather than indistinguishable from routine
+    shutdown noise, before re-raising so the existing task-failure
+    visibility (`CallSession._log_worker_crash`) still sees it too."""
+    for attempt in range(1, _END_RETRY_ATTEMPTS + 1):
+        try:
+            await session_manager.end(session_id, reason)
+            return
+        except Exception:
+            if attempt >= _END_RETRY_ATTEMPTS:
+                log.error(
+                    "voice_worker.session_end_failed_after_finalize",
+                    session_id=session_id,
+                    reason=reason.value,
+                    attempts=attempt,
+                    exc_info=True,
+                )
+                raise
+            log.warning(
+                "voice_worker.session_end_retry",
+                session_id=session_id,
+                reason=reason.value,
+                attempt=attempt,
+                exc_info=True,
+            )
+            await asyncio.sleep(_END_RETRY_BACKOFF_S * attempt)
+
+
 def _make_brain_factory(
     settings: Settings,
     sessionmaker: async_sessionmaker[AsyncSession],
     redis: RedisClient,
     stack: _BrainStack,
-) -> Callable[[str], Awaitable[Brain]]:
-    """Judgment call 2: attach, then build the per-call brain."""
+) -> Callable[[str], Awaitable[BuiltBrain]]:
+    """Judgment call 2: attach, then build the per-call brain — and, since
+    the post-call-pipeline-wiring task, this call's finalize+end hook
+    bundled with it as a `BuiltBrain` (worker.py). Both are built here,
+    together, because both close over the SAME per-call `CostTracker`
+    constructed a few lines below: `CostTracker.finalize()` reads that
+    one instance's in-memory accumulators, not a fresh lookup keyed by
+    `session_id` (cost_tracker.py has no such lookup), so the closure
+    that finalizes it must be minted in the same place and carried down
+    to `VoiceAgentWorker` alongside the `ConversationManager` it
+    also feeds."""
 
-    async def build(session_id: str) -> Brain:
+    async def build(session_id: str) -> BuiltBrain:
         session = await stack.session_manager.attach(session_id)
         # Judgment call 7 (Phase-5): the call-setup retrieval prefetch
         # (docs/02 §3.1) runs here, once, between attach and the first
@@ -227,7 +299,7 @@ def _make_brain_factory(
         except TimeoutError:
             log.warning("voice_worker.knowledge_prefetch_timeout", session_id=session_id)
         cost_tracker = CostTracker(settings, session_factory=sessionmaker, redis=redis)
-        return ConversationManager(
+        conversation_manager = ConversationManager(
             session=session,
             context_builder=stack.context_builder,
             prompt_builder=stack.prompt_builder,
@@ -240,11 +312,35 @@ def _make_brain_factory(
             tool_registry=registry,
         )
 
+        async def on_call_ended(reason: EndReason) -> None:
+            """The finalize-before-end pipeline (docs/09 §8; docs/05 §3.1's
+            `SessionManager.end()` raises if `finalize()` has not already
+            written a `call_costs` row) — run exactly once, from
+            `VoiceAgentWorker.run()`'s `finally` (worker.py), for every
+            hangup path. Closes over `cost_tracker` and `session_id`
+            above and `stack.session_manager` (process-long), which is
+            why this closure — not a fresh SessionManager/CostTracker
+            lookup — is what travels to the worker.
+
+            `end()` gets a bounded retry (`_end_with_retry`, HIGH fix)
+            because it is the one that can leave a session permanently
+            wedged as `in_call` if it fails after `finalize()` already
+            committed — `finalize()` itself is NOT retried here: a
+            partial failure part-way through its own turn-record loop
+            would double-append already-flushed Redis records on retry
+            (cost_tracker.py's `_turn_records_flushed` flag only guards
+            against re-entry AFTER a clean completion), which is a
+            different, deeper problem this task does not own fixing."""
+            await cost_tracker.finalize(session_id)
+            await _end_with_retry(stack.session_manager, session_id, reason)
+
+        return BuiltBrain(brain=conversation_manager, on_call_ended=on_call_ended)
+
     return build
 
 
 def _lazy_call_deps(
-    settings: Settings, brain_factory: Callable[[str], Awaitable[Brain]]
+    settings: Settings, brain_factory: Callable[[str], Awaitable[BuiltBrain]]
 ) -> Callable[[], CallDeps]:
     """Judgment call 1: providers are built on the first call and cached
     for the process; a missing voice key fails THAT call loudly while
@@ -293,6 +389,45 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             signal.signal(signum, lambda *_: stop.set())
 
 
+async def _run_session_control_subscriber(redis: RedisClient, server: SignalingServer) -> None:
+    """Judgment call 6 (post-call-pipeline-wiring task): the missing
+    subscriber for `session_control:{id}` (docs/13 §2.2's operator
+    `DELETE /v1/sessions/{id}`). `sessions.py`'s own judgment call 1
+    explains why agent-api cannot call `SessionManager.end()` directly —
+    the finalize-before-end invariant needs THIS process's per-call
+    `CostTracker` — and publishes `"end"` into the void instead. This
+    loop is the other half: it reduces the operator path to exactly the
+    same `close_one()` -> `peer.close()` -> ingress ends ->
+    `VoiceAgentWorker.run()`'s `finally` -> finalize+end pipeline every
+    other hangup already takes, rather than being a second, divergent
+    close path.
+
+    One message handled at a time, each in its own try/except: a single
+    malformed or failing message must not take the whole subscriber (and
+    therefore every future operator hang-up on this worker) down with
+    it — the loop logs and keeps listening."""
+    async for session_id, message in redis.subscribe_session_control():
+        try:
+            if message != SESSION_CONTROL_END:
+                log.debug(
+                    "voice_worker.session_control_ignored",
+                    session_id=session_id,
+                    message=message,
+                )
+                continue
+            log.info("voice_worker.session_control_end_received", session_id=session_id)
+            closed = await server.close_one(session_id, reason="operator_hangup")
+            if not closed:
+                # Not an error: pub/sub is lossy and a repeat DELETE (or one
+                # that lands after the call already ended some other way,
+                # docs/13 §2.2) is expected, not exceptional.
+                log.info(
+                    "voice_worker.session_control_no_active_call", session_id=session_id
+                )
+        except Exception:
+            log.exception("voice_worker.session_control_handler_failed", session_id=session_id)
+
+
 async def main() -> None:
     settings = get_settings()
     configure_logging(settings)
@@ -326,6 +461,23 @@ async def main() -> None:
     server = SignalingServer(redis=redis, peer_factory=peer_factory)
     stop = asyncio.Event()
     _install_signal_handlers(stop)
+    # Judgment call 6: one process-long subscriber, started alongside the
+    # signal handlers above — same "process-long collaborator" footing as
+    # `stack`/`snapshot_ingestor`. A crash here (as opposed to a graceful
+    # cancel at shutdown) is a real alarm: it means operator DELETEs stop
+    # reaching live calls on this worker until restart.
+    subscriber_task = asyncio.create_task(
+        _run_session_control_subscriber(redis, server), name="session-control-subscriber"
+    )
+
+    def _log_subscriber_crash(task: asyncio.Task[None]) -> None:
+        if task.cancelled() or task.exception() is None:
+            return
+        log.error(
+            "voice_worker.session_control_subscriber_crashed", error=repr(task.exception())
+        )
+
+    subscriber_task.add_done_callback(_log_subscriber_crash)
     try:
         async with serve(
             server.handle_websocket,
@@ -340,6 +492,8 @@ async def main() -> None:
             )
             await stop.wait()
             log.info("voice_worker.shutdown_started")
+            subscriber_task.cancel()
+            await asyncio.gather(subscriber_task, return_exceptions=True)
             await server.close_all(reason="agent_hangup")
     finally:
         await http.aclose()

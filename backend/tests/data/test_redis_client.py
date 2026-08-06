@@ -20,6 +20,7 @@ below keep every reference in this file unchanged.
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -474,6 +475,49 @@ async def test_publish_session_control_with_no_listener_is_not_an_error(
     caller logs, not an exception this wrapper raises."""
     assert await client.publish_session_control("sess_1", "end") == 0
     assert fake_redis.published == [("session_control:sess_1", "end")]
+
+
+async def test_subscribe_session_control_yields_the_session_id_and_message(
+    client: RedisClient,
+) -> None:
+    """The read side of `publish_session_control()` — parses the channel
+    back into a bare session_id (stripping the `session_control:` prefix)
+    and hands the message through unchanged, as a literal pair."""
+    received: list[tuple[str, str]] = []
+
+    async def _consume() -> None:
+        async for session_id, message in client.subscribe_session_control():
+            received.append((session_id, message))
+            return  # one message is enough to prove the shape
+
+    task = asyncio.create_task(_consume())
+    await asyncio.sleep(0)  # let psubscribe register before publishing
+    await client.publish_session_control("sess_1", "end")
+    await asyncio.wait_for(task, timeout=2)
+
+    assert received == [("sess_1", "end")]
+
+
+async def test_subscribe_session_control_ignores_unrelated_channels(
+    client: RedisClient, fake_redis: _FakeRedis
+) -> None:
+    """Only `session_control:*` reaches the generator — a publish on any
+    other channel (e.g. a hypothetical future pub/sub use) must not leak
+    through as a bogus session_id."""
+    received: list[tuple[str, str]] = []
+
+    async def _consume() -> None:
+        async for session_id, message in client.subscribe_session_control():
+            received.append((session_id, message))
+            return
+
+    task = asyncio.create_task(_consume())
+    await asyncio.sleep(0)
+    await fake_redis.publish("some_other_channel:sess_1", "irrelevant")
+    await client.publish_session_control("sess_2", "end")
+    await asyncio.wait_for(task, timeout=2)
+
+    assert received == [("sess_2", "end")]
 
 
 # --------------------------------------------------------------------------
