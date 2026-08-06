@@ -105,6 +105,27 @@ log = get_logger(__name__)
 # the prefetch runs concurrently with; no doc fixes this number.
 KNOWLEDGE_PREFETCH_TIMEOUT_S = 1.0
 
+# post-call-pipeline-wiring HIGH fix: bounded retry for
+# `SessionManager.end()` specifically — NOT `finalize()` — when it fails
+# after `finalize()` has already committed. `end()` is cheap and safe to
+# retry immediately (docs/05 §3.1: a second `end()` on an already-ended
+# session no-ops; the finalize-before-end check it re-runs is a no-op too,
+# since the `call_costs` row this call just wrote is still there). Total
+# worst-case added delay (0.5s + 1.0s = 1.5s of backoff across 3 attempts)
+# stays comfortably inside `CallSession._CLOSE_TIMEOUT_S` (5.0s) so a
+# retry in flight is not itself cancelled mid-attempt by the bounded
+# teardown wait it's running inside of. This does not cover a genuinely
+# down database for minutes — that needs a durable reconciliation sweep
+# (a call_costs row with no matching ended conversation, retried outside
+# any live process), which is out of scope here: it needs its own
+# composition-root decisions (which process runs it, on what schedule)
+# this wiring task does not own. What this DOES guarantee is that an
+# ordinary transient blip does not permanently wedge the session, and
+# that an unrecovered failure is loud and distinguishable from routine
+# worker-crash noise (see `_end_with_retry`'s log event below).
+_END_RETRY_ATTEMPTS = 3
+_END_RETRY_BACKOFF_S = 0.5
+
 
 class PlaceholderCallSession(CallSession):
     """T3.1's transport-only per-call wiring, now a deps-less
@@ -188,6 +209,47 @@ def _build_brain_stack(
     )
 
 
+async def _end_with_retry(
+    session_manager: SessionManager, session_id: str, reason: EndReason
+) -> None:
+    """post-call-pipeline-wiring HIGH fix: `SessionManager.end()` failing
+    AFTER `CostTracker.finalize()` already committed leaves `call_costs`
+    populated but `conversations.state` never flips to `ended` — the
+    session is stuck reporting `in_call` forever (`GET
+    /v1/sessions/{id}/summary` 404s forever, and the phantom `in_call`
+    state also reopens the reconnect-token gate in `sessions.py`'s
+    `/token` endpoint for a session whose finalize+end never actually
+    finished). A transient DB blip is the common cause and is cheap and
+    safe to retry immediately (module docstring, `_END_RETRY_ATTEMPTS`);
+    an unrecovered failure after exhausting retries is logged as its own
+    ERROR-level event — distinct from a generic worker-crash log — so it
+    is greppable/alertable rather than indistinguishable from routine
+    shutdown noise, before re-raising so the existing task-failure
+    visibility (`CallSession._log_worker_crash`) still sees it too."""
+    for attempt in range(1, _END_RETRY_ATTEMPTS + 1):
+        try:
+            await session_manager.end(session_id, reason)
+            return
+        except Exception:
+            if attempt >= _END_RETRY_ATTEMPTS:
+                log.error(
+                    "voice_worker.session_end_failed_after_finalize",
+                    session_id=session_id,
+                    reason=reason.value,
+                    attempts=attempt,
+                    exc_info=True,
+                )
+                raise
+            log.warning(
+                "voice_worker.session_end_retry",
+                session_id=session_id,
+                reason=reason.value,
+                attempt=attempt,
+                exc_info=True,
+            )
+            await asyncio.sleep(_END_RETRY_BACKOFF_S * attempt)
+
+
 def _make_brain_factory(
     settings: Settings,
     sessionmaker: async_sessionmaker[AsyncSession],
@@ -258,9 +320,19 @@ def _make_brain_factory(
             hangup path. Closes over `cost_tracker` and `session_id`
             above and `stack.session_manager` (process-long), which is
             why this closure — not a fresh SessionManager/CostTracker
-            lookup — is what travels to the worker."""
+            lookup — is what travels to the worker.
+
+            `end()` gets a bounded retry (`_end_with_retry`, HIGH fix)
+            because it is the one that can leave a session permanently
+            wedged as `in_call` if it fails after `finalize()` already
+            committed — `finalize()` itself is NOT retried here: a
+            partial failure part-way through its own turn-record loop
+            would double-append already-flushed Redis records on retry
+            (cost_tracker.py's `_turn_records_flushed` flag only guards
+            against re-entry AFTER a clean completion), which is a
+            different, deeper problem this task does not own fixing."""
             await cost_tracker.finalize(session_id)
-            await stack.session_manager.end(session_id, reason)
+            await _end_with_retry(stack.session_manager, session_id, reason)
 
         return BuiltBrain(brain=conversation_manager, on_call_ended=on_call_ended)
 

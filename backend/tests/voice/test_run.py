@@ -252,6 +252,130 @@ async def test_on_call_ended_forwards_the_error_reason_unchanged(
 
 
 # --------------------------------------------------------------------------
+# HIGH fix (post-call-pipeline-wiring review): SessionManager.end() failing
+# AFTER CostTracker.finalize() already committed must not permanently wedge
+# the session — a bounded retry recovers from a transient blip, and an
+# unrecovered failure must be loud and distinguishable from routine
+# worker-crash noise.
+# --------------------------------------------------------------------------
+
+
+async def test_on_call_ended_retries_a_transient_end_failure_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """end() failing once (a transient blip) then succeeding must not
+    surface as an error at all — the call completes normally, with
+    end() actually having been called the literal number of times this
+    test scripts, not a value re-derived from the retry loop's own
+    counter."""
+    calls: list[tuple[str, ...]] = []
+
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def finalize(self, session_id: str) -> None:
+            calls.append(("finalize", session_id))
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+    # No real sleeping in a unit test — the backoff itself isn't what this
+    # test is about, and a 0.5s+1.0s wait would make the suite slower for
+    # no assertion value.
+    monkeypatch.setattr(run_module.asyncio, "sleep", AsyncMock())
+
+    attempts = {"n": 0}
+
+    async def _end(session_id: str, reason: EndReason) -> None:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient db blip")
+        calls.append(("end", session_id, reason.value))
+
+    stack = _make_stack(AsyncMock())
+    stack.session_manager.end.side_effect = _end
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+    await built.on_call_ended(EndReason.HANGUP)  # must not raise
+
+    assert calls == [("finalize", "sess_1"), ("end", "sess_1", "hangup")]
+    assert attempts["n"] == 2
+
+
+async def test_on_call_ended_raises_after_exhausting_end_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent end() failure must still propagate (so the existing
+    task-failure visibility, CallSession._log_worker_crash, sees it) —
+    after trying the literal number of times `_END_RETRY_ATTEMPTS`
+    configures, not an arbitrary or unbounded number."""
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def finalize(self, session_id: str) -> None:
+            pass
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+    monkeypatch.setattr(run_module.asyncio, "sleep", AsyncMock())
+
+    async def _always_fails(session_id: str, reason: EndReason) -> None:
+        raise RuntimeError("db is down")
+
+    stack = _make_stack(AsyncMock())
+    stack.session_manager.end.side_effect = _always_fails
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+
+    built = await factory("sess_1")
+
+    with pytest.raises(RuntimeError, match="db is down"):
+        await built.on_call_ended(EndReason.HANGUP)
+
+    assert stack.session_manager.end.await_count == 3
+
+
+async def test_on_call_ended_logs_a_distinct_alert_worthy_event_when_end_is_never_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loud-and-distinguishable requirement, checked directly against
+    the actual log call rather than inferred from behavior: the specific
+    event name `voice_worker.session_end_failed_after_finalize` (not a
+    generic crash message) must fire at ERROR level with the session_id
+    this call was actually for."""
+    class _RecordingCostTracker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def finalize(self, session_id: str) -> None:
+            pass
+
+    monkeypatch.setattr(run_module, "CostTracker", _RecordingCostTracker)
+    monkeypatch.setattr(run_module.asyncio, "sleep", AsyncMock())
+
+    async def _always_fails(session_id: str, reason: EndReason) -> None:
+        raise RuntimeError("db is down")
+
+    stack = _make_stack(AsyncMock())
+    stack.session_manager.end.side_effect = _always_fails
+    factory = _make_brain_factory(MagicMock(), MagicMock(), MagicMock(), stack)
+    built = await factory("sess_1")
+
+    logged_error = MagicMock()
+    monkeypatch.setattr(run_module.log, "error", logged_error)
+
+    with pytest.raises(RuntimeError):
+        await built.on_call_ended(EndReason.HANGUP)
+
+    logged_error.assert_called_once_with(
+        "voice_worker.session_end_failed_after_finalize",
+        session_id="sess_1",
+        reason="hangup",
+        attempts=3,
+        exc_info=True,
+    )
+
+
+# --------------------------------------------------------------------------
 # The session_control:{id} subscriber — the missing half of docs/13 §2.2's
 # operator DELETE (sessions.py's own judgment call 1: agent-api publishes
 # "end" into a channel nothing was ever listening on).

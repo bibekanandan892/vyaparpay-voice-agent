@@ -619,3 +619,155 @@ async def test_handle_websocket_extracts_session_and_token(server, redis_client)
     await _settle()
     assert [p.session_id for p in created] == [SESSION_ID]
     await _finish(connection, task)
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL fix (post-call-pipeline-wiring review): a reconnect for the same
+# session_id landing WHILE the old connection's teardown is still in flight
+# must be rejected, not build a second peer/CostTracker/worker. Before this
+# fix, `handle_connection`'s finally popped `_active` BEFORE awaiting
+# `_close_peer`, so this exact window (bounded by `CallSession._CLOSE_TIMEOUT_S`
+# = 5s in production, which is exactly how long a real finalize+end can take)
+# let a reconnect straight through.
+# ---------------------------------------------------------------------------
+
+
+class _SlowClosePeer(FakePeer):
+    """`PeerSessionLike` double whose `close()` blocks until released —
+    lets a test deterministically land a second connection attempt WHILE
+    the first is still tearing down, instead of racing real timing."""
+
+    def __init__(self, session_id: str, send_signal: Any) -> None:
+        super().__init__(session_id, send_signal)
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
+        await super().close()
+
+
+async def test_reconnect_during_teardown_is_rejected_until_teardown_finishes(
+    redis_client,
+):
+    created: list[_SlowClosePeer] = []
+
+    def factory(session_id: str, send_signal: Any) -> _SlowClosePeer:
+        peer = _SlowClosePeer(session_id, send_signal)
+        created.append(peer)
+        return peer
+
+    sig_server = SignalingServer(redis=redis_client, peer_factory=factory)
+    transport = FakeTransport()
+    task = await _connect(sig_server, transport, token=await _mint_and_store(redis_client))
+    assert sig_server.active_sessions == (SESSION_ID,)
+
+    # Trigger teardown — the peer's close() is gated and will not return
+    # until released, so this genuinely puts handle_connection's finally
+    # in flight, blocked inside _close_peer.
+    transport.feed(_frame("bye", {"reason": "user_hangup"}))
+    await asyncio.wait_for(created[0].close_started.wait(), timeout=2)
+
+    # A reconnect for the SAME session_id, arriving while that teardown is
+    # still running — the exact race the fix closes.
+    second_transport = FakeTransport()
+    second_task = await _connect(
+        sig_server, second_transport, token=await _mint_and_store(redis_client)
+    )
+    await asyncio.wait_for(second_task, timeout=2)
+
+    assert second_transport.error_codes() == [CODE_SESSION_ALREADY_ACTIVE]
+    assert second_transport.closed
+    assert len(created) == 1, (
+        "peer_factory must not run a second time while the first call's "
+        "teardown (and therefore its finalize+end) is still in flight"
+    )
+
+    # Release the first teardown and let it actually finish...
+    created[0].release_close.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert sig_server.active_sessions == (), "the slot frees once teardown is truly done"
+
+    # ...and only now does a reconnect for the same session_id succeed —
+    # proving the gate isn't stuck open forever, only for the teardown
+    # window that actually matters.
+    third_transport = FakeTransport()
+    third_task = await _connect(
+        sig_server, third_transport, token=await _mint_and_store(redis_client)
+    )
+    assert len(created) == 2
+    created[1].release_close.set()  # unblock the third peer's own close() too
+    await _finish(third_transport, third_task)
+
+
+async def test_reconnect_during_real_worker_teardown_never_builds_a_second_worker(
+    redis_client, settings
+):
+    """The same proof, through the REAL `CallSession` + `VoiceAgentWorker`
+    composition rather than `SignalingServer`'s own bookkeeping in
+    isolation: while the first call's `on_call_ended` (the finalize+end
+    hook, worker.py's `BuiltBrain`) is genuinely still running — held open
+    by an event, extending `CallSession.close()`'s bounded wait exactly
+    the way a slow real `SessionManager.end()` would — a reconnect for the
+    same session_id must be rejected before `peer_factory` (and therefore
+    `_make_brain_factory`-style `CostTracker` construction) runs a second
+    time. `peer_factory` call count is the direct proxy for "how many
+    CostTrackers got built", since `_make_brain_factory`'s `build()` only
+    ever runs behind exactly that seam."""
+    pytest.importorskip("aiortc", reason="[voice] extra not installed")
+    from app.domain.types import EndReason  # noqa: PLC0415
+    from app.voice.call_session import CallDeps, CallSession  # noqa: PLC0415
+    from app.voice.worker import BuiltBrain  # noqa: PLC0415
+    from tests.fakes import FakeBrain, FakeStt, FakeTts, FakeVad  # noqa: PLC0415
+
+    hold_end = asyncio.Event()
+    peer_factory_calls: list[str] = []
+
+    def factory(session_id: str, send_signal: Any) -> CallSession:
+        peer_factory_calls.append(session_id)
+
+        async def on_call_ended(reason: EndReason) -> None:
+            await hold_end.wait()
+
+        async def brain_factory(_session_id: str) -> BuiltBrain:
+            return BuiltBrain(brain=FakeBrain(), on_call_ended=on_call_ended)
+
+        deps = CallDeps(
+            settings=settings,
+            stt=FakeStt(),  # type: ignore[arg-type]
+            tts=FakeTts(),  # type: ignore[arg-type]
+            vad_factory=lambda: FakeVad(),  # type: ignore[arg-type,return-value]
+            brain_factory=brain_factory,
+        )
+        return CallSession(session_id, send_signal, ice_servers=(), deps=deps)
+
+    sig_server = SignalingServer(redis=redis_client, peer_factory=factory)
+    transport = FakeTransport()
+    task = await _connect(sig_server, transport, token=await _mint_and_store(redis_client))
+    assert sig_server.active_sessions == (SESSION_ID,)
+
+    # The real ingress never receives any audio, so the worker's own loops
+    # end immediately once the peer closes — closing the transport (a
+    # client-driven disconnect) is enough to drive the real teardown chain
+    # (peer.close() -> ingress ends -> VoiceAgentWorker.run() finally ->
+    # on_call_ended), which then blocks on hold_end exactly like a slow
+    # SessionManager.end() would.
+    transport.end()
+    await asyncio.sleep(0)  # let the connection task start tearing down
+
+    second_transport = FakeTransport()
+    second_task = await _connect(
+        sig_server, second_transport, token=await _mint_and_store(redis_client)
+    )
+    await asyncio.wait_for(second_task, timeout=2)
+
+    assert second_transport.error_codes() == [CODE_SESSION_ALREADY_ACTIVE]
+    assert peer_factory_calls == [SESSION_ID], (
+        "a second CallSession/VoiceAgentWorker/CostTracker must never be "
+        "constructed while the first call's finalize+end is still running"
+    )
+
+    hold_end.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert sig_server.active_sessions == ()
