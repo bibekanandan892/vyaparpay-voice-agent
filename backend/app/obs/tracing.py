@@ -135,6 +135,18 @@ _SAFE_SPAN_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
         "fold_no",
         "summary_thru_turn",
         "summary_tokens",
+        # Phase-5 memory-wiring attributes on `context.build` (docs/08
+        # §5.2 asks for "per-slot token estimates" on this span).
+        # `memory_summary_tokens`/`knowledge_tokens` are chars/3.5
+        # estimates of slots 6 and 7 against their 250/300 budgets;
+        # `knowledge_prefetched` is a bool saying whether a prefetched
+        # slot was found in Redis at all, which is what makes an empty
+        # RAG slot readable on the trace as "retrieval never ran" versus
+        # "retrieval ran and returned nothing". Two counts and a flag —
+        # no retrieved text, no amount, no id.
+        "memory_summary_tokens",
+        "knowledge_tokens",
+        "knowledge_prefetched",
     }
 )
 

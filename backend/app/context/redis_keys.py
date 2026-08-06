@@ -59,4 +59,29 @@ def _ctx_events_key(session_id: str) -> str:
     return f"ctx:{_reject_key_delimiter(session_id, field='session_id')}:events"
 
 
-__all__ = ["CTX_TTL_SECONDS", "_ctx_events_key", "_ctx_key", "_reject_key_delimiter"]
+def _ctx_knowledge_key(session_id: str) -> str:
+    """`ctx:{session_id}:knowledge` — the rendered `<knowledge>` slot text
+    produced by the call-setup retrieval prefetch (docs/02 §3.1, docs/09
+    §6.2) and read once per turn by `ContextBuilder`.
+
+    In the `ctx:` namespace, and on `CTX_TTL_SECONDS`, because that is
+    what it is: per-call assembled context, worthless after the call, and
+    covered by the same expiry as the snapshot it was derived from. It is
+    deliberately NOT in `session:{id}`, whose 24 h TTL exists as the
+    post-call pipeline's retry window (docs/09 §3) — a rendered prompt
+    slot has nothing to contribute to that pipeline.
+
+    No new durable copy of anything is created by this key: its content
+    is KB text seeded per deploy plus this merchant's own already-stored
+    call summaries, and it expires with the rest of the `ctx:` namespace.
+    """
+    return f"ctx:{_reject_key_delimiter(session_id, field='session_id')}:knowledge"
+
+
+__all__ = [
+    "CTX_TTL_SECONDS",
+    "_ctx_events_key",
+    "_ctx_key",
+    "_ctx_knowledge_key",
+    "_reject_key_delimiter",
+]

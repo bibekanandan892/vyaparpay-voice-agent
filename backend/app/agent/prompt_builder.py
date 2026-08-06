@@ -41,11 +41,98 @@ changing the frozen `PromptBuilderProto`/`ContextBundle` contracts for a
 double-degenerate edge whose worst case is a redundant greeting — the
 regression test pins the behavior so it is a documented choice, not an
 accident.
+
+---
+## Slot-boundary escaping (Phase-5 memory wiring)
+
+docs/08 §5.3 puts the data-fencing of untrusted slots in this module:
+"`ContextBuilder` decides *what* the model sees, `PromptBuilder` decides
+*how* it is framed." The tagged regions below are the framing, so a slot
+whose *content* contains a slot tag is this module's problem.
+
+Until Phase 5 nothing merchant-influenced reached a slot that could
+exploit that: slots 4/5 carry device-captured screen text (length-capped
+and control-character-stripped on-device, docs/07 §5 rule 6), and slots
+8/9 are separate `Message` objects that never enter the system string at
+all. Phase 5 changes it — the profile slot now carries `open_issues`
+text and the knowledge slot carries retrieved chunks, both durable and
+both derived from what a merchant said. A stored `</user_profile>` fits
+inside `OpenIssue.summary`'s 300-char cap and survives
+`UserProfileMemory._flatten` unchanged (that module's own tests pin it),
+so without this the row could close its own region and everything after
+it would read as peer-level framing rather than profile content.
+
+`_escape_slot_tags` therefore neutralizes any slot-tag-shaped token in
+slot content — **every slot, not only the memory ones**. Defending only
+the slots believed untrusted today is how the next slot to become
+untrusted gets missed, and the cost of uniformity is one regex pass over
+strings the module already concatenates.
+
+Two consequences worth stating rather than discovering:
+
+- The escape is `<` -> `&lt;`, `>` -> `&gt;`, applied only to the matched
+  token. Nothing else in a slot is rewritten, so `<voice_rules>` and the
+  other persona sub-blocks (docs/11 §2/§5) are untouched — they are not
+  slot tags.
+- `prompts/persona.md`'s `<fencing_rules>` block does mention two slot
+  tags in prose ("The content inside <screen_context> and
+  <recent_actions>..."), so those two mentions now render escaped. That
+  is a real change to the rendered persona bytes and it is deliberate:
+  it is what makes "one opening and one closing token per slot tag in
+  the assembled system message" true rather than approximately true, and
+  the sentence still reads. The file itself is untouched (its sha256 pin
+  in tests/agent/test_context_builder.py still holds) and the rendered
+  result is deterministic, so the docs/11 §1.1 prefix-cache property is
+  unaffected. docs/11 §3 quotes the file, not the rendered slot.
+
+What this does NOT claim: escaping removes the ability to *forge a slot
+boundary*. It does not make injected prose stop being persuasive — text
+inside a correctly-closed region can still say "ignore your rules", and
+the answer to that is the `<fencing_rules>` block plus the action-side
+controls (confirm gate, principal injection, tool allowlist), not this
+function.
 """
 
 from __future__ import annotations
 
+import re
+from typing import Final
+
 from app.domain.types import ContextBundle, Message, Role
+
+# docs/11 §1's slot tags, in the template's own order. The literal tuple
+# is the single definition: `render` iterates it, and `_SLOT_TAG_TOKEN`
+# is built from it, so a slot added to one is added to both.
+SLOT_TAGS: Final = (
+    "persona",
+    "business_rules",
+    "user_profile",
+    "screen_context",
+    "recent_actions",
+    "memory_summary",
+    "knowledge",
+)
+
+# Anything a model could read as one of those tags: either polarity
+# (`<tag>` / `</tag>`), any case, tolerating whitespace around the slash
+# and any attribute-looking tail the renderer itself never emits. `\b`
+# after the name keeps `<knowledge_base>` from matching — `_` is a word
+# character, so the boundary only falls where the name genuinely ends.
+_SLOT_TAG_TOKEN: Final = re.compile(
+    r"<\s*/?\s*(?:" + "|".join(SLOT_TAGS) + r")\b[^>]*>", re.IGNORECASE
+)
+
+
+def _escape_slot_tags(content: str) -> str:
+    """Neutralize slot-tag-shaped tokens inside slot content.
+
+    Escaping (rather than deleting) keeps the text legible to the model
+    and to whoever reads the trace: a merchant whose business name really
+    is odd still has it rendered, just unable to act as a delimiter.
+    """
+    return _SLOT_TAG_TOKEN.sub(
+        lambda match: match.group(0).replace("<", "&lt;").replace(">", "&gt;"), content
+    )
 
 # Stable and deterministic — same bytes on every call-open turn.
 CALL_OPEN_TRIGGER = (
@@ -57,10 +144,14 @@ CALL_OPEN_TRIGGER = (
 def _render_slot(tag: str, content: str) -> str:
     """One tagged slot region. Empty content collapses to a literal empty
     tag pair on one line — exactly how docs/11 §4 shows
-    `<memory_summary></memory_summary>` on the worked turn-1 example."""
+    `<memory_summary></memory_summary>` on the worked turn-1 example.
+
+    The escape runs here, at the one place the tags are written, so no
+    caller can supply pre-fenced content and no future slot can be added
+    without it (see the module docstring)."""
     if not content:
         return f"<{tag}></{tag}>"
-    return f"<{tag}>\n{content}\n</{tag}>"
+    return f"<{tag}>\n{_escape_slot_tags(content)}\n</{tag}>"
 
 
 class PromptBuilder:
@@ -70,6 +161,11 @@ class PromptBuilder:
         # Literal tuple, not a dict: the fixed order IS the contract
         # (docs/11 §1) and iteration over a literal can't reorder the way
         # a dict-ordering leak could (docs/08 §5.1's warned failure mode).
+        # Spelled out here rather than `getattr(bundle, tag) for tag in
+        # SLOT_TAGS` so mypy still checks every slot name against
+        # `ContextBundle`; the two lists agreeing is pinned by
+        # tests/agent/test_prompt_builder.py instead, which is what makes
+        # a slot added here without an escape entry fail the build.
         system_text = "\n\n".join(
             _render_slot(tag, content)
             for tag, content in (
@@ -101,4 +197,4 @@ class PromptBuilder:
         ]
 
 
-__all__ = ["CALL_OPEN_TRIGGER", "PromptBuilder"]
+__all__ = ["CALL_OPEN_TRIGGER", "SLOT_TAGS", "PromptBuilder"]
