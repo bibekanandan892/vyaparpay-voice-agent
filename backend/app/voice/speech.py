@@ -37,6 +37,17 @@ Judgment calls, flagged per house style:
    the turn** — alignment pairs plus genuine-audio milliseconds — which
    is exactly the input the worker's barge-in commit hands to
    `truncate_reply()` (docs/06 §6.3).
+6. **Billable TTS characters are reported at dispatch**, via
+   `on_tts_chars`, which the worker forwards to the call's cost ledger
+   (docs/16 §5 prices ElevenLabs per character). Counted *before* the
+   stream opens, because a sentence whose stream dies part-way
+   (judgment call 2) was still submitted and is still billed. What is
+   counted is `len(sentence.text)`. Because `TtsProvider.synthesize` is
+   an async generator function, nothing has been sent to the vendor at
+   the moment of counting — the socket opens on the first `anext()` in
+   `_synthesize_sentence`'s `async for` below — so the count can come
+   out over OR under the invoice; `CostTracker.record_tts_text`
+   enumerates every case.
 
 Docs: docs/06 §4.2/§6.3/§9, docs/13 §4. Tests: driven through
 VoiceAgentWorker in tests/voice/test_worker.py.
@@ -118,6 +129,7 @@ class SpeechDispatcher:
         on_agent_partial: Callable[[int, str], None],
         on_speaking_started: Callable[[int], None],
         on_agent_final: Callable[[int, str], None],
+        on_tts_chars: Callable[[int], None],
     ) -> None:
         self._session_id = session_id
         self._tts = tts
@@ -126,6 +138,7 @@ class SpeechDispatcher:
         self._on_agent_partial = on_agent_partial
         self._on_speaking_started = on_speaking_started
         self._on_agent_final = on_agent_final
+        self._on_tts_chars = on_tts_chars
 
     async def speak(self, turn: Turn, reply_text: str) -> None:
         """Chunk, dispatch, drain, wait for playout, freeze the caption.
@@ -159,6 +172,8 @@ class SpeechDispatcher:
     async def _synthesize_sentence(self, turn: Turn, text: str, sentence_no: int) -> None:
         record = SentenceAudio(sentence_no=sentence_no, text=text)
         turn.sentences.append(record)
+        # Judgment call 6: billed at dispatch, before the stream can fail.
+        self._on_tts_chars(len(text))
         stream = await self._open_tts_stream(text, sentence_no)
         async with contextlib.aclosing(stream):
             async for chunk in stream:

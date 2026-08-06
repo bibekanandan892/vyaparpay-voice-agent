@@ -47,18 +47,70 @@ Judgment calls, flagged per house style:
    is the one declared frozen by canon. `cost_usd` goes on the span as a
    float (`Decimal` is not an OTel AttributeValue); `Decimal` stays
    authoritative everywhere money is computed or persisted.
-6. **Phase 2 is text-only**: `stt_usd`/`tts_usd`/`embeddings_usd` (and
-   `stt_seconds`/`tts_chars`) finalize as zero — those pipelines don't
-   exist until Phase 3/5. `total_usd` is computed as the sum of the
+6. **Non-LLM spend is metered by the stages that produce it, not
+   inferred here.** STT is billed per audio-minute, TTS per character and
+   embeddings per token — none of which is derivable from an LLM usage
+   frame. `record_stt_audio` / `record_tts_text` /
+   `record_embedding_tokens` are therefore the seams the producing stages
+   call; this class only prices and totals. `finalize()` logs
+   `recorded_stages`/`unrecorded_stages`, which separates "the stage
+   reported zero" from "the stage reported nothing at all" — NOT "did
+   not run" from "wiring broke", which are the same observation from
+   here (a stage that never ran and a stage whose wiring is broken both
+   simply never call the method). What makes the field useful is
+   context the reader supplies: on a voice call, `stt`/`tts` appearing
+   in `unrecorded_stages` is a wiring alarm, because those stages
+   certainly ran. `total_usd` is computed as the sum of the
    already-quantized components so `ck_call_costs_total_usd`
    (app/models/orm.py) can never trip on rounding drift.
+7. **`call_total()` includes every component, not just LLM spend.** The
+   $1 default cap is docs/15 §6's "~3x the ≈ $0.30 expected cost"
+   runaway backstop, and ≈ $0.30 is docs/16 §5's *all-component* figure —
+   so the guard only means what that doc says when the total it reads is
+   the all-component one. Against an LLM-only total (this class before
+   B7, ≈ $0.09 of a canonical call) the same $1 cap admits several
+   dollars of real spend before it fires.
+
+   docs/15 §6 does not name `call_total()` though: its cost-cap row
+   specifies the watchdog against "running `cost_usd` in the
+   `session:{id}` hash" — a Redis field, readable cross-process, which
+   `call_total()` is not (this instance lives in the voice worker; only
+   the worker process can see it). Leaving that field LLM-only would
+   reintroduce the exact understatement B7 exists to fix, in the
+   component that terminates calls, so `take_unpublished_media_cost()`
+   (judgment call #9) feeds media into it too.
+9. **Media spend reaches Redis on a per-turn watermark, not per
+   chunk.** `record_stt_audio`/`record_tts_text` are sync callbacks on
+   the audio pump and the sentence dispatcher — tens of calls per second
+   — and `SessionMemory.add_cost` is an async read-modify-write. Doing
+   that I/O per chunk is out on the hot path, and firing it forget-style
+   from a sync callback is what judgment call #1 already rejected.
+   Instead `take_unpublished_media_cost()` returns everything metered
+   since the previous call and moves a watermark; `ConversationManager`
+   folds it into the `add_cost` it *already* awaits per LLM round, so
+   the Redis counter converges with no extra round trip.
+
+   The honest cost of that choice: the Redis counter trails
+   `call_total()` by whatever media spend has accrued since the last LLM
+   round — in practice the current turn's own TTS, since that is spoken
+   after the round that generated it. Media spend after the final LLM
+   round never reaches Redis at all. `call_costs` (written by
+   `finalize()` from the in-memory accumulators) is the authoritative
+   ledger; the Redis field is a cross-process guard rail that is close,
+   not equal.
+8. **`stt_seconds` is rounded once, and the price is computed from the
+   rounded value.** `call_costs.stt_seconds` is `INT` (docs/12 §4.5) and
+   the row is documented as auditable against provider invoices, so the
+   stored driver and the stored cost must reproduce each other exactly;
+   pricing the unrounded accumulator would leave them up to half a
+   second apart.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, Final
 
 from opentelemetry.trace import Span
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -72,12 +124,25 @@ from app.obs.tracing import safe_set_attribute
 
 log = get_logger(__name__)
 
-_USD_PER_MILLION_TOKENS = Decimal("1000000")
+# Shared by the per-million-TOKEN (LLM, embeddings) and per-million-
+# CHARACTER (TTS) rates — both are quoted per million in Settings.
+_PER_MILLION = Decimal("1000000")
+_SECONDS_PER_MINUTE = Decimal("60")
 # call_costs money columns are NUMERIC(10, 6) (app/models/orm.py) — this
 # is the DB-boundary quantum. Per-turn TurnCost.cost_usd keeps full
 # precision so the running total never accumulates rounding drift.
 _MONEY_QUANTUM = Decimal("0.000001")
+_WHOLE = Decimal("1")
 _ZERO_USD = Decimal("0")
+
+# Judgment call #6's stage names. These are log/diagnostic labels for
+# "did this priced stage report any usage on this call", not schema:
+# `call_costs` has no stage-ran column.
+_STAGE_LLM: Final = "llm"
+_STAGE_STT: Final = "stt"
+_STAGE_TTS: Final = "tts"
+_STAGE_EMBEDDINGS: Final = "embeddings"
+_PRICED_STAGES: Final = (_STAGE_LLM, _STAGE_STT, _STAGE_TTS, _STAGE_EMBEDDINGS)
 
 
 class _ModelPricing:
@@ -124,6 +189,15 @@ class CostTracker:
         self._cost_repo_factory = cost_repo_factory
         self._turns: tuple[TurnCost, ...] = ()
         self._turn_records_flushed = False
+        # Judgment call #6: non-LLM usage drivers, accumulated by the
+        # stages that produce them.
+        self._stt_seconds: Decimal = Decimal("0")
+        self._tts_chars = 0
+        self._embedding_tokens = 0
+        self._stages_recorded: frozenset[str] = frozenset()
+        # Judgment call #9: how much media spend has already been handed
+        # to a caller for publishing to the Redis running counter.
+        self._published_media_usd: Decimal = Decimal("0")
         # Pricing is config, never constants in this logic (canon §5).
         self._pricing: dict[str, _ModelPricing] = {
             settings.openrouter_dialogue_model: _ModelPricing(
@@ -161,7 +235,7 @@ class CostTracker:
             Decimal(uncached_input) * pricing.input_usd_per_mtok
             + Decimal(cached_tokens) * pricing.cached_input_usd_per_mtok
             + Decimal(output_tokens) * pricing.output_usd_per_mtok
-        ) / _USD_PER_MILLION_TOKENS
+        ) / _PER_MILLION
 
         turn = TurnCost(
             model=model,
@@ -183,21 +257,147 @@ class CostTracker:
         # Immutable accumulation: rebuild the tuple, never mutate a shared
         # list in place (house immutability rule).
         self._turns = (*self._turns, turn)
+        self._stages_recorded |= {_STAGE_LLM}
         return turn
+
+    # ------------------------------------------------------------------
+    # Non-LLM usage (judgment call #6) — metered by the producing stage
+    # ------------------------------------------------------------------
+
+    def record_stt_audio(self, seconds: float) -> None:
+        """Add audio handed to the STT provider, in seconds.
+
+        Deepgram streaming is billed per minute of submitted audio, so the
+        quantity this expects is the duration of the PCM actually sent on
+        the STT socket — not the wall-clock call length, which also counts
+        time before the first offer and after the last frame. Calling this
+        with 0.0 still marks the STT stage as having run.
+        """
+        if seconds < 0:
+            raise ValueError(f"stt audio seconds must be non-negative, got {seconds}")
+        # via str() so the accumulator holds the decimal value the caller
+        # meant rather than a float's binary expansion. Hygiene, not
+        # behaviour: a mutation to `Decimal(seconds)` survives the suite,
+        # because at call-length scales the difference is ~1e-22 s and
+        # cannot move `_billed_stt_seconds()`. Deliberately not pinned by
+        # a test — there is no behaviour to pin.
+        self._stt_seconds += Decimal(str(seconds))
+        self._stages_recorded |= {_STAGE_STT}
+
+    def record_tts_text(self, characters: int) -> None:
+        """Add characters submitted to the TTS provider.
+
+        ElevenLabs bills on submitted characters, so this is counted at
+        dispatch: a sentence whose stream dies part-way was still billed.
+
+        **This figure can differ from the invoice in either direction**,
+        because this class cannot see how far the provider actually got.
+        Three known sources, none measurable from here:
+
+        - *Under*: the stream-input protocol sends two space-bearing
+          frames per sentence — the `{"text": " "}` begin-of-stream frame
+          and the sentence itself as `"<text> "`
+          (app/providers/elevenlabs.py judgment call 2, its lines 208-209)
+          — so two characters per sentence go uncounted.
+        - *Under*: the before-first-byte fallback-voice retry (judgment
+          call 6 there) resubmits a whole sentence invisibly to callers.
+        - *Over*: `ElevenLabsTts.synthesize` is an async **generator**
+          function, so calling it opens no connection; the socket is
+          dialled on the first `anext()`, inside `SpeechDispatcher`'s
+          `async for`. Characters are already counted by then. If the
+          vendor is unreachable, every sentence fails at connect and this
+          ledger records characters the vendor never received — a whole
+          call's worth, ~$0.15 on the docs/16 §5 canonical call, on a row
+          documented as auditable against invoices.
+
+        Dispatch-time counting is still the right default: the common
+        failure is a stream dying mid-sentence, which *was* billed. But a
+        row is a best-effort reconstruction of the invoice, not the
+        invoice.
+        """
+        if characters < 0:
+            raise ValueError(f"tts characters must be non-negative, got {characters}")
+        self._tts_chars += characters
+        self._stages_recorded |= {_STAGE_TTS}
+
+    def record_embedding_tokens(self, tokens: int) -> None:
+        """Add tokens billed by the embeddings provider.
+
+        No caller exists yet: `OpenAIEmbeddings` is not constructed in any
+        composition root (`app/voice/run.py`, `app/api/main.py`,
+        `scripts/demo_cli.py`), so the embeddings stage does not run on
+        any live path and `embeddings_usd` is legitimately zero. This
+        method is the seam the wiring task calls; until then the stage
+        shows up in `finalize()`'s `unrecorded_stages`.
+        """
+        if tokens < 0:
+            raise ValueError(f"embedding tokens must be non-negative, got {tokens}")
+        self._embedding_tokens += tokens
+        self._stages_recorded |= {_STAGE_EMBEDDINGS}
+
+    # ------------------------------------------------------------------
+    # Pricing of the non-LLM components
+    # ------------------------------------------------------------------
+
+    def _billed_stt_seconds(self) -> int:
+        """Judgment call #8: the one rounding, shared by the priced
+        figure and the `stt_seconds` column."""
+        return int(self._stt_seconds.quantize(_WHOLE, rounding=ROUND_HALF_UP))
+
+    def _stt_usd(self) -> Decimal:
+        rate = self._settings.stt_usd_per_audio_minute
+        return Decimal(self._billed_stt_seconds()) * rate / _SECONDS_PER_MINUTE
+
+    def _tts_usd(self) -> Decimal:
+        return Decimal(self._tts_chars) * self._settings.tts_usd_per_mchar / _PER_MILLION
+
+    def _embeddings_usd(self) -> Decimal:
+        rate = self._settings.embeddings_usd_per_mtok
+        return Decimal(self._embedding_tokens) * rate / _PER_MILLION
+
+    def _media_usd(self) -> Decimal:
+        """Everything `call_total()` adds beyond the LLM turns."""
+        return self._stt_usd() + self._tts_usd() + self._embeddings_usd()
+
+    def take_unpublished_media_cost(self) -> Decimal:
+        """Media spend metered since the previous call, and move the
+        watermark (judgment call #9).
+
+        The caller is expected to be publishing to the cross-process
+        `session:{id}.cost_usd` counter docs/15 §6's cost-cap watchdog is
+        specified against, which `record_turn`'s LLM figure alone would
+        leave ~3x low. Sync and free of awaits, so two callers in the same
+        event loop cannot both take the same delta.
+
+        Not idempotent by design: a caller whose Redis write then fails
+        has already consumed the delta and will under-report it. That is
+        the same failure mode `SessionMemory.add_cost` already has for LLM
+        cost (its read-modify-write is unlocked and unretried), and the
+        authoritative ledger is `call_costs`, not this counter.
+        """
+        total = self._media_usd()
+        delta = total - self._published_media_usd
+        self._published_media_usd = total
+        return delta
 
     # ------------------------------------------------------------------
     # Running total + budget guard (docs/05 §3.8 "Budget guard")
     # ------------------------------------------------------------------
 
     def call_total(self) -> Decimal:
-        return sum((turn.cost_usd for turn in self._turns), _ZERO_USD)
+        """Every priced component, per judgment call #7 — not LLM spend
+        alone."""
+        return sum((turn.cost_usd for turn in self._turns), _ZERO_USD) + self._media_usd()
 
     def over_budget(self, cap_usd: Decimal = Decimal("1.00")) -> bool:
         """Strictly-over predicate (docs/05 §3.8: "On call_total() > $1").
-        The default mirrors the frozen Proto; production callers pass
-        `settings.call_cost_cap_usd` explicitly. Acting on a breach (log,
-        span event, degrade signal, escalate offer) is the caller's
-        orchestration, not this predicate's."""
+        The default mirrors the frozen Proto and equals the
+        `settings.call_cost_cap_usd` default; the one production caller
+        (`ConversationManager._run_turn`) takes that default rather than
+        passing the setting, so overriding `CALL_COST_CAP_USD` in env has
+        no effect today. Acting on a breach (log, span event, degrade
+        signal, escalate offer) is the caller's orchestration, not this
+        predicate's."""
         return self.call_total() > cap_usd
 
     # ------------------------------------------------------------------
@@ -249,26 +449,40 @@ class CostTracker:
                 _ZERO_USD,
             )
         )
-        # Judgment call #6: Phase 2 is text-only — non-LLM components are
-        # zero, and total is the sum of the quantized components so the
+        stt_usd = _quantize_usd(self._stt_usd())
+        tts_usd = _quantize_usd(self._tts_usd())
+        embeddings_usd = _quantize_usd(self._embeddings_usd())
+        # coturn is self-hosted, so docs/16 §5 budgets its marginal
+        # per-call cost at $0.00; passed explicitly rather than left to
+        # the column default so the CHECK's six terms are all visible here.
+        turn_infra_usd = _ZERO_USD
+        # Total is the sum of the QUANTIZED components so the
         # ck_call_costs_total_usd CHECK holds by construction.
-        total_usd = llm_dialogue_usd + llm_utility_usd
+        total_usd = (
+            stt_usd
+            + llm_dialogue_usd
+            + llm_utility_usd
+            + embeddings_usd
+            + tts_usd
+            + turn_infra_usd
+        )
 
         async with self._session_factory() as db_session:
             repo = self._cost_repo_factory(db_session)
             await repo.upsert(
                 session_id,
-                stt_usd=_ZERO_USD,
+                stt_usd=stt_usd,
                 llm_dialogue_usd=llm_dialogue_usd,
                 llm_utility_usd=llm_utility_usd,
-                embeddings_usd=_ZERO_USD,
-                tts_usd=_ZERO_USD,
+                embeddings_usd=embeddings_usd,
+                tts_usd=tts_usd,
+                turn_infra_usd=turn_infra_usd,
                 total_usd=total_usd,
-                stt_seconds=0,
+                stt_seconds=self._billed_stt_seconds(),
                 input_tokens=sum(t.input_tokens for t in self._turns),
                 cached_input_tokens=sum(t.cached_input_tokens for t in self._turns),
                 output_tokens=sum(t.output_tokens for t in self._turns),
-                tts_chars=0,
+                tts_chars=self._tts_chars,
             )
             # Repos never commit (app/data/repositories/base.py: "that
             # boundary belongs to whatever opened the session") — finalize
@@ -280,6 +494,17 @@ class CostTracker:
             session_id=session_id,
             total_usd=str(total_usd),
             turns=len(self._turns),
+            stt_usd=str(stt_usd),
+            llm_dialogue_usd=str(llm_dialogue_usd),
+            llm_utility_usd=str(llm_utility_usd),
+            embeddings_usd=str(embeddings_usd),
+            tts_usd=str(tts_usd),
+            # Judgment call #6: the row alone cannot say whether a $0
+            # component means "that stage did not run on this call" or
+            # "that stage ran and its metering is broken". These two
+            # fields are where that distinction is recorded.
+            recorded_stages=sorted(self._stages_recorded),
+            unrecorded_stages=[s for s in _PRICED_STAGES if s not in self._stages_recorded],
         )
 
 

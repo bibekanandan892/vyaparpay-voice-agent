@@ -209,6 +209,22 @@ class ConversationManager:
         self.state: TurnState = TurnState.LISTENING
         self._turn_no = 0
 
+    def record_stt_audio(self, seconds: float) -> None:
+        """Media-stage usage forwarded to this call's cost ledger.
+
+        This class owns the per-call `CostTracker`, and the `Brain` seam
+        (app/voice/worker.py) is the only wire between the voice worker's
+        media stages and it — so STT audio duration and TTS character
+        counts arrive here. They are usage quantities, not transport
+        detail: nothing about SDP, RTP, or codecs crosses this boundary,
+        so docs/05 §1.1's transport-blind rule still holds.
+        """
+        self._cost_tracker.record_stt_audio(seconds)
+
+    def record_tts_text(self, characters: int) -> None:
+        """See `record_stt_audio`."""
+        self._cost_tracker.record_tts_text(characters)
+
     async def on_stt_final(self, text: str) -> str:
         """Opens a turn, runs docs/05 §2's critical path, returns the
         finalized reply. Never raises — a critical-path failure returns
@@ -411,7 +427,15 @@ class ConversationManager:
         #11's `_MAX_REPLY_CHARS` ValueError."""
         if isinstance(event, UsageEvent):
             turn_cost = self._cost_tracker.record_turn(event.usage, event.model, span)
-            await self._session_memory.add_cost(self._session.session_id, turn_cost.cost_usd)
+            # `session:{id}.cost_usd` is the field docs/15 §6's cost-cap
+            # watchdog is specified against, and the only per-call total
+            # another process can read. Publishing LLM spend alone would
+            # leave it ~3x under the real figure (docs/16 §5: LLM is about
+            # a third of a call), so the media metered since the last
+            # round rides along on this same read-modify-write — see
+            # CostTracker judgment call #9 for the residual lag.
+            delta = turn_cost.cost_usd + self._cost_tracker.take_unpublished_media_cost()
+            await self._session_memory.add_cost(self._session.session_id, delta)
         elif (calls := getattr(event, "tool_calls", None)) is not None:
             # Judgment call #1: task 4.3's reassembled-batch event,
             # matched structurally.

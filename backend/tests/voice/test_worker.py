@@ -26,7 +26,7 @@ import pytest
 pytest.importorskip("av", reason="[voice] extra not installed")
 
 import asyncio  # noqa: E402
-from collections.abc import Callable, Iterator  # noqa: E402
+from collections.abc import AsyncIterator, Callable, Iterator  # noqa: E402
 from typing import Any, cast  # noqa: E402
 
 from opentelemetry import trace as otel_trace  # noqa: E402
@@ -42,6 +42,7 @@ from app.domain.voice import (  # noqa: E402
     DC_TYPE_TRANSCRIPT_FINAL,
     DC_TYPE_TRANSCRIPT_PARTIAL,
     DataChannelMessage,
+    SttEvent,
     SttFinal,
     SttPartial,
     SttProvider,
@@ -57,6 +58,7 @@ from app.obs.tracing import (  # noqa: E402
 from app.voice import worker as worker_module  # noqa: E402
 from app.voice.audio_egress import FlushResult  # noqa: E402
 from app.voice.audio_ingress import VAD_HOP_BYTES  # noqa: E402
+from app.voice.stt_supervisor import SttSupervisor  # noqa: E402
 from app.voice.worker import REASK_TEXT, VoiceAgentWorker  # noqa: E402
 from tests.fakes import (  # noqa: E402
     FAKE_TTS_MS_PER_CHAR,
@@ -709,3 +711,145 @@ async def test_interrupted_turn_span_records_the_interruption(
     turn_spans = [s for s in worker_spans.get_finished_spans() if s.name == SPAN_TURN]
     assert len(turn_spans) == 1
     assert _attrs(turn_spans[0])["interrupted"] is True
+
+
+# --------------------------------------------------------------------------
+# Billable media usage reaches the brain's cost ledger (docs/16 §5)
+# --------------------------------------------------------------------------
+
+
+async def test_stt_audio_handed_to_the_provider_is_metered_to_the_brain(
+    settings: Settings,
+) -> None:
+    """Deepgram is billed per audio-minute, so the worker reports the
+    duration of the PCM the provider consumed, end to end through the
+    real worker wiring.
+
+    This case does NOT discriminate the two candidate metering sites —
+    `FakeStt` drains the audio iterator fully, so pump-side and
+    generator-side counting agree here.
+    `test_audio_queued_but_never_consumed_is_not_billed` is the one that
+    separates them.
+    """
+    rig = Rig(settings)
+    rig.brain.script("Understood.")
+    await rig.start()
+    try:
+        await _open_turn(rig, "How much did I take yesterday?")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the agent transcript final",
+        )
+    finally:
+        await rig.stop()
+
+    consumed_bytes = sum(len(chunk) for chunk in rig.stt.audio)
+    assert consumed_bytes > 0  # the assertion below is vacuous otherwise
+    # 16 kHz mono s16 = 32,000 bytes/s (audio_ingress).
+    assert rig.brain.stt_seconds == pytest.approx(consumed_bytes / 32_000)
+
+
+async def test_tts_characters_submitted_are_metered_to_the_brain(
+    settings: Settings,
+) -> None:
+    """ElevenLabs is billed per submitted character. Asserted against
+    `FakeTts.calls` — the exact texts the provider received — so a
+    counter that drifted from what was actually synthesized fails."""
+    rig = Rig(settings)
+    rig.brain.script("First sentence. Second one.")
+    await rig.start()
+    try:
+        await _open_turn(rig, "What happened to my payment?")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the agent transcript final",
+        )
+    finally:
+        await rig.stop()
+
+    assert rig.tts.calls == [("First sentence.", 0), ("Second one.", 1)]
+    assert rig.brain.tts_chars == sum(len(text) for text, _ in rig.tts.calls)
+
+
+async def test_a_sentence_whose_tts_stream_dies_is_still_billed(
+    settings: Settings,
+) -> None:
+    """speech.py judgment call 6: characters are counted at dispatch, so
+    §9's skip-and-continue does not silently erase a sentence the vendor
+    already charged for."""
+    rig = Rig(settings)
+    rig.brain.script("Alpha one. Beta two.")
+    rig.tts.script(
+        "Beta two.",
+        fake_tts_chunk("Beta two."),
+        fail_after=1,
+        error=ConnectionError("elevenlabs stream aborted"),
+    )
+    await rig.start()
+    try:
+        await _open_turn(rig, "Give me the summary.")
+        await _until(
+            lambda: bool(rig.messages_of(DC_TYPE_TRANSCRIPT_FINAL, role="agent")),
+            message="the reply to finish",
+        )
+    finally:
+        await rig.stop()
+
+    assert rig.brain.tts_chars == len("Alpha one.") + len("Beta two.")
+
+
+class _ConsumeOneChunkStt:
+    """`SttProvider` double that reads exactly ONE audio chunk and then
+    ends its stream — the hang-up shape, where the pump has queued audio
+    the provider never receives."""
+
+    def __init__(self) -> None:
+        self.consumed: list[bytes] = []
+
+    async def stream(
+        self, audio: AsyncIterator[bytes], *, sample_rate: int
+    ) -> AsyncIterator[SttEvent]:
+        async for chunk in audio:
+            self.consumed.append(chunk)
+            break
+        no_events: tuple[SttEvent, ...] = ()
+        for event in no_events:  # keeps this an async *generator* function
+            yield event
+
+
+async def test_audio_queued_but_never_consumed_is_not_billed(settings: Settings) -> None:
+    """stt_supervisor judgment call 5, which is the whole reason metering
+    lives in `_queued_audio` and not in `_pump_audio`.
+
+    The ingress is filled and closed BEFORE the supervisor starts, so the
+    pump provably drains every chunk into its queue (its only await is
+    over an already-complete fan-out) before the provider's first
+    `_audio_q.get()` resolves. The provider then takes one chunk and
+    leaves. Deepgram is never sent the rest, so the call must not be
+    billed for it — and a pump-side counter would bill all of it.
+    """
+    from app.voice.audio_ingress import AudioIngress
+
+    ingress = AudioIngress()
+    for _ in range(3):
+        ingress.push_pcm(HOP_PCM, sample_rate=16_000)
+    ingress.close()
+
+    stt = _ConsumeOneChunkStt()
+    metered: list[float] = []
+    supervisor = SttSupervisor(
+        "sess-meter",
+        stt=cast(SttProvider, stt),
+        ingress=ingress,
+        on_event=lambda _e: None,
+        on_stream_died=lambda: None,
+        on_audio_seconds=metered.append,
+    )
+
+    await asyncio.wait_for(supervisor.run(), timeout=5)
+
+    consumed_bytes = sum(len(chunk) for chunk in stt.consumed)
+    # The provider got strictly less than the ingress delivered — without
+    # this the test could not tell the two metering sites apart.
+    assert 0 < consumed_bytes < 3 * VAD_HOP_BYTES
+    assert sum(metered) == pytest.approx(consumed_bytes / 32_000)
