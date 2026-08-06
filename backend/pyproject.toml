@@ -56,6 +56,14 @@ dev = [
     # (see the audit note at the top of .github/workflows/ci.yml). A
     # dashboard guard that silently stops running is worse than none.
     "pyyaml>=6.0",
+    # A hang is worse than a failure: it reports nothing and blocks
+    # everything behind it. PR #66 fixed a leaked span-exporter thread
+    # that wedged `pytest tests` indefinitely, at a point that moved
+    # between runs; a 202-minute-old pytest process was found on a
+    # developer machine for a suite that finishes in 38 seconds. Nothing
+    # in the suite bounded it, because the only protection was authors
+    # remembering to wrap every wait. See [tool.pytest.ini_options].
+    "pytest-timeout>=2.3",
 ]
 # Phase-3 voice worker only — agent-api and the test suite never import
 # these, so the base install stays lean (`pip install -e ".[dev,voice]"`
@@ -87,6 +95,24 @@ asyncio_mode = "auto"
 # tests/models/test_orm.py. Pin every async fixture to the per-test loop.
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+# Turn a hang into a named failing test. Deliberately generous: the whole
+# non-Docker suite runs in ~36s and the slowest single test is well under
+# a second, so 60s cannot fire on a merely slow test — only on something
+# genuinely wedged. It is a backstop, not a performance budget, and it is
+# set high on purpose so nobody is tempted to raise it for a flaky test
+# instead of fixing the wait.
+#
+# `method = "thread"` rather than the default `signal`: `signal` relies on
+# SIGALRM, which does not exist on Windows, and this project is developed
+# on Windows and tested on Linux CI. A guard that silently does nothing on
+# the machine where the bug was found would be worse than none — that is
+# the same failure mode as the importorskip note above.
+#
+# The thread method cannot interrupt a C-level blocking call, so this does
+# not bound every conceivable hang. It bounds the ones seen so far.
+timeout = 60
+timeout_method = "thread"
 
 [tool.ruff]
 line-length = 100
