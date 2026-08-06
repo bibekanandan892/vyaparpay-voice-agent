@@ -20,6 +20,7 @@ import orjson
 import pytest
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from structlog.testing import capture_logs
 
 from app.agent.llm_router import LLMRouter
 from app.config import Settings
@@ -464,6 +465,37 @@ async def test_ttft_stall_on_retry_propagates_after_exactly_two_attempts(
 
     assert provider.call_count == 2  # never a third attempt
     assert provider.cancelled_streams == 2
+
+
+async def test_ttft_deadline_defaults_to_the_settings_value(
+    settings: Settings,
+) -> None:
+    """`stream()` called WITHOUT `ttft_deadline_s` — the shape every
+    turn-path caller uses — must resolve the deadline from
+    `Settings.llm_ttft_deadline_s`, not the previously hardcoded 1.5.
+    Made configurable when the first live end-to-end run (2026-08-07)
+    showed a slow free-tier model losing the 1.5 s deadline-plus-one-
+    retry race often enough to fail whole turns.
+
+    Proven via the deadline-exceeded warning's own logged value rather
+    than by timing: 0.05 in that log line can only have come from the
+    settings object — a regression back to the hardcoded default would
+    log 1.5 (and take 1.5 real seconds to get there)."""
+    scripted_usage = _usage_event()
+    provider = _StallingLLM(
+        [TokenEvent(delta={"content": "Hello"}), scripted_usage], stall_attempts=1
+    )
+    tuned = settings.model_copy(update={"llm_ttft_deadline_s": 0.05})
+    router = _router(provider, tuned)
+
+    with capture_logs() as logs:
+        events = await _collect(router.stream(_USER_MESSAGE, tier=ModelTier.DIALOGUE))
+
+    assert events == [TokenEvent(delta={"content": "Hello"}), scripted_usage]
+    warning = next(
+        entry for entry in logs if entry["event"] == "llm_router.ttft_deadline_exceeded"
+    )
+    assert warning["ttft_deadline_s"] == 0.05
 
 
 # --------------------------------------------------------------------------

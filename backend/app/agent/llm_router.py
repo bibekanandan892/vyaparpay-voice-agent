@@ -370,7 +370,7 @@ class LLMRouter:
         *,
         tier: ModelTier,
         tools: list[dict[str, Any]] | None = None,
-        ttft_deadline_s: float = 1.5,
+        ttft_deadline_s: float | None = None,
     ) -> AsyncIterator[LLMEvent]:
         """Stream one completion: adapt to wire shape, apply the TTFT
         deadline/one-retry policy, pass content `TokenEvent`s and the
@@ -378,7 +378,21 @@ class LLMRouter:
         CostTracker), and yield reassembled `ToolCallsEvent`s in place of
         raw tool-call fragments. See the module docstring for the policy
         scope, judgment calls, and the `llm.total`/`llm.ttft` span
-        boundaries (module docstring)."""
+        boundaries (module docstring).
+
+        `ttft_deadline_s=None` (the default every turn-path caller uses)
+        resolves to `Settings.llm_ttft_deadline_s`. Made configurable
+        during the first live end-to-end run (2026-08-07): the old
+        hardcoded 1.5 s was docs/05 §3.4's budget for *paid, voice-grade*
+        models, and a free-tier model that routinely needs longer to
+        produce its first token lost the deadline-plus-one-retry race
+        often enough to fail whole turns. The number is an environment
+        fact, not an architectural constant — so it lives in Settings
+        with the doc-canonical 1.5 s as its default. Callers with their
+        OWN latency contract (Summarizer's fold passes 15 s explicitly)
+        are unaffected."""
+        if ttft_deadline_s is None:
+            ttft_deadline_s = self._settings.llm_ttft_deadline_s
         wire_messages = [message.to_wire() for message in messages]
         models = self._models_for(tier)
         # llm.total wraps the ENTIRE call — opened here, closed on every

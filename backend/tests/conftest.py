@@ -60,6 +60,37 @@ from tests.fakes import FakeLLM
 SettingsFactory = Callable[..., Settings]
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _settings_ignore_dotenv() -> Iterator[None]:
+    """Make the module docstring's "never a real `.env` — hermetic" claim
+    actually true. It wasn't: `Settings.model_config` names
+    `env_file=".env"`, resolved against the CWD at construction time, so
+    every `Settings(...)` built anywhere in this suite silently absorbed
+    a real `backend/.env` for every field the caller didn't pass
+    explicitly. Invisible for the project's whole life only because no
+    `.env` existed on any machine that ran the tests — the first live
+    end-to-end run (2026-08-07) created one, and 14 tests failed at once:
+    `ELEVENLABS_API_KEY=` (an empty string) is `SecretStr("")`, not the
+    `None` the fail-fast tests construct for, and the cost-pricing tests
+    started pricing whatever model slugs the developer's real `.env`
+    happened to name.
+
+    Session-scoped and autouse so it covers EVERY construction site —
+    the `settings_factory` fixture, `_session_span_exporter`'s own
+    direct `Settings(...)`, and each test file's local helper — without
+    every one of them having to remember a `_env_file=None` argument
+    (the per-call-site alternative, rejected because a single forgotten
+    site silently regresses this). Deliberately narrow: only the env
+    FILE is suppressed; real environment variables keep their normal
+    pydantic-settings precedence, since CI legitimately configures
+    test processes through them.
+    """
+    saved = Settings.model_config.get("env_file")
+    Settings.model_config["env_file"] = None
+    yield
+    Settings.model_config["env_file"] = saved
+
+
 @pytest.fixture
 def settings_factory() -> SettingsFactory:
     """Factory, not a bare instance, so a test that needs one field

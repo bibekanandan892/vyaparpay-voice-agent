@@ -131,6 +131,14 @@ class Settings(BaseSettings):
 
     session_ttl_seconds: int = 86400
     rate_limit_sessions_per_min: int = 5
+    # First-token deadline for turn-path LLM calls (docs/05 §3.4's
+    # deadline/one-retry policy). The 1.5 s default is that doc's budget
+    # for paid, voice-grade models; raise it (e.g. to 8.0) when running
+    # against slower models — free-tier pools routinely exceed 1.5 s to
+    # first token, and every miss burns the one retry or fails the turn.
+    # Summarizer's fold passes its own generous deadline explicitly and
+    # ignores this.
+    llm_ttft_deadline_s: float = 1.5
     # INERT as of Phase-5 B7: no production code reads this field (only
     # tests/agent/test_cost_tracker.py compares against it). The single
     # budget check in `app/` is `ConversationManager._run_turn`'s

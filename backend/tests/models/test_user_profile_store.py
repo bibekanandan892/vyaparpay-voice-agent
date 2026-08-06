@@ -56,6 +56,7 @@ from sqlalchemy.ext.asyncio import (
 from testcontainers.postgres import PostgresContainer
 
 from app.data.repositories.user_profile_repo import UserProfileRepo
+from app.domain.types import SessionUser
 from app.memory.user_profile import IssueOpen, UserProfileMemory
 from app.models.orm import UserProfile as UserProfileRow
 
@@ -214,7 +215,7 @@ async def test_load_returns_an_empty_profile_for_a_merchant_with_no_row(
 ) -> None:
     memory = UserProfileMemory(UserProfileRepo(session))
 
-    profile = await memory.load("usr_never_called")
+    profile = await memory.load(SessionUser(user_id="usr_never_called"))
 
     assert profile.user_id == "usr_never_called"
     assert profile.facts.business_name is None
@@ -230,7 +231,7 @@ async def test_merge_then_load_round_trips_through_jsonb(session: AsyncSession) 
     memory = UserProfileMemory(UserProfileRepo(session))
 
     written = await memory.merge_post_call(
-        "usr_roundtrip",
+        SessionUser(user_id="usr_roundtrip"),
         session_id=CALL,
         extraction={
             "facts": {"business_name": "Kumar General Store", "city": "Jaipur"},
@@ -244,7 +245,7 @@ async def test_merge_then_load_round_trips_through_jsonb(session: AsyncSession) 
             )
         ],
     )
-    reloaded = await memory.load("usr_roundtrip")
+    reloaded = await memory.load(SessionUser(user_id="usr_roundtrip"))
 
     assert reloaded.facts == written.facts
     assert reloaded.preferences == written.preferences
@@ -257,10 +258,10 @@ async def test_a_second_merge_folds_onto_the_stored_row(session: AsyncSession) -
     memory = UserProfileMemory(UserProfileRepo(session))
 
     await memory.merge_post_call(
-        "usr_fold", session_id=CALL, extraction={"facts": {"city": "Jaipur"}}
+        SessionUser(user_id="usr_fold"), session_id=CALL, extraction={"facts": {"city": "Jaipur"}}
     )
     profile = await memory.merge_post_call(
-        "usr_fold",
+        SessionUser(user_id="usr_fold"),
         session_id=LATER_CALL,
         extraction={"facts": {"account_type": "Merchant Pro"}},
     )
@@ -286,7 +287,7 @@ async def test_load_launders_a_row_postgres_really_stored(session: AsyncSession)
     await session.flush()
     memory = UserProfileMemory(UserProfileRepo(session))
 
-    profile = await memory.load("usr_junk")
+    profile = await memory.load(SessionUser(user_id="usr_junk"))
 
     assert profile.facts.business_name == "Kumar General Store"
     assert "mood" not in profile.facts.model_dump()
@@ -307,7 +308,7 @@ async def test_merge_does_not_write_back_disallowed_keys(session: AsyncSession) 
     memory = UserProfileMemory(UserProfileRepo(session))
 
     await memory.merge_post_call(
-        "usr_launder",
+        SessionUser(user_id="usr_launder"),
         session_id=LATER_CALL,
         extraction={"facts": {"account_type": "Merchant Pro"}},
     )
@@ -329,7 +330,7 @@ async def test_a_profile_can_exist_without_a_merchant_row(session: AsyncSession)
     memory = UserProfileMemory(UserProfileRepo(session))
 
     profile = await memory.merge_post_call(
-        "usr_no_merchant_row_exists",
+        SessionUser(user_id="usr_no_merchant_row_exists"),
         session_id=CALL,
         extraction={"facts": {"city": "Jaipur"}},
     )
