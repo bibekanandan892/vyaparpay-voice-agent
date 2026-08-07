@@ -259,23 +259,35 @@ class SignalingServer:
             )
         finally:
             # post-call-pipeline-wiring CRITICAL fix: teardown must
-            # actually COMPLETE — `_close_peer` awaits `CallSession.close()`,
-            # which awaits `VoiceAgentWorker.run()` to finish (including its
-            # own finally's finalize+end, worker.py) — before this
-            # session_id's slot in `_active` is freed. Popping first (the
-            # old order) reopened the `session_id in self._active` gate
-            # above immediately on disconnect, well before finalize+end had
-            # run; a reconnect racing that window built a SECOND
-            # CallSession/VoiceAgentWorker/CostTracker for a call whose
-            # finalize+end hadn't run yet, corrupting call_costs (a
-            # last-write-wins upsert) or crashing a worker task (colliding
-            # `conversation_turns` PKs from two independent 1-based turn
-            # sequences) or silently losing the second CostTracker's totals
-            # (SessionManager.end()'s duplicate-end no-op). Reordering is
-            # what actually closes the window: the existing docs/06 §8
-            # "single active connection per session" rejection already
-            # handles a reconnect correctly — it just needs `_active` to
-            # stay occupied for the FULL teardown, not merely the WS half.
+            # actually COMPLETE — `_close_peer` awaits `CallSession.close()`
+            # — before this session_id's slot in `_active` is freed.
+            # Popping first (the old order) reopened the `session_id in
+            # self._active` gate above immediately on disconnect, well
+            # before finalize+end had run; a reconnect racing that window
+            # built a SECOND CallSession/VoiceAgentWorker/CostTracker for
+            # a call whose finalize+end hadn't run yet, corrupting
+            # call_costs (a last-write-wins upsert) or crashing a worker
+            # task (colliding `conversation_turns` PKs from two
+            # independent 1-based turn sequences) or silently losing the
+            # second CostTracker's totals (SessionManager.end()'s
+            # duplicate-end no-op). Reordering is what actually closes
+            # the window: the existing docs/06 §8 "single active
+            # connection per session" rejection already handles a
+            # reconnect correctly — it just needs `_active` to stay
+            # occupied for the FULL teardown, not merely the WS half.
+            #
+            # CORRECTED 2026-08-07 (second review pass, same day): this
+            # comment used to say `CallSession.close()` guarantees the
+            # above by awaiting `VoiceAgentWorker.run()` to finish. That
+            # stopped being true the moment `run()`'s own finally started
+            # shielding its finalize work from `close()`'s bounded cancel
+            # (worker.py, HIGH fix, same day) — `run()`'s task can now
+            # finish while finalize is still writing. `CallSession.close()`
+            # (its own judgment call 7) now closes THIS window itself, by
+            # separately awaiting `VoiceAgentWorker.finalize_task` before
+            # returning — the guarantee this comment describes still
+            # holds, just via a different mechanism than when it was
+            # first written.
             await self._close_peer(peer, session_id)
             await self._close_transport(transport, _WS_NORMAL, "session closed")
             self._active.pop(session_id, None)

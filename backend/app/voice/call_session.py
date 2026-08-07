@@ -42,7 +42,10 @@ Judgment calls, flagged per house style:
    the worker's fan-out loops), then stop the paced egress, then await
    everything with a timeout — anything still pending is cancelled
    loudly, never leaked. A worker turn mid-brain-call at hang-up gets
-   `_CLOSE_TIMEOUT_S` to finish before the cancel.
+   `_CLOSE_TIMEOUT_S` to finish before the cancel. **This budget covers
+   the TURN LOOP only — see judgment call 7 for why the post-call
+   finalize phase is deliberately NOT bounded by it, and never cancelled
+   at all.**
 6. **`ContextDispatcher` (Phase-4 T4, `app/voice/context_dispatch.py`)
    wiring is independent of `deps`.** `snapshot_ingestor`/`event_log` are
    their own optional constructor pair — ctx.* capture has nothing to do
@@ -62,6 +65,28 @@ Judgment calls, flagged per house style:
    ingress-fan-out drains — the dispatcher's queue has no other "no more
    messages" signal and would otherwise never finish before
    `_CLOSE_TIMEOUT_S` expires on every single call.
+7. **`close()` separately awaits `VoiceAgentWorker.finalize_task` AFTER
+   the bounded-wait-then-cancel loop above, with its own budget
+   (`_FINALIZE_TIMEOUT_S`) — and never cancels it.** CRITICAL fix
+   (2026-08-07, second review pass, same day as judgment call 5's
+   original comment): worker.py shields `on_call_ended` (finalize+end)
+   from `_CLOSE_TIMEOUT_S`'s cancel so a slow finalize is never
+   interrupted mid-write — but that means `run()`'s own task can now
+   finish (as cancelled) BEFORE finalize actually has, so `close()`
+   returning the moment `run()`'s task is done no longer implies
+   finalize is done. That distinction matters because
+   `SignalingServer.handle_connection`'s finally (signaling.py judgment
+   call 9) frees this call's `_active[session_id]` slot only after
+   `close()` returns — a reconnect racing a freed-too-early slot builds
+   a SECOND `CallSession`/`VoiceAgentWorker`/`CostTracker` for a
+   session_id whose finalize hasn't actually finished, corrupting
+   `call_costs` (last-write-wins) or colliding on `conversation_turns`
+   primary keys — the exact failure mode a prior fix (signaling.py's own
+   comment) already closed once. `close()` re-closes it here by reading
+   `worker.finalize_task` directly (exposed for exactly this) and
+   waiting for it — not cancelling it if `_FINALIZE_TIMEOUT_S` elapses,
+   only logging loudly, because the one invariant that must never break
+   again is "this write is never interrupted."
 
 Docs: docs/06 §1.1 (the worker's row), docs/04 §4 (DI split).
 Tests: tests/voice/test_run.py (shared wiring, via the shim),
@@ -91,6 +116,18 @@ from app.voice.worker import BuiltBrain, VoiceAgentWorker
 log = get_logger(__name__)
 
 _CLOSE_TIMEOUT_S: Final = 5.0
+
+# Judgment call 7. Generous on purpose, and NOT the same knob as
+# _CLOSE_TIMEOUT_S: it bounds `close()`'s own wait for
+# VoiceAgentWorker.finalize_task, which it never cancels on expiry (only
+# logs). Sized against summarizer.py's own `_FOLD_TIMEOUT_S` (45.0s, the
+# real bound on ONE LLM summarization call) plus headroom for the two DB
+# writes (CostTracker.finalize, SessionManager.end) either side of it —
+# on_call_ended can trigger at most one such fold (session_manager.py's
+# end() -> fold_pending(), for whatever tail turns summarizer.drain()
+# didn't already cover), so this does not need to cover two folds back
+# to back.
+_FINALIZE_TIMEOUT_S: Final = 60.0
 
 
 @dataclass(frozen=True)
@@ -159,6 +196,10 @@ class CallSession:
         )
         # Judgment call 1: started lazily from handle_offer().
         self._egress_task: asyncio.Task[None] | None = None
+        # Judgment call 7: close() needs to reach worker.finalize_task
+        # directly, separately from waiting on worker_task itself. None
+        # in deps-less (placeholder) mode, where there is no real worker.
+        self._worker: VoiceAgentWorker | None = None
         tasks: list[asyncio.Task[None]] = []
         if self._context_dispatcher is not None:
             tasks.append(
@@ -189,6 +230,7 @@ class CallSession:
                 send_message=self._peer.send_data_channel,
                 settings=deps.settings,
             )
+            self._worker = worker
             # Judgment call 4: the worker task starts now; its loops idle
             # on the empty fan-outs until media flows.
             worker_task = asyncio.create_task(worker.run(), name=f"worker-run:{session_id}")
@@ -225,14 +267,20 @@ class CallSession:
     async def close(self) -> None:
         """Judgment call 5: peer → egress stop → bounded wait → loud
         cancel. `_egress_task` may be None if the connection closed
-        before any offer arrived."""
+        before any offer arrived. Judgment call 7: THEN, separately,
+        wait for the worker's post-call finalize to genuinely finish —
+        see that judgment call for why this method does not return, and
+        `_active[session_id]` does not free, until it has (or has been
+        given every reasonable chance to)."""
         await self._peer.close()
         self._egress.stop()
         if self._context_dispatcher is not None:
-            # ContextDispatcher judgment call 7: sentinel, not cancellation
-            # — the channel is already shut, so run() drains promptly
-            # instead of the bounded wait below always paying the full
-            # _CLOSE_TIMEOUT_S on a task that never ends on its own.
+            # ContextDispatcher judgment call 7 (its own, unrelated
+            # numbering — context_dispatch.py's docstring): sentinel, not
+            # cancellation — the channel is already shut, so run() drains
+            # promptly instead of the bounded wait below always paying
+            # the full _CLOSE_TIMEOUT_S on a task that never ends on its
+            # own.
             self._context_dispatcher.close()
         tasks = self._tasks if self._egress_task is None else (*self._tasks, self._egress_task)
         done, pending = await asyncio.wait(tasks, timeout=_CLOSE_TIMEOUT_S)
@@ -250,6 +298,54 @@ class CallSession:
                     task=task.get_name(),
                     error=repr(task.exception()),
                 )
+        await self._await_finalize()
+
+    async def _await_finalize(self) -> None:
+        """Judgment call 7 (CRITICAL fix, 2026-08-07). By the time this
+        runs, `worker_task` — one of `tasks` above — is guaranteed to be
+        in `done` or already `gather()`-ed to completion, and `run()`'s
+        finally always runs on the way there (finally blocks run under
+        cancellation too), so `self._worker.finalize_task` is reliably
+        set here whenever `self._worker` is not None. What it is NOT
+        guaranteed to be is FINISHED — worker.py shields it from exactly
+        the cancellation `close()` may have just delivered above.
+
+        `asyncio.wait(..., timeout=...)`, not `wait_for` — `wait_for`
+        cancels its argument on timeout, which is precisely the bug this
+        whole fix removes; `wait()` only stops WAITING, it never touches
+        the task. If `_FINALIZE_TIMEOUT_S` elapses, the finalize task is
+        still left running to its own real completion in the background,
+        and the done-callback worker.py already attached
+        (`_log_finalize_crash`) is what still logs a genuine late
+        failure — this method's own log line below is only for "still
+        running, close() is giving up waiting", not for the task's
+        eventual outcome."""
+        task = self._worker.finalize_task if self._worker is not None else None
+        if task is None:
+            return
+        done, pending = await asyncio.wait({task}, timeout=_FINALIZE_TIMEOUT_S)
+        if pending:
+            log.error(
+                "voice_worker.finalize_still_pending_after_close",
+                session_id=self._session_id,
+                timeout_s=_FINALIZE_TIMEOUT_S,
+            )
+            return
+        (finished,) = done
+        if not finished.cancelled() and finished.exception() is not None:
+            # Already logged once by worker.py's own `except Exception`
+            # branch inside run() when this ISN'T the cancelled-outer-
+            # task case — this covers the other path: `finalize_task`
+            # failing on its own terms, with nothing else ever having
+            # awaited it directly. `_log_finalize_crash`'s done-callback
+            # also logs this same exception; a duplicate log line here
+            # is preferable to a failed finalize being invisible from
+            # close()'s own perspective.
+            log.error(
+                "voice_worker.finalize_failed",
+                session_id=self._session_id,
+                error=repr(finished.exception()),
+            )
 
 
 __all__ = ["CallDeps", "CallSession"]
