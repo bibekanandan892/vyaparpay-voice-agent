@@ -222,15 +222,18 @@ async def test_reset_seed_rows_deletes_in_fk_safe_order() -> None:
     merchant (exactly the "demo rehearsal" scenario --reset exists for),
     deleting merchants without first clearing the agent-zone tables that
     reference it (no ON DELETE CASCADE, app/models/orm.py) raises an
-    IntegrityError. This pins the full 8-delete, child-to-parent order:
-    call_costs/tool_invocations/conversation_turns (all -> conversations)
-    -> conversations -> transactions -> merchant_limits -> wallet_accounts
-    -> merchants."""
+    IntegrityError. `conversation_summaries` joined this list after the
+    first live end-to-end run (2026-08-07) hit the same IntegrityError
+    once Phase 5's post-call pipeline started actually writing rows there.
+    This pins the full 9-delete, child-to-parent order:
+    call_costs/tool_invocations/conversation_turns/conversation_summaries
+    (all -> conversations) -> conversations -> transactions ->
+    merchant_limits -> wallet_accounts -> merchants."""
     session = make_session()
 
     await seed_module.reset_seed_rows(session)
 
-    assert session.execute.await_count == 8
+    assert session.execute.await_count == 9
     tables_in_order = [
         str(c.args[0].compile(dialect=postgresql.dialect()))
         for c in session.execute.await_args_list
@@ -238,11 +241,12 @@ async def test_reset_seed_rows_deletes_in_fk_safe_order() -> None:
     assert "DELETE FROM call_costs" in tables_in_order[0]
     assert "DELETE FROM tool_invocations" in tables_in_order[1]
     assert "DELETE FROM conversation_turns" in tables_in_order[2]
-    assert "DELETE FROM conversations" in tables_in_order[3]
-    assert "DELETE FROM transactions" in tables_in_order[4]
-    assert "DELETE FROM merchant_limits" in tables_in_order[5]
-    assert "DELETE FROM wallet_accounts" in tables_in_order[6]
-    assert "DELETE FROM merchants" in tables_in_order[7]
+    assert "DELETE FROM conversation_summaries" in tables_in_order[3]
+    assert "DELETE FROM conversations" in tables_in_order[4]
+    assert "DELETE FROM transactions" in tables_in_order[5]
+    assert "DELETE FROM merchant_limits" in tables_in_order[6]
+    assert "DELETE FROM wallet_accounts" in tables_in_order[7]
+    assert "DELETE FROM merchants" in tables_in_order[8]
     session.flush.assert_awaited_once()
 
 
@@ -258,19 +262,20 @@ async def test_reset_seed_rows_scopes_deletes_to_the_seeded_keys() -> None:
     compiled = [
         c.args[0].compile(dialect=postgresql.dialect()) for c in session.execute.await_args_list
     ]
-    # The 3 agent-zone deletes (call_costs, tool_invocations,
-    # conversation_turns) are scoped via an `IN (SELECT session_id FROM
-    # conversations WHERE user_id = :user_id_1)` subquery, not a direct
-    # column on those tables (none of them carry merchant_id) — the
-    # subquery's own WHERE clause is what's actually scoped.
-    for i in range(3):
+    # The 4 agent-zone deletes (call_costs, tool_invocations,
+    # conversation_turns, conversation_summaries) are scoped via an
+    # `IN (SELECT session_id FROM conversations WHERE user_id = :user_id_1)`
+    # subquery, not a direct column on those tables (none of them carry
+    # merchant_id) — the subquery's own WHERE clause is what's actually
+    # scoped.
+    for i in range(4):
         assert compiled[i].params["user_id_1"] == "usr_rajesh01"
-    assert compiled[3].params["user_id_1"] == "usr_rajesh01"  # DELETE FROM conversations itself
-    assert compiled[4].params["txn_id_1"] == "txn_0724_1414a"
-    assert compiled[5].params["merchant_id_1"] == "usr_rajesh01"
-    assert compiled[5].params["limit_type_1"] == "daily_txn"
-    assert compiled[6].params["wallet_id_1"] == "wal_rajesh01"
-    assert compiled[7].params["merchant_id_1"] == "usr_rajesh01"
+    assert compiled[4].params["user_id_1"] == "usr_rajesh01"  # DELETE FROM conversations itself
+    assert compiled[5].params["txn_id_1"] == "txn_0724_1414a"
+    assert compiled[6].params["merchant_id_1"] == "usr_rajesh01"
+    assert compiled[6].params["limit_type_1"] == "daily_txn"
+    assert compiled[7].params["wallet_id_1"] == "wal_rajesh01"
+    assert compiled[8].params["merchant_id_1"] == "usr_rajesh01"
 
 
 # --------------------------------------------------------------------------

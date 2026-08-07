@@ -55,7 +55,13 @@ from app.config import get_settings
 from app.data import create_engine_and_sessionmaker
 from app.data.repositories import LimitRepo, MerchantRepo, PaymentRepo, WalletRepo
 from app.models import Merchant, MerchantLimit, Transaction, WalletAccount
-from app.models.orm import CallCost, Conversation, ConversationTurn, ToolInvocation
+from app.models.orm import (
+    CallCost,
+    Conversation,
+    ConversationSummary,
+    ConversationTurn,
+    ToolInvocation,
+)
 
 # --------------------------------------------------------------------------
 # Canonical fixture facts (docs/01 §6-7, docs/12 §8) — kept as named
@@ -135,22 +141,28 @@ async def reset_seed_rows(session: AsyncSession) -> None:
     function only cleared the business-zone rows): `conversations.user_id`
     references `merchants.merchant_id` with no `ON DELETE CASCADE`
     (app/models/orm.py), and `conversation_turns`/`tool_invocations`/
-    `call_costs` each reference `conversations.session_id` the same way.
-    Once any real call happens against `usr_rajesh01` — i.e. exactly the
-    "demo rehearsal" scenario `--reset` exists for — a `Conversation` row
-    exists, and deleting `merchants` without clearing these first raises
-    an `IntegrityError`. None of `ConversationRepo`/`ToolAuditRepo`/
-    `CostRepo` expose a `delete` (deliberately — `ToolAuditRepo`'s own
-    docstring calls itself "insert-only from the tool path"), so these
-    four deletes go through Core directly, scoped via a subquery on this
-    merchant's `session_id`s rather than a second, easy-to-typo `merchant_id`
-    filter repeated four times.
+    `call_costs`/`conversation_summaries` each reference
+    `conversations.session_id` the same way. Once any real call happens
+    against `usr_rajesh01` — i.e. exactly the "demo rehearsal" scenario
+    `--reset` exists for — a `Conversation` row exists, and deleting
+    `merchants` without clearing these first raises an `IntegrityError`.
+    `conversation_summaries` joined this list only once Phase 5's post-call
+    pipeline started actually writing rows there — a live end-to-end run
+    (2026-08-07) is what surfaced the gap. None of `ConversationRepo`/
+    `ToolAuditRepo`/`CostRepo` expose a `delete` (deliberately —
+    `ToolAuditRepo`'s own docstring calls itself "insert-only from the tool
+    path"), so these five deletes go through Core directly, scoped via a
+    subquery on this merchant's `session_id`s rather than a second,
+    easy-to-typo `merchant_id` filter repeated five times.
     """
     session_ids = select(Conversation.session_id).where(Conversation.user_id == MERCHANT_ID)
     await session.execute(delete(CallCost).where(CallCost.session_id.in_(session_ids)))
     await session.execute(delete(ToolInvocation).where(ToolInvocation.session_id.in_(session_ids)))
     await session.execute(
         delete(ConversationTurn).where(ConversationTurn.session_id.in_(session_ids))
+    )
+    await session.execute(
+        delete(ConversationSummary).where(ConversationSummary.session_id.in_(session_ids))
     )
     await session.execute(delete(Conversation).where(Conversation.user_id == MERCHANT_ID))
 
