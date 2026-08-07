@@ -189,7 +189,7 @@ public class CallController(
                 startAnswerTimeout()
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Throwable) {
+            } catch (_: Throwable) {
                 // Connect refused or peer bootstrap failed — either way the
                 // control plane never came up (docs/03 §3.2's Signaling
                 // failure). The cause was a transport/native error, not a
@@ -332,51 +332,81 @@ public class CallController(
 
     private suspend fun collectSignalingFrames() {
         signaling.frames.collect { frame ->
-            when (frame) {
-                is SignalFrame.Answer -> {
-                    answerTimeoutJob?.cancel()
-                    answerTimeoutJob = null
-                    try {
-                        webRtc.applyAnswer(Sdp(frame.sdp))
-                        dispatch(CallEvent.AnswerApplied)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        dispatch(CallEvent.Failed(ApiError.UNKNOWN))
+            // Whole-branch try/catch (found live, real device, same session
+            // as openTransport's Throwable widening): this collector runs
+            // as a sibling coroutine to openTransport's — launched before
+            // its try block, never inside it — so that fix covered none of
+            // these branches. webRtc.addRemoteCandidate below is the same
+            // native PeerConnection surface as webRtc.start/applyAnswer,
+            // both already known Error-capable; an uncaught throw here
+            // escaped this coroutine exactly like the openTransport case
+            // did, with the same outcome (serviceScope's SupervisorJob had
+            // nothing left to catch it, the process died). The existing
+            // inner try/catch on the Answer branch is left as-is — this is
+            // a backstop for the other four, not a replacement for it.
+            try {
+                when (frame) {
+                    is SignalFrame.Answer -> {
+                        answerTimeoutJob?.cancel()
+                        answerTimeoutJob = null
+                        try {
+                            webRtc.applyAnswer(Sdp(frame.sdp))
+                            dispatch(CallEvent.AnswerApplied)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            dispatch(CallEvent.Failed(ApiError.UNKNOWN))
+                        }
                     }
+                    is SignalFrame.RemoteIce -> webRtc.addRemoteCandidate(
+                        // candidate == null is the end-of-candidates marker —
+                        // forwarded, and a no-op inside the client (docs/13 §6).
+                        RemoteIceCandidate(frame.candidate, frame.sdpMid, frame.sdpMLineIndex),
+                    )
+                    is SignalFrame.Bye -> dispatch(CallEvent.RemoteBye(frame.reason))
+                    is SignalFrame.ServerError ->
+                        // Same code vocabulary as REST (docs/13 §6); unknown
+                        // members fold to UNKNOWN (§9). The reducer decides
+                        // whether it is fatal for the current phase.
+                        dispatch(CallEvent.Failed(ApiError.fromWireCode(frame.code)))
+                    is SignalFrame.Closed -> dispatch(CallEvent.SignalingClosed)
                 }
-                is SignalFrame.RemoteIce -> webRtc.addRemoteCandidate(
-                    // candidate == null is the end-of-candidates marker —
-                    // forwarded, and a no-op inside the client (docs/13 §6).
-                    RemoteIceCandidate(frame.candidate, frame.sdpMid, frame.sdpMLineIndex),
-                )
-                is SignalFrame.Bye -> dispatch(CallEvent.RemoteBye(frame.reason))
-                is SignalFrame.ServerError ->
-                    // Same code vocabulary as REST (docs/13 §6); unknown
-                    // members fold to UNKNOWN (§9). The reducer decides
-                    // whether it is fatal for the current phase.
-                    dispatch(CallEvent.Failed(ApiError.fromWireCode(frame.code)))
-                is SignalFrame.Closed -> dispatch(CallEvent.SignalingClosed)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                dispatch(CallEvent.Failed(ApiError.UNKNOWN))
             }
         }
     }
 
     private suspend fun collectRtcEvents() {
         webRtc.events.collect { event ->
-            when (event) {
-                is RtcEvent.IceCandidateFound -> signaling.send(
-                    // Trickle out immediately — media starts on the first
-                    // working pair (docs/06 §2).
-                    OutboundSignal.LocalIce(
-                        candidate = event.candidate.candidate,
-                        sdpMid = event.candidate.sdpMid,
-                        sdpMLineIndex = event.candidate.sdpMLineIndex,
-                    ),
-                )
-                RtcEvent.PeerConnected -> dispatch(CallEvent.PeerConnected)
-                RtcEvent.TransportLost -> dispatch(CallEvent.TransportLost)
-                RtcEvent.TransportResumed -> dispatch(CallEvent.TransportResumed)
-                RtcEvent.Closed -> Unit // teardown converges via ReleaseCall
+            // Same backstop as collectSignalingFrames, same reason: a
+            // sibling coroutine to openTransport's try/catch, not inside
+            // it. signaling.send below can throw (the socket can already
+            // be gone by the time the first ICE candidate arrives), and
+            // every branch here touches the same native WebRTC surface
+            // openTransport's own Throwable fix was written for.
+            try {
+                when (event) {
+                    is RtcEvent.IceCandidateFound -> signaling.send(
+                        // Trickle out immediately — media starts on the first
+                        // working pair (docs/06 §2).
+                        OutboundSignal.LocalIce(
+                            candidate = event.candidate.candidate,
+                            sdpMid = event.candidate.sdpMid,
+                            sdpMLineIndex = event.candidate.sdpMLineIndex,
+                        ),
+                    )
+                    RtcEvent.PeerConnected -> dispatch(CallEvent.PeerConnected)
+                    RtcEvent.TransportLost -> dispatch(CallEvent.TransportLost)
+                    RtcEvent.TransportResumed -> dispatch(CallEvent.TransportResumed)
+                    RtcEvent.Closed -> Unit // teardown converges via ReleaseCall
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                dispatch(CallEvent.Failed(ApiError.UNKNOWN))
             }
         }
     }
