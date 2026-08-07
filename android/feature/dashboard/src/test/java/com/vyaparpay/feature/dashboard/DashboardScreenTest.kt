@@ -38,7 +38,8 @@ class DashboardScreenTest {
         alertMessage = SeededDashboardRepository.KYC_ALERT_MESSAGE,
     )
 
-    private val ctaTags = listOf(PAY_VENDOR_TEST_TAG, VIEW_SETTLEMENTS_TEST_TAG, DEVICE_ORDERS_TEST_TAG)
+    private val ctaTags =
+        listOf(PAY_VENDOR_TEST_TAG, VIEW_SETTLEMENTS_TEST_TAG, DEVICE_ORDERS_TEST_TAG, NEED_HELP_TEST_TAG)
 
     @Test
     fun `every documented testTag renders`() {
@@ -49,6 +50,7 @@ class DashboardScreenTest {
                 onPayVendor = {},
                 onViewSettlements = {},
                 onViewOrders = {},
+                onNeedHelp = {},
             )
         }
 
@@ -64,6 +66,7 @@ class DashboardScreenTest {
         composeTestRule.onNodeWithTag(PAY_VENDOR_TEST_TAG).performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag(VIEW_SETTLEMENTS_TEST_TAG).performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag(DEVICE_ORDERS_TEST_TAG).performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag(NEED_HELP_TEST_TAG).performScrollTo().assertIsDisplayed()
     }
 
     @Test
@@ -75,6 +78,7 @@ class DashboardScreenTest {
                 onPayVendor = {},
                 onViewSettlements = {},
                 onViewOrders = {},
+                onNeedHelp = {},
             )
         }
 
@@ -96,6 +100,7 @@ class DashboardScreenTest {
                 onPayVendor = {},
                 onViewSettlements = {},
                 onViewOrders = {},
+                onNeedHelp = {},
             )
         }
 
@@ -116,6 +121,7 @@ class DashboardScreenTest {
                 onPayVendor = { tapped = true },
                 onViewSettlements = {},
                 onViewOrders = {},
+                onNeedHelp = {},
             )
         }
 

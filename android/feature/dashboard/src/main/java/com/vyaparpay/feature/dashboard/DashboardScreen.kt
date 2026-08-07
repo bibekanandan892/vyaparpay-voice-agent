@@ -47,6 +47,9 @@ internal const val VIEW_SETTLEMENTS_TEST_TAG = "view_settlements_secondary"
 /** testTag for the "Device orders" quick action -- role `secondary_cta` (`_secondary`). */
 internal const val DEVICE_ORDERS_TEST_TAG = "device_orders_secondary"
 
+/** testTag for the "Need help?" quick action -- role `secondary_cta` (`_secondary`). */
+internal const val NEED_HELP_TEST_TAG = "need_help_secondary"
+
 /**
  * The real content behind [DashboardRoute] -- the merchant home screen
  * (docs/03-android-architecture.md §4: "Wallet balance (₹18,450), today's
@@ -61,6 +64,7 @@ internal fun DashboardScreen(
     onPayVendor: () -> Unit,
     onViewSettlements: () -> Unit,
     onViewOrders: () -> Unit,
+    onNeedHelp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -75,6 +79,7 @@ internal fun DashboardScreen(
                 onPayVendor = onPayVendor,
                 onViewSettlements = onViewSettlements,
                 onViewOrders = onViewOrders,
+                onNeedHelp = onNeedHelp,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -88,6 +93,7 @@ private fun DashboardContent(
     onPayVendor: () -> Unit,
     onViewSettlements: () -> Unit,
     onViewOrders: () -> Unit,
+    onNeedHelp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -164,6 +170,19 @@ private fun DashboardContent(
                 modifier = Modifier.weight(1f),
             )
         }
+        // Not gated on actionsEnabled: a merchant stuck on a loading
+        // dashboard is exactly who needs a way to reach a human (or the
+        // agent) most, and DashboardDestination's own kdoc already
+        // declares this screen the SupportButton's home.
+        DashboardCta(
+            label = "Need help?",
+            testTag = NEED_HELP_TEST_TAG,
+            enabled = true,
+            filled = false,
+            events = events,
+            onClick = onNeedHelp,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 

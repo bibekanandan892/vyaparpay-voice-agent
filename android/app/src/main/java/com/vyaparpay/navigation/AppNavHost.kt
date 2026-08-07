@@ -43,7 +43,11 @@ public fun AppNavHost(
         startDestination = AppRoute.START.route,
         modifier = modifier,
     ) {
-        composable(AppRoute.DASHBOARD.route) { DashboardRoute() }
+        composable(AppRoute.DASHBOARD.route) {
+            DashboardRoute(
+                onNeedHelp = { navController.navigate(AppRoute.SUPPORT.route) },
+            )
+        }
         composable(AppRoute.PAYMENT.route) { PaymentRoute() }
         composable(AppRoute.SETTLEMENTS.route) { SettlementsRoute() }
         composable(AppRoute.ORDERS.route) {
