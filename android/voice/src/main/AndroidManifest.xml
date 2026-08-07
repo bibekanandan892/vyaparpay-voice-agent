@@ -24,6 +24,20 @@
     <!-- Soft requirement, API 33+ (docs/03 §3.6): denial degrades to a headless call, never blocks it. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      Hard requirement, undocumented until found live on a real device: libwebrtc's
+      NetworkMonitorAutoDetect calls ConnectivityManager.getActiveNetworkInfo() from
+      its native network_thread during PeerConnectionFactory/NetworkMonitor startup.
+      Without this permission that call throws SecurityException, and WebRTC's JNI
+      boundary (sdk/android/src/jni/jvm.cc) treats any uncaught Java exception as
+      unrecoverable — it aborts the whole process (SIGABRT, "Check failed: false")
+      rather than letting the exception propagate to Kotlin. No try/catch on the
+      Kotlin side can ever catch this: the abort happens in native code, one layer
+      below any JVM stack frame. Normal permission, granted at install, no runtime
+      prompt — this alone fixes the crash.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <application>
 
         <service
