@@ -88,6 +88,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
+import sys
 from collections.abc import Sequence
 
 import httpx
@@ -368,6 +370,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    # A real LLM's reply is natural-language text, not the ASCII-only
+    # fixtures the test suite scripts through FakeLLM — em dashes, curly
+    # quotes, non-breaking hyphens (U+2011) all showed up in the first
+    # live run against a real model. Windows' console defaults sys.stdout
+    # to the system codepage (cp1252 here) with errors="strict", so the
+    # bare `print(f"Asha: {reply}")` below crashed the whole REPL the
+    # first time a reply carried a character outside that codepage's
+    # ~220-character range. structlog's interleaved JSON lines never hit
+    # this — `configure_logging` writes pre-encoded UTF-8 bytes directly
+    # (module docstring's `BytesLoggerFactory`), bypassing text-mode
+    # encoding entirely.
+    if isinstance(sys.stdout, io.TextIOWrapper) and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = _parse_args(argv)
     asyncio.run(_run(args.user))
 
