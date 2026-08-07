@@ -16,7 +16,11 @@ ConversationManager's internal state, collapsed into "thinking" on the
 wire (domain judgment call 6). Cancellation ownership: the barge-in
 commit (VAD-loop frame handler) cancels the SPEAKING subtask; the call
 session cancels the whole `run()` task at teardown; nothing else cancels
-anything.
+anything — EXCEPT the post-call finalize pipeline (`on_call_ended`,
+`run()`'s `finally`), which is deliberately shielded from that same
+teardown cancellation (see `run()`'s own comment, HIGH fix 2026-08-07)
+and keeps executing to completion even after `run()`'s task itself has
+already been cancelled out from under it.
 
 Judgment calls, numbered so review argues with the reasoning:
 
@@ -323,8 +327,38 @@ class VoiceAgentWorker:
                 turns=self._turn_no,
                 reason=reason.value,
             )
+            # asyncio.shield, not a bare await (HIGH fix, found on the
+            # first real device call, 2026-08-07): `CallSession.close()`
+            # bounds its wait for this whole task at `_CLOSE_TIMEOUT_S`
+            # (5.0s, call_session.py) — a budget that file's own comment
+            # sizes for "a worker turn mid-brain-call", written before the
+            # post-call-pipeline-wiring task folded finalize+end into
+            # THIS finally block. `on_call_ended` can run a real LLM call
+            # (`SessionManager.end()`'s `fold_pending()`, for whatever
+            # tail turns never got summarized mid-call) on top of two DB
+            # writes — live, that took ~4.6s, and `close()` cancelled this
+            # task at the 5s mark mid-write. Confirmed from the trace:
+            # `conversation_summaries` had zero rows, from any call, ever.
+            # `shield()` runs `on_call_ended` as its own task that keeps
+            # executing on the loop even if THIS task is cancelled out
+            # from under it by `close()`; the done-callback below is what
+            # still surfaces a late failure in the logs instead of losing
+            # it to asyncio's silent "exception was never retrieved" path,
+            # since nothing else will be awaiting this task by then.
+            finalize_task = asyncio.create_task(
+                built.on_call_ended(reason),
+                name=f"worker:post-call-finalize:{self._session_id}",
+            )
+            finalize_task.add_done_callback(self._log_finalize_crash)
             try:
-                await built.on_call_ended(reason)
+                await asyncio.shield(finalize_task)
+            except asyncio.CancelledError:
+                # THIS task was cancelled (by close()'s bounded wait) —
+                # `finalize_task` is unaffected and keeps running; nothing
+                # to log here, the done-callback owns that. Re-raising is
+                # correct and required (docs at the top of run(): a
+                # cancelled task must end in CancelledError).
+                raise
             except Exception:
                 log.exception(
                     "worker.post_call_finalize_failed",
@@ -332,6 +366,23 @@ class VoiceAgentWorker:
                     reason=reason.value,
                 )
                 raise
+
+    def _log_finalize_crash(self, task: asyncio.Task[None]) -> None:
+        """Done-callback for the shielded finalize task above. By the
+        time this fires, `run()` may already have returned (cancelled),
+        so this is the ONLY place left that can observe a late finalize
+        failure — without it, a real exception here would surface
+        nowhere but asyncio's own "exception was never retrieved"
+        warning at garbage-collection time, same shape as
+        `CallSession._log_worker_crash` (call_session.py) for the
+        analogous case one layer up."""
+        if task.cancelled() or task.exception() is None:
+            return
+        log.error(
+            "worker.post_call_finalize_failed_after_cancel",
+            session_id=self._session_id,
+            error=repr(task.exception()),
+        )
 
     # ------------------------------------------------------------------
     # Billable media usage -> the brain's per-call cost ledger
