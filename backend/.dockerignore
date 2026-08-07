@@ -1,22 +1,10 @@
-# backend/.dockerignore — Dockerfile does `COPY . .` from this directory
-# (build context is ./backend, per root docker-compose.yml). Without this
-# file, backend/.env (real secrets: JWT_SECRET, DATABASE_URL credentials,
-# OPENROUTER_API_KEY) gets baked into an image layer the moment a
-# developer follows .env.example's own instructions and creates it —
-# recoverable from `docker history`/`docker save` even after a later
-# layer, and permanently so if the image is ever pushed to a registry.
-
-.env
-.env.*
-!.env.example
-
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-.git/
-tests/
+# DEAD FILE — Docker only reads .dockerignore from the BUILD CONTEXT ROOT.
+# That used to be this directory (`build: ./backend`), but the fix for the
+# missing-protocol/-schemas defect (2026-08-07, see backend/Dockerfile's
+# `COPY protocol/` comment) moved the build context to the repo root, so
+# this file has been inert since that change — Docker no longer reads it.
+#
+# The real secret-exclusion rules (backend/.env must never be baked into
+# an image layer) now live in the repo-root `.dockerignore`. Edit that
+# file, not this one. Left in place rather than deleted only so this note
+# is here if anyone goes looking for why the old rules stopped applying.

@@ -16,7 +16,11 @@ ConversationManager's internal state, collapsed into "thinking" on the
 wire (domain judgment call 6). Cancellation ownership: the barge-in
 commit (VAD-loop frame handler) cancels the SPEAKING subtask; the call
 session cancels the whole `run()` task at teardown; nothing else cancels
-anything.
+anything — EXCEPT the post-call finalize pipeline (`on_call_ended`,
+`run()`'s `finally`), which is deliberately shielded from that same
+teardown cancellation (see `run()`'s own comment, HIGH fix 2026-08-07)
+and keeps executing to completion even after `run()`'s task itself has
+already been cancelled out from under it.
 
 Judgment calls, numbered so review argues with the reasoning:
 
@@ -95,9 +99,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from typing import Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from app.config import Settings
 from app.domain.types import EndReason
@@ -186,7 +190,13 @@ class BuiltBrain:
     known about `SessionManager.end()` and should not start now)."""
 
     brain: Brain
-    on_call_ended: Callable[[EndReason], Awaitable[None]]
+    # Coroutine, not the broader Awaitable: run()'s finally now wraps a
+    # call to this in asyncio.create_task() (CRITICAL fix, 2026-08-07),
+    # which requires a Coroutine specifically. Every real implementation
+    # (run.py's `_make_brain_factory`) and every test fake already
+    # defines this as `async def`, so this is a correction, not a
+    # narrowing that costs anything.
+    on_call_ended: Callable[[EndReason], Coroutine[Any, Any, None]]
 
 
 class SttStreamDied(RuntimeError):
@@ -262,6 +272,12 @@ class VoiceAgentWorker:
         )
         self._brain: Brain | None = None
         self._tg: asyncio.TaskGroup | None = None
+        # Set once, in run()'s finally, the moment the finalize task is
+        # created — see finalize_task's docstring and run()'s own comment
+        # (CRITICAL fix, 2026-08-07) for why CallSession.close() needs
+        # this exposed rather than inferring completion from run()'s own
+        # task.
+        self._finalize_task: asyncio.Task[None] | None = None
         self._state = AgentState.LISTENING
         self._turn_no = 0
         self._seq = 0
@@ -277,6 +293,19 @@ class VoiceAgentWorker:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    @property
+    def finalize_task(self) -> asyncio.Task[None] | None:
+        """The shielded post-call finalize task, once `run()`'s finally
+        has created it — `None` before then. `CallSession.close()` reads
+        this directly (CRITICAL fix, 2026-08-07): it must wait for
+        finalize to genuinely finish before freeing this call's
+        `_active[session_id]` slot (signaling.py judgment call 9), and
+        once `run()`'s own task is cancellable-but-shielded from this
+        work (see run()'s own comment below), `run()`'s task finishing
+        no longer implies finalize has — so `close()` cannot infer that
+        from `worker_task` alone anymore and needs this handle instead."""
+        return self._finalize_task
 
     async def run(self) -> None:
         """Run the call's loops until the ingress fan-outs end (the peer
@@ -323,8 +352,50 @@ class VoiceAgentWorker:
                 turns=self._turn_no,
                 reason=reason.value,
             )
+            # asyncio.shield, not a bare await (HIGH fix, found on the
+            # first real device call, 2026-08-07): `CallSession.close()`
+            # bounds its wait for THIS task at `_CLOSE_TIMEOUT_S` (5.0s,
+            # call_session.py) — a budget that file's own comment sizes
+            # for "a worker turn mid-brain-call", written before the
+            # post-call-pipeline-wiring task folded finalize+end into
+            # THIS finally block. `on_call_ended` can run a real LLM call
+            # (`SessionManager.end()`'s `fold_pending()`, for whatever
+            # tail turns never got summarized mid-call) on top of two DB
+            # writes — live, that took ~4.6s, and `close()` cancelled this
+            # task at the 5s mark mid-write. Confirmed from the trace:
+            # `conversation_summaries` had zero rows, from any call, ever.
+            # `shield()` runs `on_call_ended` as its own task that keeps
+            # executing on the loop even if THIS task is cancelled out
+            # from under it by `close()`.
+            #
+            # Assigned to `self._finalize_task` BEFORE the shielded await
+            # (CRITICAL follow-up fix, same day, second review pass):
+            # `close()` no longer infers "finalize is done" from THIS
+            # task finishing — because once shielded, this task can now
+            # finish (as cancelled) while finalize keeps running behind
+            # it. `close()` reads `self.finalize_task` directly instead
+            # and waits on it separately, with its own generous budget
+            # (`_FINALIZE_TIMEOUT_S`, call_session.py) — otherwise
+            # `close()` would free this call's `_active[session_id]` slot
+            # (signaling.py judgment call 9) while the write was still in
+            # flight, reopening the exact reconnect race that fix closed:
+            # a fast reconnect building a second CallSession/CostTracker
+            # for a session_id whose finalize hadn't actually finished.
+            self._finalize_task = asyncio.create_task(
+                built.on_call_ended(reason),
+                name=f"worker:post-call-finalize:{self._session_id}",
+            )
+            self._finalize_task.add_done_callback(self._log_finalize_crash)
             try:
-                await built.on_call_ended(reason)
+                await asyncio.shield(self._finalize_task)
+            except asyncio.CancelledError:
+                # THIS task was cancelled (by close()'s bounded wait on
+                # the turn loop) — `finalize_task` is unaffected and
+                # keeps running; `close()` picks it up separately via
+                # `self.finalize_task` (see above). Re-raising is correct
+                # and required (docs at the top of run(): a cancelled
+                # task must end in CancelledError).
+                raise
             except Exception:
                 log.exception(
                     "worker.post_call_finalize_failed",
@@ -332,6 +403,23 @@ class VoiceAgentWorker:
                     reason=reason.value,
                 )
                 raise
+
+    def _log_finalize_crash(self, task: asyncio.Task[None]) -> None:
+        """Done-callback for the shielded finalize task above. By the
+        time this fires, `run()` may already have returned (cancelled),
+        so this is the ONLY place left that can observe a late finalize
+        failure — without it, a real exception here would surface
+        nowhere but asyncio's own "exception was never retrieved"
+        warning at garbage-collection time, same shape as
+        `CallSession._log_worker_crash` (call_session.py) for the
+        analogous case one layer up."""
+        if task.cancelled() or task.exception() is None:
+            return
+        log.error(
+            "worker.post_call_finalize_failed_after_cancel",
+            session_id=self._session_id,
+            error=repr(task.exception()),
+        )
 
     # ------------------------------------------------------------------
     # Billable media usage -> the brain's per-call cost ledger

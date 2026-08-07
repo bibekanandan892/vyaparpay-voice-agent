@@ -147,7 +147,9 @@ services:
     # absent one. ICE failure on the client is the real signal.
 
   agent-api:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     # Shared tag with voice-worker below: docs/04 §1 is "one image, built
     # once, started two ways", and naming it makes that literally true —
     # the two services differ only in `command:`, and `up` builds once.
@@ -187,7 +189,9 @@ services:
     #
     # Same build context and same image tag as agent-api — the second of
     # the two entrypoints in docs/04 §1. Only `command:` differs.
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     image: vyapar-backend:dev
     # Overrides the Dockerfile CMD, which is agent-api's (alembic upgrade
     # + uvicorn). Migrations stay agent-api's job: two containers racing

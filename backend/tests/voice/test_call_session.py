@@ -19,8 +19,8 @@ import pytest
 pytest.importorskip("aiortc", reason="[voice] extra not installed")
 
 import asyncio  # noqa: E402
-from collections.abc import Awaitable, Callable  # noqa: E402
-from typing import cast  # noqa: E402
+from collections.abc import Callable, Coroutine  # noqa: E402
+from typing import Any, cast  # noqa: E402
 
 from app.config import Settings  # noqa: E402
 from app.context.context_compressor import ContextCompressor  # noqa: E402
@@ -122,7 +122,7 @@ async def test_close_tears_down_the_dispatcher_task_without_hanging_or_raising()
 def _real_call_deps(
     settings: Settings,
     brain: FakeBrain,
-    on_call_ended: Callable[[EndReason], Awaitable[None]],
+    on_call_ended: Callable[[EndReason], Coroutine[Any, Any, None]],
 ) -> CallDeps:
     async def brain_factory(_session_id: str) -> BuiltBrain:
         return BuiltBrain(brain=brain, on_call_ended=on_call_ended)
@@ -160,3 +160,84 @@ async def test_close_called_twice_concurrently_runs_on_call_ended_exactly_once(
     await asyncio.wait_for(asyncio.gather(session.close(), session.close()), timeout=5)
 
     assert on_call_ended_calls == [EndReason.HANGUP]
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL regression (2026-08-07, found on the first real device call):
+# worker.py shields on_call_ended from _CLOSE_TIMEOUT_S's cancel so a slow
+# finalize is never interrupted mid-write — but that alone means close()
+# can return (and signaling.py can free `_active[session_id]`) BEFORE
+# finalize has actually finished, reopening the exact reconnect race a
+# prior CRITICAL fix closed (signaling.py's own comment). These two tests
+# prove call_session.py's judgment call 7 closes that window again: close()
+# now separately waits for `worker.finalize_task`, and never cancels it
+# even if ITS OWN generous budget (_FINALIZE_TIMEOUT_S) is exceeded.
+#
+# Both timeouts are monkeypatched to tiny values so these run in well
+# under a second rather than genuinely waiting out production-sized
+# (5s / 60s) budgets.
+# ---------------------------------------------------------------------------
+
+
+async def test_close_waits_for_a_slow_finalize_without_cancelling_it(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finalize that outlives the patched _CLOSE_TIMEOUT_S (so the
+    turn-loop-bound wait times out and cancels worker_task) must still
+    run to completion — proven directly by asserting it actually
+    finished before close() returns, not merely that close() didn't
+    raise."""
+    import app.voice.call_session as call_session_module
+
+    monkeypatch.setattr(call_session_module, "_CLOSE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(call_session_module, "_FINALIZE_TIMEOUT_S", 2.0)
+
+    finished = False
+
+    async def slow_on_call_ended(reason: EndReason) -> None:
+        nonlocal finished
+        await asyncio.sleep(0.3)  # outlives the patched _CLOSE_TIMEOUT_S
+        finished = True
+
+    deps = _real_call_deps(settings, FakeBrain(), slow_on_call_ended)
+    session = CallSession("sess-slow-finalize", _noop_signal, ice_servers=(), deps=deps)
+
+    await asyncio.wait_for(session.close(), timeout=5)
+
+    assert finished, "close() returned before the shielded finalize task actually finished"
+
+
+async def test_close_gives_up_waiting_past_finalize_timeout_but_never_cancels(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: if finalize somehow outlives even the generous
+    _FINALIZE_TIMEOUT_S, close() stops WAITING — but the task itself
+    must never be cancelled. Proven in two steps: close() returns before
+    the slow finalize's sleep completes (it gave up), then the task is
+    shown to finish normally on its own afterward (it was never
+    cancelled)."""
+    import app.voice.call_session as call_session_module
+
+    monkeypatch.setattr(call_session_module, "_CLOSE_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(call_session_module, "_FINALIZE_TIMEOUT_S", 0.05)
+
+    finished = False
+
+    async def slow_on_call_ended(reason: EndReason) -> None:
+        nonlocal finished
+        await asyncio.sleep(0.2)  # outlives the patched _FINALIZE_TIMEOUT_S
+        finished = True
+
+    deps = _real_call_deps(settings, FakeBrain(), slow_on_call_ended)
+    session = CallSession("sess-finalize-timeout", _noop_signal, ice_servers=(), deps=deps)
+
+    await asyncio.wait_for(session.close(), timeout=1)
+    assert not finished, "close() should have given up waiting before the sleep finished"
+
+    assert session._worker is not None
+    task = session._worker.finalize_task
+    assert task is not None
+    # Never cancelled: left running, and it finishes on its own.
+    await asyncio.wait_for(asyncio.shield(task), timeout=1)
+    assert finished
+    assert not task.cancelled()
