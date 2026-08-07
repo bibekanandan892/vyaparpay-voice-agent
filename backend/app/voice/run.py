@@ -89,6 +89,7 @@ from app.memory.summarizer import Summarizer
 from app.obs.logging import configure_logging, get_logger
 from app.obs.tracing import setup_observability
 from app.providers.deepgram import DeepgramStt
+from app.providers.deepgram_tts import DeepgramTts
 from app.providers.elevenlabs import ElevenLabsTts
 from app.providers.openai_embeddings import OpenAIEmbeddings
 from app.providers.openrouter import OpenRouterLLM
@@ -475,6 +476,13 @@ def _lazy_call_deps(
 
     def build() -> CallDeps:
         if not cache:
+            # TTS provider chosen by config; Settings' Literal already
+            # rejected any value other than these two.
+            tts = (
+                DeepgramTts(settings)
+                if settings.tts_provider == "deepgram"
+                else ElevenLabsTts(settings)
+            )
             cache.append(
                 CallDeps(
                     settings=settings,
@@ -485,7 +493,7 @@ def _lazy_call_deps(
                     # demo_cli's LLMRouter construction; the worker handles
                     # both shapes at runtime (speech/stt_supervisor).
                     stt=DeepgramStt(settings),  # type: ignore[arg-type]
-                    tts=ElevenLabsTts(settings),  # type: ignore[arg-type]
+                    tts=tts,  # type: ignore[arg-type]
                     vad_factory=SileroVad,
                     brain_factory=brain_factory,
                 )

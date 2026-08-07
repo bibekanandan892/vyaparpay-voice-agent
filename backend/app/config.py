@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -158,6 +159,16 @@ class Settings(BaseSettings):
     deepgram_api_key: SecretStr | None = None
     deepgram_model: str = "nova-3"
     deepgram_url: str = "wss://api.deepgram.com/v1/listen"
+
+    # TTS provider selection. "deepgram" (Aura, REST) was added when
+    # ElevenLabs gated API access behind a paid credit balance — Aura
+    # rides the same Deepgram key/credit as STT. Default stays
+    # "elevenlabs" so existing deployments change nothing. Unknown values
+    # fail at Settings construction (Literal), not silently downgrade.
+    tts_provider: Literal["elevenlabs", "deepgram"] = "elevenlabs"
+    # An Aura voice is a model name, not an account-scoped voice id.
+    deepgram_tts_model: str = "aura-2-thalia-en"
+    deepgram_speak_url: str = "https://api.deepgram.com/v1/speak"
 
     # TTS — ElevenLabs Flash (docs/04 §3, docs/06 §1); fallback voice id
     # is used when the primary voice errors, empty = no fallback.
