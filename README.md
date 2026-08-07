@@ -12,7 +12,7 @@
 ![ElevenLabs](https://img.shields.io/badge/ElevenLabs-Flash%20v2.5%20TTS-000000)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-Claude%20Sonnet%205-6566F1)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
-![Status](https://img.shields.io/badge/status-architecture--complete-blueviolet)
+![Status](https://img.shields.io/badge/status-MVP%20live%20on%20device-brightgreen)
 
 **VyaparPay** is a demo "Paytm for Business"-style merchant payments app (India, INR); **Asha** is the AI support agent embedded in its Android app. The signature capability is *screen-aware context*: before the merchant says a word, Asha holds a ≤300-token semantic snapshot of the live screen, the last ~15 user actions, and the most recent API error. This repo is a portfolio project — the agent stack (voice, context, memory, tools, safety) is real engineering; the business it serves is seeded fixtures, marked honestly throughout.
 
@@ -22,7 +22,9 @@
 
 ## 🎬 Demo
 
-**Demo video coming with Phase 3.** Until then, the canonical call — Rajesh Kumar's declined ₹245 vendor payment — reads like the transcript below. The entire greeting was composed *before Rajesh spoke*, from what the app sent at session creation:
+**Confirmed working end-to-end on a real Android device (2026-08-07).** The full path — tap "Need help?" → foreground call service → WebRTC signaling and media over a self-hosted coturn relay → streamed STT → agent turn → streamed TTS back to the phone — connects and holds a live two-way voice conversation without the app crashing. (A recorded demo video is still pending.)
+
+The canonical call — Rajesh Kumar's declined ₹245 vendor payment — is the script the agent loop is designed and tested against, turn by turn, from the text-only CLI harness in Phase 2 through to the real voice call in Phase 3. It reads like the transcript below. The entire greeting is composed *before Rajesh speaks*, from what the app sends at session creation:
 
 > **What Asha holds at t = 0 — zero tool calls, straight from `POST /v1/sessions`:**
 > - 🖥️ **Screen** — `PaymentScreen` / `vendor_payment`: ₹245 → "Amazon Business"; "Daily Limit Exceeded" dialog + "Payment Failed" snackbar visible
@@ -54,11 +56,30 @@ The full 9-turn annotated transcript — with per-turn *Knew / Tool / Latency* b
 
 ---
 
+## Current status
+
+Two weeks of continuous work — 94 commits, 2026-07-24 → 2026-08-07. The table below is a code-read, not a doc-trusted, status check:
+
+| Phase | Reality check |
+|---|---|
+| 1 — Architecture | ✅ 17-doc set, unchanged since Phase 1 |
+| 2 — Backend MVP | ✅ The full agent loop (`SessionManager` → `ContextBuilder` → `PromptBuilder` → `LLMRouter` → `ToolExecutor` → `SafetyLayer` → `CostTracker`) is real, not stubs — 73 backend test files, real CI (`ruff` + `mypy` + `pytest`, testcontainers-gated) |
+| 3 — Voice MVP | ✅ Signaling, the aiortc peer session, Silero VAD + barge-in, Deepgram STT and dual TTS providers are all live. One open item: barge-in session-memory truncation (`ReplySink.on_turn_complete`) is still pending |
+| 4 — Screen-aware context | ✅ `UiTreeCollector`/`SemanticSnapshotBuilder` are genuinely wired into the running Android app (Hilt-injected from `MainActivity`, not dead code); backend ingestion + compression confirmed live |
+| 5 — Memory + RAG | ✅ The rolling summarizer and profile merge fire every turn inside the real `ConversationManager` loop; pgvector semantic memory, cost tracking, and the Grafana/Tempo dashboards are all confirmed live, not placeholders |
+| 6 — Production hardening | 🚧 Real CI on both backend and Android; no eval pipeline, load tests, or security-audit pass yet |
+
+**What's real right now:** the merchant app runs on a physical Android device, taps through to a live voice call, and holds a real two-way WebRTC conversation with the agent backend — confirmed end-to-end today.
+
+**Known gaps:** the tool catalog is 3 tools deep today, not the fuller catalog [docs/10](docs/10-tool-calling.md) designs for later phases; the persistent floating support button described in the docs is deferred in favor of a Dashboard quick-action; there's no free-tier path to run this (OpenRouter and Deepgram are billed, though `TTS_PROVIDER=deepgram` avoids paying a second TTS vendor); and Android test coverage is unit/Robolectric only — no instrumented on-device suite yet.
+
+---
+
 ## Why this is interesting
 
 - **The agent sees the screen, cheaply.** A raw Compose semantics tree is ~214 nodes / **~4,000+ tokens**; `SemanticSnapshotBuilder` compresses it on-device to a **≤300-token** role-based IR (`screen_context/v1`) — a >13× reduction that is *more* informative than the raw tree, because it carries the `402` decline code that was never drawn. This is a domain-specific compiler, not a JSON dump ([docs/07](docs/07-ui-semantic-context.md)).
 - **The voice loop is sub-second, with barge-in.** Everything streams — STT partials, LLM tokens, sentence-chunked TTS — for a turn budget of **p50 ≤ 1.0 s, p95 ≤ 2.0 s**, and interruption (TTS stop) within **≤ 250 ms** ([docs/06](docs/06-voice-pipeline.md)).
-- **The tool layer does not hallucinate.** Sixteen typed (Pydantic in/out) tools; the LLM never states an account fact a read tool can fetch, and every mutating tool (`request_limit_increase`, `block_card`, …) requires a voiced confirmation and an explicit "yes" before it runs — idempotency-keyed and scoped to the authenticated session user ([docs/10](docs/10-tool-calling.md)).
+- **The tool layer does not hallucinate.** Three typed (Pydantic in/out) tools are live today — `get_wallet_balance`, `get_payment_status`, `request_limit_increase` — scoped precisely to the MVP incident, with a larger catalog designed in [docs/10](docs/10-tool-calling.md) for later phases. The LLM never states an account fact a read tool can fetch, and the one mutating tool requires a voiced confirmation and an explicit "yes" before it runs — idempotency-keyed and scoped to the authenticated session user.
 - **The WebRTC stack is hand-rolled, both ends.** No managed platform: the Android app (libwebrtc via `org.webrtc`) and the Python agent (aiortc) are two direct peers, with an owned WebSocket signaling protocol (SDP offer/answer + trickle ICE), self-hosted coturn for STUN/TURN, and a native `RTCDataChannel` — the protocol-level engineering most voice stacks outsource ([docs/06](docs/06-voice-pipeline.md)).
 
 ---
@@ -152,11 +173,34 @@ Two backend services share one `app/` package: **agent-api** (sessions — mints
 | STT | Deepgram Nova-3 (streaming) | Streaming partials, ~80 ms finalization after endpoint |
 | Dialogue LLM | Claude Sonnet 5 via OpenRouter | Tool-calling + tone; one wire format, per-request fallback arrays |
 | Utility LLM | Claude Haiku 4.5 | Summarization every 6 turns, intent classification, context compression |
-| TTS | ElevenLabs Flash v2.5 | Lowest-latency tier (~75 ms model latency), the second-largest turn cost |
+| TTS | ElevenLabs Flash v2.5 (default) · Deepgram Aura-2 (alt) | Lowest-latency tier (~75 ms model latency) by default; `TTS_PROVIDER=deepgram` swaps to Aura-2 so STT and TTS share one Deepgram key/credit — added after ElevenLabs gated API access behind a paid balance |
 | Data | Postgres 16 + pgvector · Redis 7 | One durable store incl. vectors; Redis carries hot `session:{id}` state (ADR-003) |
 | Observability | OpenTelemetry → Tempo · Grafana | One trace per conversation turn; the demo closes on a Grafana trace + cost row (ADR-005) |
 
 Full ADRs with flip conditions, the model/pricing table, and the **≈ $0.30 (~₹25) per call** cost model are in [docs/16](docs/16-tech-stack.md).
+
+---
+
+## Getting started
+
+Requires paid API keys — there's no fully free-tier path (OpenRouter for the LLM, Deepgram for STT; TTS can reuse the Deepgram key via `TTS_PROVIDER=deepgram` instead of a separate ElevenLabs account).
+
+```bash
+cp backend/.env.example backend/.env   # fill OPENROUTER_API_KEY, DEEPGRAM_API_KEY, JWT_SECRET, TURN_SECRET, ...
+./infra/docker/coturn/gen-cert.sh      # one-time self-signed TLS cert for coturn
+docker compose up -d                   # postgres (pgvector) + redis + coturn + agent-api + voice-worker
+```
+
+Then, from `backend/`:
+
+```bash
+python -m scripts.fetch_models                    # pinned, hash-verified Silero VAD model
+python -m scripts.seed                             # canonical Rajesh Kumar merchant/wallet/transaction fixtures
+python -m scripts.seed_kb                           # ~40-article support knowledge base (needs OPENAI_API_KEY)
+python -m scripts.demo_cli --user usr_rajesh01       # text-only REPL against the real agent loop
+```
+
+For a real voice call, build and install `android/app` on a device on the same network as the backend, point its `BASE_URL`/`DEMO_BEARER_TOKEN` manifest meta-data at the backend, and tap **Need help? → Call Support**. `docker compose --profile obs up` additionally starts Tempo + Grafana for the trace/cost dashboards.
 
 ---
 
@@ -201,15 +245,17 @@ voice-calling-agent/
 │   └── voice/               # WebRtcClient (org.webrtc), SignalingClient, VoiceCallService, CallStateMachine
 ├── backend/                 # Python 3.12 — agent-api + voice-worker share one app/ package
 │   ├── app/
-│   │   ├── agent/           # SessionManager, ContextBuilder, PromptBuilder, ToolExecutor, LLMRouter, SafetyLayer
+│   │   ├── agent/           # SessionManager, ContextBuilder, PromptBuilder, ToolExecutor, LLMRouter, SafetyLayer, CostTracker
 │   │   ├── context/         # SnapshotIngestor, EventLog, ContextCompressor
-│   │   ├── memory/          # short-term / session / profile / semantic (pgvector)
-│   │   ├── tools/           # 16-tool catalog, typed Pydantic contracts
-│   │   ├── providers/       # OpenRouterLLM, DeepgramStt, ElevenLabsTts, OpenAIEmbeddings
+│   │   ├── memory/          # short-term / session / profile / semantic (pgvector) + Summarizer
+│   │   ├── tools/           # 3-tool catalog today: get_wallet_balance, get_payment_status, request_limit_increase
+│   │   ├── providers/       # OpenRouterLLM, DeepgramStt, ElevenLabsTts, DeepgramTts (Aura), OpenAIEmbeddings
 │   │   ├── voice/           # SignalingServer, PeerSession (aiortc), VadEndpointer — hand-rolled WebRTC + voice pipeline
+│   │   ├── auth/            # TURN credential minting (coturn use-auth-secret), JWT
+│   │   ├── obs/             # OpenTelemetry tracing → Tempo
 │   │   ├── api/             # FastAPI routes (POST /v1/sessions, seeded business APIs)
 │   │   └── models/          # Pydantic + SQLAlchemy
-│   └── tests/
+│   └── tests/                # 73 test files across 15 subdirectories
 ├── protocol/                # Cross-language wire schemas (screen_context/v1, app_event/v1)
 ├── infra/                   # docker-compose stack: coturn, Postgres, Redis, Grafana/Tempo
 └── docs/                    # 17-document architecture set (start at docs/README.md)
@@ -222,11 +268,11 @@ voice-calling-agent/
 | Phase | Scope | Status |
 |---|---|---|
 | 1 — Architecture | This documentation set; the design a reviewer can audit before code | ✅ |
-| 2 — Backend MVP | Compose stack, seeded business APIs, text-chat agent loop, tools end-to-end | ⬜ |
-| 3 — Voice MVP (raw WebRTC) | SignalingServer + coturn + aiortc PeerSession, Silero VAD pipeline, Deepgram/ElevenLabs streaming, Android `org.webrtc` call UI | ⬜ |
-| 4 — Screen-aware context | `UiTreeCollector` → ScreenContext → prompt | ⬜ |
-| 5 — Memory + RAG | Memory tiers, pgvector retrieval, observability dashboard | ⬜ |
-| 6 — Production hardening | Security pass, evals, load tests, CI/CD, docs polish | ⬜ |
+| 2 — Backend MVP | Compose stack, seeded business APIs, text-chat agent loop, tools end-to-end | ✅ |
+| 3 — Voice MVP (raw WebRTC) | SignalingServer + coturn + aiortc PeerSession, Silero VAD pipeline, Deepgram/ElevenLabs streaming, Android `org.webrtc` call UI | ✅ |
+| 4 — Screen-aware context | `UiTreeCollector` → ScreenContext → prompt | ✅ |
+| 5 — Memory + RAG | Memory tiers, pgvector retrieval, observability dashboard | ✅ |
+| 6 — Production hardening | Security pass, evals, load tests, CI/CD, docs polish | 🚧 CI is real; evals, load tests, and a security pass are still open |
 
 Phase sizing and the post-Phase-6 enhancement catalog are in [docs/17](docs/17-roadmap.md).
 
@@ -236,4 +282,4 @@ Phase sizing and the post-Phase-6 enhancement catalog are in [docs/17](docs/17-r
 
 Released under the [MIT License](LICENSE).
 
-Built by Bibekananda Nayak — [github.com/your-handle](https://github.com/your-handle) *(profile link placeholder)*.
+Built by Bibekananda Nayak — [github.com/bibekanandan892](https://github.com/bibekanandan892).
