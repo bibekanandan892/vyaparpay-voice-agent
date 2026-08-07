@@ -1,0 +1,34 @@
+# Root .dockerignore — docker-compose.yml builds backend/Dockerfile with a
+# repo-root build context (needed so that Dockerfile can COPY protocol/,
+# which schema_validation.py expects at /protocol/schemas — see that
+# Dockerfile's COPY comment). Docker only reads .dockerignore from the
+# BUILD CONTEXT ROOT, so this file — not backend/.dockerignore, which is
+# now dead — is what actually protects secrets from being baked into an
+# image layer. Without the block below, backend/.env (real secrets:
+# JWT_SECRET, DATABASE_URL credentials, OPENROUTER_API_KEY, DEEPGRAM_API_KEY,
+# ELEVENLABS_API_KEY, TURN_SECRET) gets baked into an image layer the moment
+# a developer follows .env.example's own instructions and creates it —
+# recoverable from `docker history`/`docker save` even after a later layer,
+# and permanently so if the image is ever pushed to a registry.
+
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+backend/.venv/
+backend/venv/
+**/__pycache__/
+*.py[cod]
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/tests/
+
+.git/
+.github/
+.claude/
+android/
+docs/
+infra/
+*.md
+bash.exe.stackdump

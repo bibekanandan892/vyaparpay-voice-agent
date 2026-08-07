@@ -26,7 +26,22 @@ WORKDIR /app
 # resolve `packages = ["app"]` — a pyproject-only layer would fail to
 # build. This trades away a dependency-only cache layer for correctness
 # and simplicity; revisit only if build times become a real problem.
-COPY . .
+COPY backend/ /app/
+
+# `protocol/` is a SIBLING of `backend/` in the repo, not inside it —
+# schema_validation.py's load_schema() resolves it as
+# `Path(__file__).resolve().parents[3] / "protocol" / "schemas"`, which
+# from this image's `/app/app/context/schema_validation.py` is
+# `/protocol/schemas`. HIGH fix, found on the first real device call
+# (2026-08-07): the build context used to be `./backend` (docker-compose
+# .yml), so `protocol/` was never reachable by any COPY in this file —
+# every mid-call `app_event.v1` screen update failed validation with
+# FileNotFoundError and was silently dropped, for the whole time this
+# service has existed. The build context is now the repo root (see
+# docker-compose.yml's `context: .` / `dockerfile: backend/Dockerfile`),
+# so this COPY can actually see it. Root `.dockerignore` carries forward
+# the secret-exclusion rules `backend/.dockerignore` used to own alone.
+COPY protocol/ /protocol/
 
 # The `[voice]` extra is NOT optional here, despite only one of the two
 # services needing it. docs/04 §1 is "one image, built once, started two
