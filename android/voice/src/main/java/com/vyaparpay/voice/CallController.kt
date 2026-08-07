@@ -189,11 +189,28 @@ public class CallController(
                 startAnswerTimeout()
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Throwable) {
                 // Connect refused or peer bootstrap failed — either way the
                 // control plane never came up (docs/03 §3.2's Signaling
                 // failure). The cause was a transport/native error, not a
                 // wire code, so there is nothing better than UNKNOWN to map.
+                //
+                // Throwable, not Exception (found live, real device):
+                // webRtc.start() does the same real native init
+                // (PeerConnectionFactory / libwebrtc) that
+                // VoiceCallService.handleStart's own
+                // WebRtcClientFactory.create() catch already documents as
+                // Error-capable ("e.g. an UnsatisfiedLinkError"), but this
+                // catch, one call later in the same native surface, only
+                // caught Exception — so an Error here escaped this
+                // coroutine, was never dispatched as CallEvent.Failed, and
+                // crashed the process outright once serviceScope's
+                // SupervisorJob had nothing left to catch it. Confirmed on
+                // a real device: the signaling WebSocket connects
+                // (voice-worker logs signaling.connected), then the app
+                // vanished from the foreground and voice-worker saw
+                // ConnectionClosedError with no close code — the signature
+                // of the client process dying, not a graceful failure path.
                 dispatch(CallEvent.Failed(ApiError.UNKNOWN))
             }
         }

@@ -10,13 +10,30 @@
   (MockWebServer, no Android OS enforcement at all) until this file existed.
 
   base-config stays false, matching :core:network's manifest and docs/14's
-  "TLS everywhere" — only 127.0.0.1/localhost get the exception, so this
+  "TLS everywhere" — only these specific hosts get the exception, so this
   can't accidentally be pointed at a real non-TLS host during a demo.
+
+  The signaling WebSocket (OkHttpSignalingClient, CallController.openTransport)
+  is a SEPARATE connection from the REST base URL: it dials whatever
+  signaling_url the session-create response carries — SIGNALING_PUBLIC_URL
+  in backend/.env, the host's real LAN IP, not 127.0.0.1 — because that
+  value has to be reachable directly from the phone's real WiFi radio, not
+  through the adb-reverse USB tunnel (TCP-only, and only forwards the two
+  ports named in the manifest's own comment). Found live: session-create
+  succeeded fine over the loopback carve-out above, then the WS connect
+  failed with UnknownServiceException("CLEARTEXT communication to
+  <LAN IP> not permitted") because that host was never added here.
+
+  REPLACE 192.168.1.11 with `ipconfig`'s current Wi-Fi IPv4 address if it
+  changes (new network, DHCP lease renewal) — must match COTURN_HOST /
+  SIGNALING_PUBLIC_URL in backend/.env exactly, same as the manifest's
+  BASE_URL comment already asks for the REST side.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">127.0.0.1</domain>
         <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">192.168.1.11</domain>
     </domain-config>
 </network-security-config>
