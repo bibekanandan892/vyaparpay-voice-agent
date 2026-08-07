@@ -48,7 +48,7 @@ class EnvelopeAdapterErrorTest {
     private fun defaultInterceptedClient(): OkHttpClient {
         val json = NetworkModule.provideJson()
         val interceptor = ApiErrorReportingInterceptor(ApiErrorReporter(RingBufferEventTracker()), json)
-        return NetworkModule.provideOkHttpClient(interceptor)
+        return NetworkModule.provideOkHttpClient(interceptor, DemoAuthInterceptor { null })
     }
 
     private fun enqueueError(status: Int, body: String) {

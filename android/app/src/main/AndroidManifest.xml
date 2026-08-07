@@ -11,7 +11,8 @@
   system default stands in. Android Lint reports MissingApplicationIcon as a
   warning, which is the honest severity for it.
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <application
         android:name=".VyaparApp"
@@ -31,6 +32,55 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          VoiceCallService (declared in :voice's manifest) reads its API base
+          URL from this meta-data at runtime (VoiceCallService.kt's own kdoc:
+          ":voice -> :core:* only" forbids reaching :app's BuildConfig
+          directly, so the manifest is the one channel left). tools:node
+          merge because the <service> is already declared upstream — this
+          only adds the child <meta-data>, it doesn't redeclare the service.
+
+          REPLACE the value below with this machine's own reachable address
+          before a real device run:
+            - emulator against a host-local backend: http://10.0.2.2:8000/v1/
+            - real device over `adb reverse tcp:8000 tcp:8000`:
+              http://127.0.0.1:8000/v1/ (needs the debug-only
+              network-security-config in src/debug/ — plain
+              usesCleartextTraffic="false" blocks loopback cleartext too,
+              it has no built-in loopback carve-out)
+          VyaparApiFactory.create() requires https, OR http to exactly
+          "localhost" / "127.0.0.1" / "::1" — nothing else.
+        -->
+        <service
+            android:name="com.vyaparpay.voice.service.VoiceCallService"
+            tools:node="merge">
+            <meta-data
+                android:name="com.vyaparpay.voice.BASE_URL"
+                android:value="http://127.0.0.1:8000/v1/" />
+        </service>
+
+        <!--
+          DemoAuthInterceptor (:core:network) reads this the same way, off
+          <application> rather than a specific component since the OkHttp
+          client it decorates is shared by every VyaparApi call, not just
+          VoiceCallService's. Absent or blank = no Authorization header, the
+          exact behavior before this meta-data existed.
+
+          Mint one against whatever JWT_SECRET backend/.env actually has:
+            python -c "
+            import jwt, datetime
+            print(jwt.encode(
+                {'sub': 'usr_rajesh01',
+                 'exp': datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=12)},
+                '<JWT_SECRET from backend/.env>', algorithm='HS256'))
+            "
+          Demo-only: one static token for the process lifetime, no refresh.
+          See DemoAuthInterceptor's own kdoc.
+        -->
+        <meta-data
+            android:name="com.vyaparpay.core.network.DEMO_BEARER_TOKEN"
+            android:value="REPLACE_WITH_MINTED_DEMO_JWT" />
 
     </application>
 

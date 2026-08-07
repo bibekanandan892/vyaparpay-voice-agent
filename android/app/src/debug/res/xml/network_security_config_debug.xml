@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug build type only (src/debug/, never merged into release). Without
+  this, VyaparApiFactory's own loopback carve-out is dead on-device: its
+  KDoc admits as much ("On-device the manifest's usesCleartextTraffic=false
+  backstops this check") — a blanket usesCleartextTraffic="false" with no
+  domain-config has no automatic loopback exception, it blocks cleartext to
+  127.0.0.1 exactly as it blocks cleartext to anywhere else. The carve-out
+  in VyaparApiFactory.create() only ever did real work for JVM unit tests
+  (MockWebServer, no Android OS enforcement at all) until this file existed.
+
+  base-config stays false, matching :core:network's manifest and docs/14's
+  "TLS everywhere" — only 127.0.0.1/localhost get the exception, so this
+  can't accidentally be pointed at a real non-TLS host during a demo.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

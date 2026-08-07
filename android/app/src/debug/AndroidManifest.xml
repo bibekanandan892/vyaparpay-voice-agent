@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-build-only manifest fragment (AGP source-set convention: src/debug/
+  merges only into debug builds, never release). Points at the
+  network-security-config that carves out cleartext for 127.0.0.1/localhost
+  — see that file's own comment for why this is required, not optional,
+  for a real device reaching this machine over `adb reverse`.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application android:networkSecurityConfig="@xml/network_security_config_debug" />
+
+</manifest>

@@ -16,6 +16,7 @@ class VyaparApiFactoryTest {
     private val factory = NetworkModule.provideVyaparApiFactory(
         NetworkModule.provideOkHttpClient(
             ApiErrorReportingInterceptor(ApiErrorReporter(RingBufferEventTracker()), NetworkModule.provideJson()),
+            DemoAuthInterceptor { null },
         ),
         NetworkModule.provideJson(),
     )

@@ -40,7 +40,7 @@ class ApiErrorReportingInterceptorTest {
         events = FakeEventTracker()
         val json = NetworkModule.provideJson()
         val interceptor = ApiErrorReportingInterceptor(ApiErrorReporter(events), json)
-        val client = NetworkModule.provideOkHttpClient(interceptor)
+        val client = NetworkModule.provideOkHttpClient(interceptor, DemoAuthInterceptor { null })
         api = NetworkModule.provideVyaparApiFactory(client, json).create(server.url("/v1/").toString())
     }
 

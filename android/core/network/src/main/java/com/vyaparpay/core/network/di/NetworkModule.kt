@@ -1,6 +1,7 @@
 package com.vyaparpay.core.network.di
 
 import com.vyaparpay.core.network.ApiErrorReportingInterceptor
+import com.vyaparpay.core.network.DemoAuthInterceptor
 import com.vyaparpay.core.network.VyaparApiFactory
 import dagger.Module
 import dagger.Provides
@@ -41,9 +42,14 @@ public object NetworkModule {
     @Singleton
     public fun provideOkHttpClient(
         apiErrorReportingInterceptor: ApiErrorReportingInterceptor,
+        demoAuthInterceptor: DemoAuthInterceptor,
     ): OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        // Attaches Authorization first (see DemoAuthInterceptor's own kdoc —
+        // no-ops without a configured token) so error reporting below always
+        // observes the request that actually went out.
+        .addInterceptor(demoAuthInterceptor)
         // docs/08 §2.1: every non-2xx response becomes an `api_error` timeline
         // entry. An application interceptor (not a network interceptor) so it
         // still fires on a response OkHttp itself served from cache — there is
