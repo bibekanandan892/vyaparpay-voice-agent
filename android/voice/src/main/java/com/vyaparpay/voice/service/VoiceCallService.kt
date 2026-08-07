@@ -76,6 +76,24 @@ public class VoiceCallService : LifecycleService() {
     @Inject
     public lateinit var screenContextPublishers: Provider<ScreenContextPublisher>
 
+    /**
+     * The `:core:network`-provided client (DemoAuthInterceptor +
+     * ApiErrorReportingInterceptor), Hilt-injected since this is an
+     * `@AndroidEntryPoint` service — used for REST only. Found missing
+     * while placing the first real device call: `buildApi()` previously
+     * built [VyaparApi] on the companion's bare `sharedOkHttp`, which
+     * carries no interceptors at all, so every session-create request
+     * went out with no Authorization header and 401'd. Deliberately a
+     * SEPARATE client from `sharedOkHttp` rather than folding auth into
+     * it: `sharedOkHttp` also opens the signaling WebSocket, and
+     * ApiErrorReportingInterceptor's `!response.isSuccessful` check
+     * treats a 101 Switching Protocols upgrade as a failure — reusing
+     * one client for both would misfire that interceptor on every
+     * successful signaling connect.
+     */
+    @Inject
+    public lateinit var restOkHttpClient: OkHttpClient
+
     // A single confined worker, not the raw Default pool: CallController's
     // own event loop, VoiceCallCoordinator's two collectors, and a mute
     // toggle arriving on the main thread via ACTION_MUTE all share this
@@ -297,7 +315,7 @@ public class VoiceCallService : LifecycleService() {
     private fun buildApi(): VyaparApi {
         val baseUrl = resolveConfiguredBaseUrl() ?: return UnconfiguredVyaparApi
         return runCatching {
-            VyaparApiFactory(sharedOkHttp, Json { ignoreUnknownKeys = true }).create(baseUrl)
+            VyaparApiFactory(restOkHttpClient, Json { ignoreUnknownKeys = true }).create(baseUrl)
         }.getOrElse { UnconfiguredVyaparApi }
     }
 
@@ -336,7 +354,12 @@ public class VoiceCallService : LifecycleService() {
 
         // One process-lifetime OkHttpClient, matching :core:network's own
         // NetworkModule reasoning: connection pooling shared across every
-        // socket this module opens, signaling and REST alike.
+        // signaling WebSocket this module opens. REST calls use the
+        // Hilt-injected restOkHttpClient instance field instead (see its
+        // own kdoc for why the two are no longer one client) — this one
+        // stays deliberately bare, no interceptors, since
+        // ApiErrorReportingInterceptor misreads a 101 Switching Protocols
+        // upgrade as a failed response.
         private val sharedOkHttp: OkHttpClient by lazy { OkHttpClient() }
     }
 }
