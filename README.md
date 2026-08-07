@@ -58,7 +58,7 @@ The full 9-turn annotated transcript — with per-turn *Knew / Tool / Latency* b
 
 ## Current status
 
-Two weeks of continuous work — 94 commits, 2026-07-24 → 2026-08-07. The table below is a code-read, not a doc-trusted, status check:
+Two weeks of continuous work — 100 commits, 2026-07-24 → 2026-08-07. The table below is a code-read, not a doc-trusted, status check:
 
 | Phase | Reality check |
 |---|---|
@@ -70,6 +70,8 @@ Two weeks of continuous work — 94 commits, 2026-07-24 → 2026-08-07. The tabl
 | 6 — Production hardening | 🚧 Real CI on both backend and Android; no eval pipeline, load tests, or security-audit pass yet |
 
 **What's real right now:** the merchant app runs on a physical Android device, taps through to a live voice call, and holds a real two-way WebRTC conversation with the agent backend — confirmed end-to-end today.
+
+**Verified by evidence, not assumption:** after that first real call "worked," server logs and direct DB queries — not the app's own say-so — were checked against it. That surfaced two silent defects the call itself never showed: mid-call screen-context updates were failing 100% of the time (the Docker build never actually shipped `protocol/schemas` into the image), and post-call summaries were never persisting a single row (the finalize write was getting cancelled mid-flight by call teardown). Both are fixed and merged ([PR #71](https://github.com/bibekanandan892/vyaparpay-voice-agent/pull/71)) — and the fix for the second one went through a review pass that caught a CRITICAL regression in its *first* attempt (the shielded write could still return before it finished) before it ever shipped.
 
 **Known gaps:** the tool catalog is 3 tools deep today, not the fuller catalog [docs/10](docs/10-tool-calling.md) designs for later phases; the persistent floating support button described in the docs is deferred in favor of a Dashboard quick-action; there's no free-tier path to run this (OpenRouter and Deepgram are billed, though `TTS_PROVIDER=deepgram` avoids paying a second TTS vendor); and Android test coverage is unit/Robolectric only — no instrumented on-device suite yet.
 
@@ -138,7 +140,7 @@ flowchart LR
     subgraph Providers["Providers (behind owned interfaces)"]
         STT["Deepgram STT"]
         LLM["OpenRouter → Claude Sonnet 5"]
-        TTS["ElevenLabs TTS"]
+        TTS["ElevenLabs / Deepgram TTS"]
     end
     DB[("Postgres 16 + pgvector")]
     RD[("Redis 7")]
@@ -255,7 +257,7 @@ voice-calling-agent/
 │   │   ├── obs/             # OpenTelemetry tracing → Tempo
 │   │   ├── api/             # FastAPI routes (POST /v1/sessions, seeded business APIs)
 │   │   └── models/          # Pydantic + SQLAlchemy
-│   └── tests/                # 73 test files across 15 subdirectories
+│   └── tests/                # 73 test files across 16 subdirectories
 ├── protocol/                # Cross-language wire schemas (screen_context/v1, app_event/v1)
 ├── infra/                   # docker-compose stack: coturn, Postgres, Redis, Grafana/Tempo
 └── docs/                    # 17-document architecture set (start at docs/README.md)
