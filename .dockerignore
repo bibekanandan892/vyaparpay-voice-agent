@@ -15,10 +15,21 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 
+# Defense in depth, security review 2026-08-07: the two rules above are
+# what actually matters today (Dockerfile only COPYs backend/ and
+# protocol/, and no root-level .env exists) — these unprefixed rules are
+# a second layer in case either of those two facts ever changes (e.g. a
+# future COPY . . reintroduces the exact class of drift that put
+# backend/.env at risk of this before, or a root .env gets created since
+# Compose itself would look for one there by convention).
+.env
+.env.*
+!.env.example
+
 backend/.venv/
 backend/venv/
 **/__pycache__/
-*.py[cod]
+**/*.py[cod]
 backend/.pytest_cache/
 backend/.mypy_cache/
 backend/.ruff_cache/
@@ -30,5 +41,19 @@ backend/tests/
 android/
 docs/
 infra/
-*.md
 bash.exe.stackdump
+
+# Deliberately NOT excluding *.md anywhere under backend/: tried it
+# (security review's LOW/hygiene suggestion), and reverted after it broke
+# the image build AND the runtime image in two different, non-obvious
+# ways — caught only by actually rebuilding and running the image, not
+# by reasoning about the patterns. (1) backend/pyproject.toml declares
+# `readme = "README.md"`; hatchling refuses to even build the wheel
+# without that file present ("OSError: Readme file does not exist").
+# (2) backend/app/agent/prompts/*.md (persona.md, business_rules.md,
+# rolling_summary.md) are load-bearing prompt templates ContextBuilder
+# reads at process startup, not documentation — voice-worker crashed
+# outright on boot without them. A few KB of genuinely-non-sensitive
+# README text shipping in the image is a complete non-issue; chasing an
+# allowlist for every file this pattern turns out to also match is not
+# worth the risk of missing one and silently breaking the service again.
