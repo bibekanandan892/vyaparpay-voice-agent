@@ -204,7 +204,7 @@ python -m scripts.seed_kb                           # ~40-article support knowle
 python -m scripts.demo_cli --user usr_rajesh01       # text-only REPL against the real agent loop
 ```
 
-For a real voice call, build and install `android/app` on a device on the same network as the backend, point its `BASE_URL`/`DEMO_BEARER_TOKEN` manifest meta-data at the backend, and tap **Need help? → Call Support**. `docker compose --profile obs up` additionally starts Tempo + Grafana for the trace/cost dashboards.
+For a real voice call, build and install `android/app` on a device on the same network as the backend, point the `BASE_URL` manifest meta-data at the backend, put a minted demo JWT in the gitignored `android/local.properties` as `vyaparpay.demoBearerToken=...` (the manifest's comment shows the one-liner; never paste a token into the manifest itself), and tap **Need help? → Call Support**. `docker compose --profile obs up` additionally starts Tempo + Grafana for the trace/cost dashboards.
 
 ---
 

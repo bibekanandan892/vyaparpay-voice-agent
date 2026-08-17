@@ -122,5 +122,36 @@ jobs:
       # test_voice_pipeline_e2e.py, which needs no container and therefore
       # runs in `gates` instead — it importorskips to a skip here, and that
       # skip is expected, not a regression.
+      # A junit report plus a floor on the number of tests that actually
+      # PASSED -- not just "pytest exited 0". Three of the six files here
+      # `pytest.skip(..., allow_module_level=True)` when the Docker daemon
+      # is unreachable (35 of the 50 tests), and pytest reports a skip as
+      # success. Today the other three files have no such guard and would
+      # ERROR on a dead daemon, so the job still goes red -- but the day
+      # someone adds the same guard to them (a reasonable local-dev
+      # nicety), this job would go green having run nothing, which is the
+      # exact way test_voice_pipeline_e2e once went unrun for a whole
+      # phase (see the audit note at the top of this file). The floor is
+      # deliberately well below today's count (49-50 pass) so it only ever
+      # trips on "most of the job did not run", never on an ordinary test
+      # being removed.
       - name: Pytest (Docker-gated suites)
-        run: pytest tests/models tests/e2e -q
+        run: pytest tests/models tests/e2e -q --junitxml=docker-gated-junit.xml
+      - name: Assert the Docker-gated suites actually ran
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("docker-gated-junit.xml").getroot()
+          suites = root.iter("testsuite") if root.tag == "testsuites" else [root]
+          tests = failures = errors = skipped = 0
+          for ts in suites:
+              tests += int(ts.get("tests", 0)); failures += int(ts.get("failures", 0))
+              errors += int(ts.get("errors", 0)); skipped += int(ts.get("skipped", 0))
+          passed = tests - failures - errors - skipped
+          print(f"docker-gated: tests={tests} passed={passed} skipped={skipped} failures={failures} errors={errors}")
+          MIN_PASSED = 30
+          assert passed >= MIN_PASSED, (
+              f"only {passed} Docker-gated tests passed (< {MIN_PASSED}); "
+              "the suites were skipped or never ran -- check the Docker daemon on the runner"
+          )
+          PY

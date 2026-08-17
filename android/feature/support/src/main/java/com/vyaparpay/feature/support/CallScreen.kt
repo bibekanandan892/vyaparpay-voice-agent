@@ -14,11 +14,15 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
@@ -48,6 +52,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.ui.modifier.trackedClickable
@@ -65,6 +72,9 @@ internal const val CALL_MUTE_TOGGLE_TEST_TAG = "call_mute_toggle"
 
 /** testTag for the speaker toggle. */
 internal const val CALL_SPEAKER_TOGGLE_TEST_TAG = "call_speaker_toggle"
+
+/** testTag for the in-call notice line (e.g. notifications denied), shown under the status. */
+internal const val CALL_SCREEN_NOTICE_TEST_TAG = "call_screen_notice"
 
 /**
  * docs/03 §3.12's fuller in-call surface, scoped to what Phases 1-2 actually
@@ -131,6 +141,11 @@ internal fun BoxScope.CallSurface(
             onOpenSettings = onOpenSettings,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
+                // Same edge-to-edge reasoning as CallScreen's content and
+                // :app's ReturnToCallChip: this banner is bottom-anchored in
+                // SupportRoute's un-Scaffolded Box, so without this it sits
+                // behind a 3-button navigation bar under targetSdk 36.
+                .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(16.dp),
         )
     }
@@ -165,9 +180,16 @@ internal fun CallScreen(
             .testTag(CALL_SCREEN_TEST_TAG),
         color = MaterialTheme.colorScheme.surface,
     ) {
+        // safeDrawing insets on the CONTENT, not the Surface: targetSdk 36
+        // is edge-to-edge with no opt-out, and this screen is composed
+        // outside any Scaffold (SupportRoute's Box, over HelpScreen), so
+        // nothing else keeps the title out from under the status bar or
+        // the control row out from under a 3-button navigation bar. The
+        // Surface still fills the window so its colour reaches the edges.
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween,
@@ -192,6 +214,25 @@ internal fun CallScreen(
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.testTag(CALL_SCREEN_STATUS_TEST_TAG),
                 )
+                // A notice that arrived WITH the call -- today only
+                // NOTIFICATIONS_DENIED, applied on the way through to
+                // startCall -- used to be rendered by CallStatusPanel
+                // alongside the live phase. Once this screen took over the
+                // live phases it silently dropped, surfacing only after the
+                // call ended, under "Call ended", where it no longer meant
+                // anything (verification audit, 2026-08-17). Same copy as
+                // the panel, so the two surfaces never disagree.
+                state.notice?.let { notice ->
+                    Text(
+                        text = notice.message(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .padding(horizontal = 8.dp)
+                            .testTag(CALL_SCREEN_NOTICE_TEST_TAG),
+                    )
+                }
             }
 
             Row(
@@ -215,6 +256,11 @@ internal fun CallScreen(
                     label = "Speaker",
                     testTag = CALL_SPEAKER_TOGGLE_TEST_TAG,
                     active = state.speakerOn,
+                    // Mute conveys its state through the label flip
+                    // (Mute/Unmute); Speaker's label is constant, so
+                    // without this TalkBack says "Speaker, Button" in both
+                    // states and a blind merchant cannot tell which.
+                    stateDescription = if (state.speakerOn) "On" else "Off",
                     events = events,
                     onClick = onToggleSpeaker,
                 )
@@ -361,6 +407,8 @@ private fun CallControlButton(
     events: EventTracker,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Spoken after the label by screen readers ("Speaker, On, Button"); null when the label itself carries the state. */
+    stateDescription: String? = null,
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier) {
         Surface(
@@ -369,6 +417,13 @@ private fun CallControlButton(
             contentColor = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier
                 .size(64.dp)
+                .then(
+                    if (stateDescription != null) {
+                        Modifier.semantics { this.stateDescription = stateDescription }
+                    } else {
+                        Modifier
+                    },
+                )
                 .trackedClickable(
                     events = events,
                     screen = SupportDestination.ROUTE,

@@ -534,7 +534,10 @@ public class CallViewModel internal constructor(
         // onServiceDisconnected: the service process died without a terminal
         // CallState ever arriving. docs/03 §7's rule is to end the call
         // honestly rather than fake a live one, so the UI goes to ENDED
-        // instead of sitting on a spinner backed by nothing.
+        // instead of sitting on a spinner backed by nothing -- and the
+        // return-to-call signal is ended the same way, since the flow the
+        // observer holds will never reach Ended on its own.
+        callLiveness.abandon()
         releaseBinding()
         _state.update {
             if (it.canHangUp) it.copy(phase = CallPhase.ENDED, endReason = null) else it

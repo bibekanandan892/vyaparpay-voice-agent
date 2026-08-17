@@ -6,8 +6,11 @@ import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -225,6 +228,13 @@ public class MainActivity : ComponentActivity() {
                                 },
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
+                                    // Edge-to-edge (targetSdk 36): without
+                                    // this the chip sits behind a 3-button
+                                    // navigation bar. The reachable NavHost
+                                    // screens (Dashboard, Payment, Help) get
+                                    // their insets from Scaffold; this
+                                    // sibling of the NavHost does not.
+                                    .windowInsetsPadding(WindowInsets.navigationBars)
                                     .padding(bottom = 24.dp),
                             )
                         }

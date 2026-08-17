@@ -100,6 +100,29 @@ class CallLivenessObserverTest {
     }
 
     @Test
+    fun `abandon publishes not-live and stops collecting a flow that will never end`() = runTest {
+        // onServiceDisconnected: the service is gone without a terminal
+        // state, so the tracked flow will never emit Ended on its own.
+        val signal = CallActivitySignal()
+        val observer = CallLivenessObserver(signal, backgroundScope)
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        observer.track(state)
+        runCurrent()
+        assertTrue(signal.isCallLive.value)
+
+        observer.abandon()
+        runCurrent()
+
+        assertFalse(signal.isCallLive.value)
+        assertEquals(0, state.subscriptionCount.value)
+        // And a later, real call is still tracked normally.
+        val next = MutableStateFlow<CallState>(CallState.Requesting)
+        observer.track(next)
+        runCurrent()
+        assertTrue(signal.isCallLive.value)
+    }
+
+    @Test
     fun `under an eager dispatcher the collector runs inline before track returns`() {
         // Production scope is Dispatchers.Main.immediate: launch{} runs the
         // body inline up to its first suspension, and StateFlow.collect

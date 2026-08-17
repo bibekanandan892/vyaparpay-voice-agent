@@ -161,7 +161,8 @@ private fun EndReason?.endedLine(): String = when (this) {
     null -> "Call ended"
 }
 
-private fun CallNotice.message(): String = when (this) {
+/** The one wording per notice, shared with [CallScreen] so the two surfaces never disagree. */
+internal fun CallNotice.message(): String = when (this) {
     CallNotice.MIC_DENIED ->
         "Support calls need your microphone. Tap Call Support to allow it."
     CallNotice.MIC_BLOCKED ->

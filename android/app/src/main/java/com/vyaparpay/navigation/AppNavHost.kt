@@ -45,7 +45,11 @@ public fun AppNavHost(
     ) {
         composable(AppRoute.DASHBOARD.route) {
             DashboardRoute(
-                onNeedHelp = { navController.navigate(AppRoute.SUPPORT.route) },
+                // launchSingleTop: a fast double-tap on "Need help?" would
+                // otherwise push SUPPORT twice -- two CallViewModels, two
+                // service bindings, and a Back that lands on a second Help
+                // screen. Same guard MainActivity's return-to-call chip has.
+                onNeedHelp = { navController.navigate(AppRoute.SUPPORT.route) { launchSingleTop = true } },
             )
         }
         composable(AppRoute.PAYMENT.route) { PaymentRoute() }

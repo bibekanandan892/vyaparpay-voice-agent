@@ -113,4 +113,20 @@ public class CallLivenessObserver internal constructor(
             }
         }
     }
+
+    /**
+     * The service went away WITHOUT a terminal state -- `onServiceDisconnected`
+     * ([CallViewModel.onUnbound]), which for this same-process service means
+     * the process itself died and nothing is running any more. The tracked
+     * flow will never emit `Ended`, so publish not-live now and drop it.
+     * Unreachable in-process today (a dead process takes this singleton
+     * with it); kept symmetric with the ViewModel's own "end honestly"
+     * handling so the two cannot drift if the service ever moves out of
+     * process, where this becomes the only thing that hides the chip.
+     */
+    internal fun abandon() {
+        job?.cancel()
+        job = null
+        signal.update(false)
+    }
 }
