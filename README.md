@@ -58,11 +58,11 @@ The full 9-turn annotated transcript — with per-turn *Knew / Tool / Latency* b
 
 ## Current status
 
-Two weeks of continuous work — 100 commits, 2026-07-24 → 2026-08-07. The table below is a code-read, not a doc-trusted, status check:
+Three weeks of continuous work — 100+ commits since 2026-07-24. The table below is a code-read, not a doc-trusted, status check:
 
 | Phase | Reality check |
 |---|---|
-| 1 — Architecture | ✅ 17-doc set, unchanged since Phase 1 |
+| 1 — Architecture | ✅ 17-doc set from Phase 1; only small reconciliation edits since, where later phases found a detail the docs got wrong |
 | 2 — Backend MVP | ✅ The full agent loop (`SessionManager` → `ContextBuilder` → `PromptBuilder` → `LLMRouter` → `ToolExecutor` → `SafetyLayer` → `CostTracker`) is real, not stubs — 73 backend test files, real CI (`ruff` + `mypy` + `pytest`, testcontainers-gated) |
 | 3 — Voice MVP | ✅ Signaling, the aiortc peer session, Silero VAD + barge-in, Deepgram STT and dual TTS providers are all live. One open item: barge-in session-memory truncation (`ReplySink.on_turn_complete`) is still pending |
 | 4 — Screen-aware context | ✅ `UiTreeCollector`/`SemanticSnapshotBuilder` are genuinely wired into the running Android app (Hilt-injected from `MainActivity`, not dead code); backend ingestion + compression confirmed live |
@@ -190,13 +190,15 @@ Requires paid API keys — there's no fully free-tier path (OpenRouter for the L
 ```bash
 cp backend/.env.example backend/.env   # fill OPENROUTER_API_KEY, DEEPGRAM_API_KEY, JWT_SECRET, TURN_SECRET, ...
 ./infra/docker/coturn/gen-cert.sh      # one-time self-signed TLS cert for coturn
-docker compose up -d                   # postgres (pgvector) + redis + coturn + agent-api + voice-worker
+docker compose up -d --build           # postgres (pgvector) + redis + coturn + agent-api + voice-worker
 ```
+
+The image build fetches the pinned, hash-verified Silero VAD model itself (`backend/Dockerfile`), so the voice worker is ready to take calls as soon as it is up — nothing to fetch into a running container.
 
 Then, from `backend/`:
 
 ```bash
-python -m scripts.fetch_models                    # pinned, hash-verified Silero VAD model
+python -m scripts.fetch_models                    # same Silero model, for running the voice pipeline/tests on the host (not needed for the Docker stack)
 python -m scripts.seed                             # canonical Rajesh Kumar merchant/wallet/transaction fixtures
 python -m scripts.seed_kb                           # ~40-article support knowledge base (needs OPENAI_API_KEY)
 python -m scripts.demo_cli --user usr_rajesh01       # text-only REPL against the real agent loop
