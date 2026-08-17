@@ -40,27 +40,25 @@ $EDITOR backend/.env            # fill provider keys + TURN_SECRET (see below)
 # 2. the TLS cert coturn's turns: listener needs — once, idempotent
 ./infra/docker/coturn/gen-cert.sh
 
-# 3. up
-docker compose up -d postgres redis coturn agent-api
-#    ^ voice-worker is deliberately omitted here — see the note below
+# 3. up — all five services, including voice-worker
+docker compose up -d --build
 
 # 4. optional: trace sink
 docker compose --profile obs up -d
 ```
 
-**Why step 3 names services instead of a bare `up`:** `voice-worker` runs
-`python -m app.voice.run`, and **`backend/app/voice/run.py` does not exist
-yet** — it lands in a later Phase-3 task. The service is wired ahead of the
-code on purpose (the infrastructure shape is reviewable now, and that task
-then adds only `run.py`), but until it lands a plain `docker compose up`
-brings everything else up and leaves that one container exiting with
-`No module named app.voice.run`.
-
-A second thing that task will need: the image installs `pip install .`
-(base dependencies only), while the worker needs the `voice` extra
-(aiortc, onnxruntime, av, numpy — `backend/pyproject.toml`). Whoever wires
-`run.py` owns that Dockerfile change; it is not done here because this task
-does not touch `backend/`.
+**Step 3 is a plain `up`, and `--build` matters the first time.** Earlier
+revisions of this file told you to name every service *except*
+`voice-worker`, because `backend/app/voice/run.py` "does not exist yet" and
+the image installed only the base dependencies. Both have been false since
+Phase 3 landed: `run.py` is the worker's real entrypoint, `backend/Dockerfile`
+installs the `[voice]` extra into the one shared image, and — as of
+2026-08-17 — the image build also fetches the pinned, hash-verified Silero
+VAD model itself, so a freshly built worker is call-ready without anyone
+running `fetch_models` into the container by hand. (That was the remaining
+trap: the model file is gitignored, and an image built from a clean checkout
+used to ship without it and fail every call at peer setup.) `--build`
+ensures you are running that image and not a cached pre-fix one.
 
 ---
 

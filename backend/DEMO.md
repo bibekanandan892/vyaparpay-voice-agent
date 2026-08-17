@@ -89,9 +89,11 @@ select turn_no, tool_name, status, idempotency_key from tool_invocations
 ```
 
 This exact script — with scripted (not live) LLM responses, so it's
-deterministic and Docker/API-key-free to run — is also what
+deterministic and needs no API keys; it does need a Docker daemon, because
+it runs against a REAL Postgres started by testcontainers rather than a
+fake (see the test's own header) — is also what
 [tests/e2e/test_canonical_conversation.py](tests/e2e/test_canonical_conversation.py)
-replays and asserts against in CI: the confirm-gate hold at turn 5, the
+replays and asserts against in CI's docker-gated job: the confirm-gate hold at turn 5, the
 idempotency-key switch from `:5` to `:7`, the exact tool arguments, and
 the full post-call audit trail.
 

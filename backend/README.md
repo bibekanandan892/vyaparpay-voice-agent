@@ -1,14 +1,25 @@
 # backend/ — Agent Backend (Python / FastAPI)
 
-Phase 2 of the VyaparPay voice agent: the full text-only intelligence loop —
-context → prompt → LLM → tools → safety → cost — resolving the canonical
-Rajesh/₹245/`DAILY_LIMIT_EXCEEDED` incident end to end against seeded
-Postgres data, with real tool calls and a confirm-gated mutation. No
-WebRTC, no STT/TTS, no screen context — those are Phase 3+
-([docs/17-roadmap.md](../docs/17-roadmap.md)). See
-[docs/04-backend-architecture.md](../docs/04-backend-architecture.md) and
-[docs/05-agent-architecture.md](../docs/05-agent-architecture.md) for the
-architecture this implements.
+The VyaparPay voice agent's backend, Phases 2–5 as built: the intelligence
+loop — context → prompt → LLM → tools → safety → cost — resolving the
+canonical Rajesh/₹245/`DAILY_LIMIT_EXCEEDED` incident end to end against
+seeded Postgres data with real tool calls and a confirm-gated mutation
+(Phase 2); the real-time voice path — signaling, the aiortc peer session,
+Silero VAD + barge-in, Deepgram STT, Deepgram/ElevenLabs TTS — run by the
+`voice-worker` process (Phase 3); screen-context ingestion, compression and
+mid-call event dispatch (Phase 4); and the memory tiers — rolling summary,
+merchant profile, pgvector semantic search over past calls and a seeded
+knowledge base — plus per-call cost tracking (Phase 5). It has carried
+real voice calls from a physical Android device (first on 2026-08-07). See
+[docs/04-backend-architecture.md](../docs/04-backend-architecture.md),
+[docs/05-agent-architecture.md](../docs/05-agent-architecture.md) and
+[docs/06-voice-pipeline.md](../docs/06-voice-pipeline.md) for the
+architecture this implements, and [docs/17-roadmap.md](../docs/17-roadmap.md)
+for what each phase promised.
+
+(Until 2026-08-17 this file still introduced itself as "Phase 2 — no
+WebRTC, no STT/TTS, no screen context". That was three phases stale; the
+map below is now checked against `ls app/`.)
 
 For a guided walkthrough of the demo, see [DEMO.md](DEMO.md).
 
@@ -23,7 +34,7 @@ app/
 │   ├── middleware.py   # RequestId -> Tracing -> Auth -> ErrorEnvelope
 │   ├── errors.py   #   AppError hierarchy + error/success envelope (shared with tools/)
 │   ├── deps.py     #   get_db, require_rate_limit, JWT verification
-│   └── routes/     #   health, wallet, payments, limits
+│   └── routes/     #   health, wallet, payments, limits, sessions (POST /v1/sessions — the call's entry point)
 ├── agent/          # The agent brain (docs/05 §3) — one module per component
 │   ├── session_manager.py     # SessionManager — lifecycle + post-call drain
 │   ├── context_builder.py     # ContextBuilder — assembles the ContextBundle
@@ -40,25 +51,38 @@ app/
 │   ├── get_wallet_balance.py
 │   ├── get_payment_status.py
 │   └── request_limit_increase.py
-├── memory/         # ShortTermMemory (in-process), SessionMemory (Redis-backed)
-├── providers/      # OpenRouterLLM — the LLMProvider implementation
+├── memory/         # ShortTermMemory, SessionMemory (Redis), Summarizer (rolling summary),
+│                   #   ConversationSummaryStore, UserProfile store, semantic.py (pgvector search)
+├── providers/      # OpenRouterLLM, Deepgram STT, Deepgram TTS, ElevenLabs TTS, OpenAI embeddings
+├── voice/          # The Phase-3 real-time path, run as the `voice-worker` process (run.py):
+│                   #   signaling.py, peer_session.py (aiortc), audio_ingress/egress, silero.py +
+│                   #   vad_endpointer.py (VAD, endpointing, barge-in), stt_supervisor, speech (TTS),
+│                   #   worker.py (VoiceAgentWorker), call_session.py (lifecycle + shielded finalize),
+│                   #   context_dispatch.py (mid-call ctx.* frames), models/ (Silero ONNX, fetched)
+├── context/        # Phase-4 screen context: snapshot_ingestor, event_log, context_compressor,
+│                   #   schema_validation (protocol/schemas), token_estimate, redis_keys
+├── auth/           # Signaling tokens + short-lived TURN credentials (HMAC, TTL-bounded)
 ├── data/           # Engine/sessionmaker factory, RedisClient, repository-per-aggregate
-│   └── repositories/   # Merchant/Wallet/Payment/Limit/Conversation/ToolAudit/Cost
-├── domain/         # Frozen contract: value types (types.py) + Protocols (interfaces.py)
-├── models/         # SQLAlchemy ORM (8 Phase-2 tables)
-├── obs/            # structlog + OpenTelemetry wiring
+│   └── repositories/   # Merchant/Wallet/Payment/Limit/Conversation/ToolAudit/Cost/…
+├── domain/         # Frozen contract: value types (types.py) + Protocols (interfaces.py, voice.py)
+├── models/         # SQLAlchemy ORM — 12 tables (Phase-2 core + Phase-5 memory/summary/profile)
+├── obs/            # structlog + OpenTelemetry wiring (span contract for the Grafana/Tempo boards)
 └── config.py       # Settings (pydantic-settings, fail-fast on missing secrets)
 scripts/
 ├── seed.py         # Idempotent demo fixture seeder (Rajesh/Kumar General Store/...)
-├── demo_cli.py     # Text REPL harness — stands in for the Phase-3 voice transport
+├── seed_kb.py, kb_chunker.py, kb_content/  # ~40-article support knowledge base -> pgvector (needs OPENAI_API_KEY)
+├── fetch_models.py # Pinned, hash-verified Silero VAD model (also run inside the Dockerfile)
+├── demo_cli.py     # Text REPL harness — the Phase-2 development surface, not a product surface
 └── smoke_providers/ # Live Deepgram/ElevenLabs smoke harness (operator-run, real APIs — see below)
 tests/
-├── agent/, api/, data/, memory/, models/, obs/, providers/, scripts/, tools/  # unit tests
-└── e2e/            # test_canonical_conversation.py — the full 9-turn replay
+├── agent/, api/, auth/, context/, contract/, data/, domain/, memory/, models/, obs/,
+│   providers/, scripts/, support/, tools/, voice/                                  # unit tests
+└── e2e/            # test_canonical_conversation.py (9-turn replay), test_voice_pipeline_e2e.py (fake peer)
 ```
 
 Everything above is real, merged code — this map replaced Phase 1's
-"planned package map" placeholder once Phase 2 landed.
+"planned package map" placeholder once Phase 2 landed, and was brought up
+to the Phase-5 tree on 2026-08-17.
 
 ## Quickstart
 
