@@ -64,7 +64,7 @@ Two weeks of continuous work — 100 commits, 2026-07-24 → 2026-08-07. The tab
 |---|---|
 | 1 — Architecture | ✅ 17-doc set, unchanged since Phase 1 |
 | 2 — Backend MVP | ✅ The full agent loop (`SessionManager` → `ContextBuilder` → `PromptBuilder` → `LLMRouter` → `ToolExecutor` → `SafetyLayer` → `CostTracker`) is real, not stubs — 73 backend test files, real CI (`ruff` + `mypy` + `pytest`, testcontainers-gated) |
-| 3 — Voice MVP | ✅ Signaling, the aiortc peer session, Silero VAD + barge-in, Deepgram STT and dual TTS providers are all live. One open item: barge-in session-memory truncation (`ReplySink.on_turn_complete`) is still pending |
+| 3 — Voice MVP | ✅ Signaling, the aiortc peer session, Silero VAD + barge-in, Deepgram STT and dual TTS providers are all live. On Android the in-call UI is a real call screen — mute, speaker, end call, live duration (also ticking in the ongoing-call notification), and a "Return to call" chip from anywhere in the app. Open items: barge-in session-memory truncation (`ReplySink.on_turn_complete`) is still pending; the docs' live-transcript overlay (`ConversationOverlay`) is not built — the phone never renders captions or an agent-state indicator |
 | 4 — Screen-aware context | ✅ `UiTreeCollector`/`SemanticSnapshotBuilder` are genuinely wired into the running Android app (Hilt-injected from `MainActivity`, not dead code); backend ingestion + compression confirmed live |
 | 5 — Memory + RAG | ✅ The rolling summarizer and profile merge fire every turn inside the real `ConversationManager` loop; pgvector semantic memory, cost tracking, and the Grafana/Tempo dashboards are all confirmed live, not placeholders |
 | 6 — Production hardening | 🚧 Real CI on both backend and Android; no eval pipeline, load tests, or security-audit pass yet |
@@ -243,7 +243,7 @@ voice-calling-agent/
 │   │   ├── network/         # last_api interceptor feeding ScreenContext
 │   │   ├── analytics/       # EventTracker — 50-entry action ring buffer
 │   │   └── ui/              # shared Compose components
-│   ├── feature/             # dashboard, payments, support (SupportButton, ConversationOverlay)
+│   ├── feature/             # dashboard, payments, support (SupportButton, CallScreen, CallStatusPanel)
 │   └── voice/               # WebRtcClient (org.webrtc), SignalingClient, VoiceCallService, CallStateMachine
 ├── backend/                 # Python 3.12 — agent-api + voice-worker share one app/ package
 │   ├── app/

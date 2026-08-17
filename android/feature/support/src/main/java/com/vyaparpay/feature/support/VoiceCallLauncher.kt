@@ -8,6 +8,8 @@ import android.os.IBinder
 import androidx.core.content.ContextCompat
 import com.vyaparpay.voice.CallController
 import com.vyaparpay.voice.CallState
+import com.vyaparpay.voice.audio.AudioRoute
+import com.vyaparpay.voice.service.VoiceCallCoordinator
 import com.vyaparpay.voice.service.VoiceCallService
 import kotlinx.coroutines.flow.StateFlow
 
@@ -31,15 +33,47 @@ internal interface BoundCall {
     /** Context frames dropped so far — see `CallController.contextFramesDropped`. */
     val contextFramesDropped: Long
 
+    /** Wall-clock time the call first connected, observable — see `CallController.inCallSinceMillis`. */
+    val inCallSinceMillis: StateFlow<Long?>
+
+    /** Effective mute state — see `VoiceCallCoordinator.muted`. */
+    val muted: StateFlow<Boolean>
+
+    /** The requested audio route — see `VoiceCallCoordinator.audioRoute`. */
+    val audioRoute: StateFlow<AudioRoute>
+
     /** The user tapped End. */
     fun hangUp()
+
+    /** The user tapped Mute/Unmute — see `VoiceCallCoordinator.toggleMute`. */
+    fun toggleMute()
+
+    /** The user tapped Speaker — see `VoiceCallCoordinator.toggleSpeaker`. */
+    fun toggleSpeaker()
 }
 
-/** Adapts the real [CallController] to [BoundCall]. */
-internal class ControllerBoundCall(private val controller: CallController) : BoundCall {
+/**
+ * Adapts the real [CallController] + [VoiceCallCoordinator] pair to [BoundCall].
+ *
+ * Two collaborators, not one, because the mute/speaker surface this class
+ * exposes lives on the coordinator (docs: `VoiceCallCoordinator`'s own kdoc on
+ * why mute must go through it rather than `CallController.setMuted` directly
+ * — it reconciles a user mute against focus-driven auto-mute). `state` and
+ * `contextFramesDropped`/`inCallSinceMillis` stay on [controller], matching
+ * where `:voice` actually keeps that state.
+ */
+internal class ControllerBoundCall(
+    private val controller: CallController,
+    private val coordinator: VoiceCallCoordinator,
+) : BoundCall {
     override val state: StateFlow<CallState> get() = controller.state
     override val contextFramesDropped: Long get() = controller.contextFramesDropped
+    override val inCallSinceMillis: StateFlow<Long?> get() = controller.inCallSinceMillis
+    override val muted: StateFlow<Boolean> get() = coordinator.muted
+    override val audioRoute: StateFlow<AudioRoute> get() = coordinator.audioRoute
     override fun hangUp(): Unit = controller.hangUp()
+    override fun toggleMute(): Unit = coordinator.toggleMute()
+    override fun toggleSpeaker(): Unit = coordinator.toggleSpeaker()
 }
 
 /**
@@ -185,8 +219,24 @@ internal class AndroidVoiceCallLauncher(
 
         val newConnection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                val controller = (binder as? VoiceCallService.LocalBinder)?.callController
-                onBound(controller?.let(::ControllerBoundCall))
+                val localBinder = binder as? VoiceCallService.LocalBinder
+                val controller = localBinder?.callController
+                val coordinator = localBinder?.callCoordinator
+                // Both or neither: VoiceCallService.handleStart assigns its
+                // controller and coordinator fields together, from the same
+                // construction block, so a controller with no coordinator is
+                // not a state `:voice` actually produces. Treating it as
+                // controller-less anyway — rather than assuming that
+                // invariant across the module boundary — costs nothing and
+                // routes an impossible-but-unenforced case through the same
+                // honest handling a real controller-less bind already gets.
+                onBound(
+                    if (controller != null && coordinator != null) {
+                        ControllerBoundCall(controller, coordinator)
+                    } else {
+                        null
+                    },
+                )
             }
 
             override fun onServiceDisconnected(name: ComponentName?) {

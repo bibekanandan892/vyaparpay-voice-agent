@@ -2,13 +2,10 @@ package com.vyaparpay.feature.support
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
@@ -64,17 +61,22 @@ public fun SupportRoute(
             // mic-typed FGS started without it (docs/03 §3.3).
             onCallSupport = requestCallPermissions,
         )
-        CallStatusPanel(
+        // CallSurface owns picking between CallScreen and CallStatusPanel —
+        // extracted out of this composable (rather than an inline if/else
+        // here) specifically so that choice is unit-testable against a bare
+        // Box, with no Hilt graph, the same way CallScreenTest and
+        // CallStatusPanelTest already test their own composables standalone.
+        CallSurface(
             state = callState,
-            // The same EventTracker HelpScreen taps land on, so ending a call
-            // is on the agent's timeline alongside the tap that started it.
+            // The same EventTracker HelpScreen taps land on, so ending a
+            // call is on the agent's timeline alongside the tap that started
+            // it.
             events = viewModel.events,
             onHangUp = callViewModel::hangUp,
             onDismiss = callViewModel::dismiss,
+            onToggleMute = callViewModel::toggleMute,
+            onToggleSpeaker = callViewModel::toggleSpeaker,
             onOpenSettings = { PermissionManager.openAppSettings(context) },
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(16.dp),
         )
     }
 }

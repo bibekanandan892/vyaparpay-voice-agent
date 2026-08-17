@@ -25,7 +25,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -68,6 +70,8 @@ public class CallController(
     private val contextPublisher: CallContextPublisher? = null,
     private val answerTimeoutMillis: Long = ANSWER_TIMEOUT_MILLIS,
     private val reconnectGraceMillis: Long = RECONNECT_GRACE_MILLIS,
+    /** Injectable for deterministic tests — see [inCallSinceMillis]. */
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
 
     private val machine = CallStateMachine()
@@ -103,6 +107,36 @@ public class CallController(
      * counter reachable at all rather than test-only.
      */
     public val contextFramesDropped: Long get() = contextChannel?.droppedFrameCount ?: 0L
+
+    private val _inCallSinceMillis = MutableStateFlow<Long?>(null)
+
+    /**
+     * Wall-clock time the call first reached [CallState.InCall], or `null`
+     * before that — the anchor an in-call UI renders an elapsed-time counter
+     * against. A `StateFlow`, not a plain getter, for the reason under
+     * "not atomic" below: an observer collects it and gets the stamp
+     * whenever it lands, instead of snapshotting a value that may be one
+     * dispatch-loop turn from existing.
+     *
+     * Set exactly once per call, from the same `Connecting -> InCall` edge
+     * [CallEffect.BindContextPublisher] fires on (see that effect's kdoc): a
+     * mid-call `Reconnecting -> InCall` resume does not re-fire it, so a
+     * reconnect never resets the timer a merchant is watching. Like
+     * [contextFramesDropped], deliberately never cleared afterwards — a
+     * finished call's duration is the interesting value, not a reset one.
+     *
+     * **Not atomic with [state].** This and `state` are two separately
+     * published flows, not one value — `CallStateMachine.dispatch` publishes
+     * `InCall` and only then does this loop's effect execution stamp the
+     * time, so a reader on another thread can observe
+     * `state.value == CallState.InCall` for one dispatch-loop turn before
+     * this flow turns non-null. That is why it is observable: a UI that
+     * *collects* it (rather than reading `.value` once on the InCall
+     * transition) cannot miss the stamp, and must treat `null` as "not yet
+     * available", not as "not in a call". (Review, 2026-08-17: the earlier
+     * `@Volatile` getter had exactly that snapshot hazard downstream.)
+     */
+    public val inCallSinceMillis: StateFlow<Long?> = _inCallSinceMillis.asStateFlow()
 
     init {
         scope.launch {
@@ -146,7 +180,10 @@ public class CallController(
         when (effect) {
             CallEffect.MintSession -> mintSession()
             is CallEffect.OpenTransport -> openTransport(effect.bundle)
-            CallEffect.BindContextPublisher -> bindContextPublisher()
+            CallEffect.BindContextPublisher -> {
+                if (_inCallSinceMillis.value == null) _inCallSinceMillis.value = clock()
+                bindContextPublisher()
+            }
             is CallEffect.SendBye -> signaling.send(OutboundSignal.Bye(effect.reason))
             CallEffect.StartReconnectGrace -> startGraceTimer()
             CallEffect.CancelReconnectGrace -> {

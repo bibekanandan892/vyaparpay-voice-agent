@@ -64,11 +64,12 @@ class CallControllerTest {
         expires = "2026-07-24T14:19:22+05:30",
     )
 
-    private fun TestScope.controller(): CallController = CallController(
+    private fun TestScope.controller(clock: () -> Long = { 0L }): CallController = CallController(
         api = api,
         signaling = signaling,
         webRtc = webRtc,
         scope = backgroundScope,
+        clock = clock,
     )
 
     private suspend fun TestScope.driveToInCall(controller: CallController) {
@@ -313,6 +314,59 @@ class CallControllerTest {
         controller.setMuted(true)
 
         assertEquals(true, webRtc.lastMuted)
+    }
+
+    // ------------------------------------------------------------------
+    // Elapsed-call timer anchor
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `inCallSinceMillis is null before the call ever reaches InCall`() = runTest {
+        val controller = controller()
+        controller.startCall(request)
+        runCurrent()
+
+        assertNull(controller.inCallSinceMillis.value)
+    }
+
+    @Test
+    fun `inCallSinceMillis is stamped from the clock the moment the call first reaches InCall`() = runTest {
+        val controller = controller(clock = { 42_000L })
+        driveToInCall(controller)
+
+        assertEquals(42_000L, controller.inCallSinceMillis.value)
+    }
+
+    @Test
+    fun `inCallSinceMillis is not reset by a mid-call reconnect`() = runTest {
+        var now = 1_000L
+        val controller = controller(clock = { now })
+        driveToInCall(controller)
+        assertEquals(1_000L, controller.inCallSinceMillis.value)
+
+        now = 5_000L
+        webRtc.events.emit(RtcEvent.TransportLost)
+        runCurrent()
+        webRtc.events.emit(RtcEvent.TransportResumed)
+        runCurrent()
+        assertEquals(CallState.InCall, controller.state.value)
+
+        // The clock moved on, but the anchor must still be the original
+        // stamp — a reconnect must never reset the timer a merchant is
+        // watching mid-call.
+        assertEquals(1_000L, controller.inCallSinceMillis.value)
+    }
+
+    @Test
+    fun `inCallSinceMillis survives past hang-up, like contextFramesDropped does`() = runTest {
+        val controller = controller(clock = { 7_000L })
+        driveToInCall(controller)
+
+        controller.hangUp()
+        runCurrent()
+
+        assertEquals(CallState.Ended(EndReason.USER_HUNG_UP), controller.state.value)
+        assertEquals(7_000L, controller.inCallSinceMillis.value)
     }
 
     // ------------------------------------------------------------------

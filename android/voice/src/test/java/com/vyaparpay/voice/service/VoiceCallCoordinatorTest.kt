@@ -34,7 +34,10 @@ class VoiceCallCoordinatorTest {
     private var foregroundRequiredCount = 0
     private var callEndedCount = 0
 
-    private fun TestScope.coordinator(state: MutableStateFlow<CallState>): VoiceCallCoordinator =
+    private fun TestScope.coordinator(
+        state: MutableStateFlow<CallState>,
+        inCallSinceMillis: () -> Long? = { null },
+    ): VoiceCallCoordinator =
         VoiceCallCoordinator(
             callState = state,
             audioSession = audioSession,
@@ -44,7 +47,44 @@ class VoiceCallCoordinatorTest {
             hangUp = { hangUpCallCount++ },
             onForegroundServiceRequired = { foregroundRequiredCount++ },
             onCallEnded = { callEndedCount++ },
+            inCallSinceMillis = inCallSinceMillis,
         )
+
+    // ------------------------------------------------------------------
+    // start() idempotency — load-bearing now that LocalBinder hands the
+    // coordinator itself to a bound client, not just VoiceCallService
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `a second start call is a no-op, not a second set of collectors`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.Idle)
+        val coordinator = coordinator(state)
+        coordinator.start()
+        coordinator.start()
+        runCurrent()
+
+        state.value = CallState.Requesting
+        runCurrent()
+
+        // Focus/foreground are de-duplicated by `everForegrounded` even with
+        // two collectors, so those counters cannot tell one collector from
+        // two. What a duplicated collectCallState() genuinely doubles is the
+        // per-emission notification push -- one collector, one push per
+        // state -- so that is the load-bearing assertion (verified to read 2
+        // with the AtomicBoolean guard removed).
+        assertEquals(1, audioSession.acquireCallCount)
+        assertEquals(1, foregroundRequiredCount)
+        assertEquals(1, notifier.shown.size)
+
+        state.value = CallState.Ended(EndReason.SETUP_FAILED)
+        runCurrent()
+
+        // Likewise the terminal path: two collectors would clear the
+        // notification, release audio and report call-ended twice each.
+        assertEquals(1, notifier.clearCallCount)
+        assertEquals(1, audioSession.releaseCallCount)
+        assertEquals(1, callEndedCount)
+    }
 
     // ------------------------------------------------------------------
     // Audio focus: requested before capture, abandoned exactly once
@@ -334,6 +374,144 @@ class VoiceCallCoordinatorTest {
         runCurrent()
 
         assertEquals(true, notifier.shown.last().muted)
+    }
+
+    // ------------------------------------------------------------------
+    // Notification duration anchor (docs/03 §3.3's "live call duration")
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `the coordinator passes inCallSinceMillis through unconditionally, without gating on phase itself`() = runTest {
+        // CallController is what actually withholds the value until the call
+        // connects (its own inCallSinceMillis kdoc), and AndroidCallNotifier
+        // is what decides whether to render a chronometer from it -- this
+        // class's only job is to read the lambda fresh on every push and
+        // forward it, not to reinterpret what it means.
+        val state = MutableStateFlow<CallState>(CallState.Requesting)
+        coordinator(state, inCallSinceMillis = { 42_000L }).start()
+        runCurrent()
+
+        assertEquals(42_000L, notifier.shown.last().inCallSinceMillis)
+    }
+
+    @Test
+    fun `the duration anchor reaches the notification once in call`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        coordinator(state, inCallSinceMillis = { 7_000L }).start()
+        runCurrent()
+
+        assertEquals(7_000L, notifier.shown.last().inCallSinceMillis)
+    }
+
+    @Test
+    fun `the duration anchor stays stable across a mute toggle`() = runTest {
+        // pushNotification() fires on every mute-driven update too
+        // (applyMuteState) -- the anchor must not flicker or reset just
+        // because the mute button was tapped.
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        val coordinator = coordinator(state, inCallSinceMillis = { 7_000L })
+        coordinator.start()
+        runCurrent()
+
+        coordinator.toggleMute()
+        runCurrent()
+
+        assertEquals(7_000L, notifier.shown.last().inCallSinceMillis)
+        assertTrue("every pushed state carried the same anchor", notifier.shown.all { it.inCallSinceMillis == 7_000L })
+    }
+
+    @Test
+    fun `a null duration anchor is the default when the caller supplies none`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        coordinator(state).start() // default inCallSinceMillis = { null }
+        runCurrent()
+
+        assertEquals(null, notifier.shown.last().inCallSinceMillis)
+    }
+
+    // ------------------------------------------------------------------
+    // Observable state for a bound UI: muted / audioRoute
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `muted starts false and reflects a user toggle`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        val coordinator = coordinator(state)
+        coordinator.start()
+        runCurrent()
+
+        assertEquals(false, coordinator.muted.value)
+
+        coordinator.toggleMute()
+        runCurrent()
+
+        assertEquals(true, coordinator.muted.value)
+    }
+
+    @Test
+    fun `muted reflects auto-mute the same way the notification does`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        val coordinator = coordinator(state)
+        coordinator.start()
+        runCurrent()
+
+        audioSession.focusChangesFlow.emit(AudioFocusChange.LOST_TRANSIENT)
+        runCurrent()
+        assertEquals(true, coordinator.muted.value)
+
+        audioSession.focusChangesFlow.emit(AudioFocusChange.GAINED)
+        runCurrent()
+        assertEquals(false, coordinator.muted.value)
+    }
+
+    @Test
+    fun `audioRoute defaults to earpiece before any call, matching what acquire hard-sets on Requesting`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.Idle)
+        val coordinator = coordinator(state)
+        coordinator.start()
+        runCurrent()
+
+        assertEquals(AudioRoute.EARPIECE, coordinator.audioRoute.value)
+        assertEquals(0, audioSession.acquireCallCount)
+
+        // The default is not just a constructor guess: acquire() itself is
+        // what actually hard-sets EARPIECE in production
+        // (AndroidCallAudioSession.acquire), and this drives the state that
+        // triggers it to confirm the two stay consistent.
+        state.value = CallState.Requesting
+        runCurrent()
+
+        assertEquals(1, audioSession.acquireCallCount)
+        assertEquals(AudioRoute.EARPIECE, coordinator.audioRoute.value)
+    }
+
+    @Test
+    fun `toggling speaker switches to SPEAKER and calls setRoute`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        val coordinator = coordinator(state)
+        coordinator.start()
+        runCurrent()
+
+        coordinator.toggleSpeaker()
+        runCurrent()
+
+        assertEquals(AudioRoute.SPEAKER, coordinator.audioRoute.value)
+        assertEquals(listOf(AudioRoute.SPEAKER), audioSession.routes)
+    }
+
+    @Test
+    fun `toggling speaker twice returns to earpiece`() = runTest {
+        val state = MutableStateFlow<CallState>(CallState.InCall)
+        val coordinator = coordinator(state)
+        coordinator.start()
+        runCurrent()
+
+        coordinator.toggleSpeaker()
+        coordinator.toggleSpeaker()
+        runCurrent()
+
+        assertEquals(AudioRoute.EARPIECE, coordinator.audioRoute.value)
+        assertEquals(listOf(AudioRoute.SPEAKER, AudioRoute.EARPIECE), audioSession.routes)
     }
 }
 

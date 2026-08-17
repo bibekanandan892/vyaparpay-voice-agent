@@ -83,7 +83,7 @@ public class AndroidCallNotifier(
             if (state.muted) R.string.voice_call_action_unmute else R.string.voice_call_action_mute,
         )
 
-        return NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_call_notification)
             .setContentTitle(context.getString(R.string.voice_call_notification_title))
             .setContentText(contentText)
@@ -97,7 +97,20 @@ public class AndroidCallNotifier(
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(0, muteLabel, actionIntent(VoiceCallService.ACTION_MUTE))
             .addAction(0, context.getString(R.string.voice_call_action_end), actionIntent(VoiceCallService.ACTION_END))
-            .build()
+
+        // docs/03 §3.3's "plus the live call duration" — a system chronometer,
+        // not a manually re-posted string: setWhen anchors it to the real
+        // connect time and the platform ticks the MM:SS/HH:MM:SS display on
+        // its own, with none of this class re-calling show() on a timer.
+        // Only once inCallSinceMillis is non-null (the call has actually
+        // connected at least once) — a chronometer ticking up during
+        // CONNECTING, before any media is up, would show a duration for a
+        // call that has not started yet.
+        state.inCallSinceMillis?.let { anchor ->
+            builder.setWhen(anchor).setShowWhen(true).setUsesChronometer(true)
+        }
+
+        return builder.build()
     }
 
     private fun contentIntent(): PendingIntent? {
