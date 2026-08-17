@@ -21,10 +21,21 @@ public interface CallNotifier {
     public fun clear()
 }
 
-/** What the notification currently says (docs/03 §3.3). */
+/**
+ * What the notification currently says (docs/03 §3.3).
+ *
+ * @param inCallSinceMillis wall-clock time the call first connected
+ *   (`CallController.inCallSinceMillis`, threaded in through
+ *   `VoiceCallCoordinator`'s constructor), or `null` before that — the
+ *   anchor [AndroidCallNotifier] renders docs/03 §3.3's "live call duration"
+ *   against via `NotificationCompat.Builder.setUsesChronometer`/`setWhen`.
+ *   Non-null for the rest of the call's life once set, including through a
+ *   reconnect, matching that field's own "never reset" contract.
+ */
 public data class CallNotificationState(
     val phase: CallNotificationPhase,
     val muted: Boolean,
+    val inCallSinceMillis: Long? = null,
 )
 
 /** The phases the user-facing notification distinguishes. */

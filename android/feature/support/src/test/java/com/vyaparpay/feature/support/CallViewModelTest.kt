@@ -8,12 +8,15 @@ import com.vyaparpay.core.screencontext.NavigationTracker
 import com.vyaparpay.core.screencontext.UiTreeCollector
 import com.vyaparpay.voice.CallState
 import com.vyaparpay.voice.EndReason
+import com.vyaparpay.voice.audio.AudioRoute
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -284,7 +287,7 @@ class CallViewModelTest {
     fun `the request handed to the service is AppStateManager's session body verbatim`() {
         val appState = newAppStateManager()
         val launcher = FakeVoiceCallLauncher()
-        val viewModel = CallViewModel(appState, launcher)
+        val viewModel = CallViewModel(appState, launcher, newLivenessObserver())
 
         viewModel.startCall()
 
@@ -367,6 +370,136 @@ class CallViewModelTest {
         assertEquals(EndReason.REMOTE_HUNG_UP, viewModel.state.value.endReason)
     }
 
+    // ---------------------------------------------------------------
+    // CallActivitySignal — the return-to-call chip's data source, fed by
+    // CallLivenessObserver from the call the ViewModel binds to
+    // ---------------------------------------------------------------
+
+    @Test
+    fun `callActivitySignal tracks the bound call across its whole lifecycle`() = runTest {
+        val signal = CallActivitySignal()
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher, newLivenessObserver(signal))
+        assertFalse(signal.isCallLive.value)
+
+        viewModel.startCall()
+        val call = FakeBoundCall(initial = CallState.Requesting)
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(signal.isCallLive.value)
+
+        call.emit(CallState.InCall)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(signal.isCallLive.value)
+
+        call.emit(CallState.Ended(EndReason.USER_HUNG_UP))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertFalse(signal.isCallLive.value)
+    }
+
+    @Test
+    fun `a fresh ViewModel discovering an already-running call publishes live immediately`() = runTest {
+        // The reconciliation-on-creation path (the class kdoc's HIGH-fix
+        // paragraph): a merchant returning to a call the previous ViewModel
+        // instance was destroyed mid-way through.
+        val signal = CallActivitySignal()
+        val launcher = FakeVoiceCallLauncher()
+        newViewModel(launcher, newLivenessObserver(signal))
+
+        launcher.connect(FakeBoundCall(initial = CallState.InCall))
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(signal.isCallLive.value)
+    }
+
+    @Test
+    fun `a call ending after its ViewModel was cleared still publishes not-live`() = runTest {
+        // THE bug this design exists for (2026-08-17 audit, confirmed HIGH):
+        // the merchant left Support mid-call (ViewModel cleared, binding
+        // released, call still running), then the call ended -- agent hung
+        // up, or End tapped in the notification shade -- with no ViewModel
+        // alive to see it. The old ViewModel-owned publisher left the chip
+        // offered indefinitely. The observer outlives the ViewModel, so the
+        // call's own Ended must reach the signal. Verified to fail with the
+        // observer's collector cancelled in onCleared.
+        val signal = CallActivitySignal()
+        val launcher = FakeVoiceCallLauncher()
+        val store = ViewModelStore()
+        val viewModel = newViewModel(launcher, newLivenessObserver(signal))
+        store.put("call", viewModel)
+        viewModel.startCall()
+        val call = FakeBoundCall(initial = CallState.InCall)
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(signal.isCallLive.value)
+
+        store.clear()
+        assertFalse("binding released with the ViewModel", launcher.isBound)
+        assertTrue("clearing the ViewModel must not itself end the chip", signal.isCallLive.value)
+
+        call.emit(CallState.Ended(EndReason.REMOTE_HUNG_UP))
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(signal.isCallLive.value)
+    }
+
+    @Test
+    fun `a reconnaissance bind that finds nothing running leaves the signal alone`() = runTest {
+        // Deliberately NOT a "publishes false" test: CallLivenessObserver's
+        // kdoc explains why "I saw nothing" is not written -- it would race
+        // a live call's own true (a probe can connect before the service has
+        // processed a start). So the signal is primed TRUE here, as if a
+        // call were live, and the controller-less probe must not clobber
+        // it. (Primed false, this test could not fail: the regression it
+        // guards against -- a probe publishing false -- would leave false.)
+        val signal = CallActivitySignal().apply { update(true) }
+        val launcher = FakeVoiceCallLauncher()
+        newViewModel(launcher, newLivenessObserver(signal))
+
+        launcher.connect(null)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue("a controller-less probe must not write the signal", signal.isCallLive.value)
+    }
+
+    @Test
+    fun `a second ViewModel re-binding mid-call replaces the observer's collector, and the call's end still lands`() = runTest {
+        // The production sequence end to end: VM1 binds the call and is
+        // cleared (merchant leaves Support); VM2 is created later (merchant
+        // returns, or taps the chip) and its reconnaissance bind finds the
+        // SAME call; then the call ends. One collector, not two; the old
+        // VM's teardown must not have disturbed the observer; Ended reaches
+        // the signal.
+        val signal = CallActivitySignal()
+        val observer = newLivenessObserver(signal)
+        val call = FakeBoundCall(initial = CallState.InCall)
+
+        val launcher1 = FakeVoiceCallLauncher()
+        val store1 = ViewModelStore()
+        val vm1 = newViewModel(launcher1, observer)
+        store1.put("call", vm1)
+        vm1.startCall()
+        launcher1.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(signal.isCallLive.value)
+        store1.clear()
+        assertTrue(signal.isCallLive.value)
+
+        val launcher2 = FakeVoiceCallLauncher()
+        newViewModel(launcher2, observer)
+        launcher2.connect(call) // reconnaissance finds the running call
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(signal.isCallLive.value)
+        // Two subscribers to the call's state, not three: VM2's own stateJob
+        // plus ONE observer collector. VM1's stateJob was cancelled with it;
+        // a stacked (not replaced) observer would read 3.
+        assertEquals("VM2's collector + one observer collector", 2, call.stateSubscriptionCount)
+
+        call.emit(CallState.Ended(EndReason.REMOTE_HUNG_UP))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertFalse(signal.isCallLive.value)
+    }
+
     @Test
     fun `a freshly bound controller still reporting Idle stays on connecting`() = runTest {
         // VoiceCallService dispatches SupportTapped through a channel, so the
@@ -403,6 +536,233 @@ class CallViewModelTest {
         dispatcher.scheduler.advanceUntilIdle()
 
         assertEquals(7L, viewModel.state.value.contextFramesDropped)
+    }
+
+    @Test
+    fun `the elapsed-call anchor is surfaced from the bound call`() = runTest {
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+        val call = FakeBoundCall()
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertNull(viewModel.state.value.inCallSinceMillis)
+
+        call.inCallSinceMillis.value = 12_345L
+        call.emit(CallState.InCall)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(12_345L, viewModel.state.value.inCallSinceMillis)
+    }
+
+    @Test
+    fun `an anchor that lands after the InCall transition still reaches the UI`() = runTest {
+        // CallController's own kdoc: it publishes InCall one dispatch-loop
+        // turn BEFORE it stamps inCallSinceMillis. A ViewModel that only
+        // snapshotted the anchor on state transitions would read null here
+        // and -- with no further transition for the rest of the call --
+        // never look again: a bare "Connected" with no timer until a
+        // reconnect. Collecting the anchor's flow closes that. Verified to
+        // fail against the snapshot-on-transition version.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+        val call = FakeBoundCall()
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        call.emit(CallState.InCall) // state first, anchor still null
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(CallPhase.IN_CALL, viewModel.state.value.phase)
+        assertNull(viewModel.state.value.inCallSinceMillis)
+
+        call.inCallSinceMillis.value = 12_345L // anchor lands late, no state change
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(12_345L, viewModel.state.value.inCallSinceMillis)
+    }
+
+    @Test
+    fun `a fresh call attempt clears the previous call's mute, speaker, and timer`() = runTest {
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+        val first = FakeBoundCall()
+        launcher.connect(first)
+        dispatcher.scheduler.advanceUntilIdle()
+        first.toggleMute()
+        first.toggleSpeaker()
+        first.inCallSinceMillis.value = 9_000L
+        first.emit(CallState.InCall)
+        dispatcher.scheduler.advanceUntilIdle()
+        first.emit(CallState.Ended(EndReason.USER_HUNG_UP))
+        dispatcher.scheduler.advanceUntilIdle()
+        // Deliberately NO dismiss() here: dismiss() replaces the whole state
+        // with CallUiState() defaults, which would clear these three fields
+        // by itself and make startCall's own reset unobservable. ENDED has
+        // canHangUp == false, so startCall() is allowed straight from it --
+        // the "Call Support again from the banner" path -- and that is the
+        // path whose leftovers the reset lines exist for. Verified to fail
+        // with those reset lines removed from startCall.
+        assertTrue(viewModel.state.value.muted)
+        assertTrue(viewModel.state.value.speakerOn)
+        assertEquals(9_000L, viewModel.state.value.inCallSinceMillis)
+
+        viewModel.startCall()
+
+        assertFalse(viewModel.state.value.muted)
+        assertFalse(viewModel.state.value.speakerOn)
+        assertNull(viewModel.state.value.inCallSinceMillis)
+    }
+
+    // ---------------------------------------------------------------
+    // Mute / speaker
+    // ---------------------------------------------------------------
+
+    @Test
+    fun `toggling mute reaches the bound call and the effective state round-trips back`() = runTest {
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+        val call = FakeBoundCall(initial = CallState.InCall)
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.muted)
+
+        viewModel.toggleMute()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, call.toggleMuteCount)
+        assertTrue(viewModel.state.value.muted)
+
+        viewModel.toggleMute()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.muted)
+    }
+
+    @Test
+    fun `toggling speaker reaches the bound call and the route round-trips back`() = runTest {
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+        val call = FakeBoundCall(initial = CallState.InCall)
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.speakerOn)
+
+        viewModel.toggleSpeaker()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, call.toggleSpeakerCount)
+        assertTrue(viewModel.state.value.speakerOn)
+    }
+
+    @Test
+    fun `a mute tap before binding is simply dropped, unlike hang-up's pending queue`() = runTest {
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+
+        // No bound call yet — call is still null. toggleMute must not throw
+        // and must not queue anything for a later bind to replay.
+        viewModel.toggleMute()
+        viewModel.toggleSpeaker()
+
+        val call = FakeBoundCall(initial = CallState.InCall)
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(0, call.toggleMuteCount)
+        assertEquals(0, call.toggleSpeakerCount)
+    }
+
+    @Test
+    fun `binding synchronously to an already-ended call does not leak stale collectors`() = runTest {
+        // bound.state.collect delivers its current value synchronously when
+        // running on Dispatchers.Main.immediate (what viewModelScope actually
+        // uses in production) — before the launch{} that started it ever
+        // suspends. If the bound call's state is already terminal at bind
+        // time (reachable via handleControllerlessBinding's retry loop
+        // racing a fast session-mint failure), onCallStateChanged runs
+        // inline and calls releaseBinding(), which the outer
+        // `stateJob = ...`/`controlsJob = ...` assignments could then clobber
+        // back to non-null if CallViewModel.onBound did not guard against it.
+        //
+        // This class's default StandardTestDispatcher queues launch{} bodies
+        // instead of inlining them, which would hide this race entirely —
+        // UnconfinedTestDispatcher is what actually reproduces the eager,
+        // synchronous-until-first-suspension execution Main.immediate has,
+        // so this is the one test in the file that needs it.
+        Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
+
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+
+        val staleCall = FakeBoundCall(initial = CallState.Ended(EndReason.SETUP_FAILED))
+        launcher.connect(staleCall)
+
+        assertEquals(CallPhase.ENDED, viewModel.state.value.phase)
+
+        // If either job leaked, this toggle on the released call would still
+        // be observed and would corrupt state describing a call that ended
+        // before this ViewModel ever held a live reference to it.
+        staleCall.toggleMute()
+
+        assertFalse("a released call's mute toggle must not reach state", viewModel.state.value.muted)
+    }
+
+    @Test
+    fun `a stale bound call's flows stop reaching state once a fresh call is bound`() = runTest {
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+        viewModel.startCall()
+        val first = FakeBoundCall(initial = CallState.InCall)
+        launcher.connect(first)
+        dispatcher.scheduler.advanceUntilIdle()
+        first.emit(CallState.Ended(EndReason.USER_HUNG_UP))
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.dismiss()
+
+        viewModel.startCall()
+        val second = FakeBoundCall(initial = CallState.InCall)
+        launcher.connect(second)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        // The first call's collectors must have been replaced, not merely
+        // shadowed — a stray toggle on the released call must not reach
+        // state that is now describing `second`.
+        first.toggleMute()
+        dispatcher.scheduler.advanceUntilIdle()
+        assertFalse(viewModel.state.value.muted)
+
+        second.toggleMute()
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(viewModel.state.value.muted)
+    }
+
+    @Test
+    fun `rebinding to an already-running call reflects its current mute and speaker state`() = runTest {
+        // The scenario CallViewModel's reconciliation-on-creation exists for:
+        // the merchant left HelpScreen mid-call (destroying the old ViewModel
+        // and its collectors), muted or switched to speaker from the
+        // notification while away, then came back. The new ViewModel's init
+        // reconnaissance bind must pick up the call's *current* state, not
+        // the defaults a freshly bound call would otherwise imply.
+        val launcher = FakeVoiceCallLauncher()
+        val viewModel = newViewModel(launcher)
+
+        val call = FakeBoundCall(initial = CallState.InCall)
+        call.toggleMute()
+        call.toggleSpeaker()
+        launcher.connect(call)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.state.value.muted)
+        assertTrue(viewModel.state.value.speakerOn)
     }
 
     // ---------------------------------------------------------------
@@ -673,8 +1033,17 @@ class CallViewModelTest {
     private fun proceed() =
         CallPermissionDecision(CallPermissionOutcome.PROCEED, notificationsGranted = true)
 
-    private fun newViewModel(launcher: VoiceCallLauncher) =
-        CallViewModel(newAppStateManager(), launcher)
+    private fun newViewModel(launcher: VoiceCallLauncher, callLiveness: CallLivenessObserver = newLivenessObserver()) =
+        CallViewModel(newAppStateManager(), launcher, callLiveness)
+
+    /**
+     * A real [CallLivenessObserver] on the test dispatcher: its collector must
+     * be driven by the same scheduler as the ViewModel's own, so
+     * `advanceUntilIdle()` settles both. Process-lifetime in production; here
+     * one per test.
+     */
+    private fun newLivenessObserver(signal: CallActivitySignal = CallActivitySignal()) =
+        CallLivenessObserver(signal, CoroutineScope(SupervisorJob() + dispatcher))
 
     /**
      * A real [AppStateManager], built through the same `@Inject` constructor
@@ -762,19 +1131,54 @@ internal class FakeVoiceCallLauncher : VoiceCallLauncher {
     }
 }
 
-/** A [BoundCall] whose state the test drives directly. */
+/**
+ * A [BoundCall] whose state the test drives directly.
+ *
+ * [toggleMute]/[toggleSpeaker] actually flip [muted]/[audioRoute] — mirroring
+ * [VoiceCallCoordinator][com.vyaparpay.voice.service.VoiceCallCoordinator]'s
+ * real toggle behavior, not just recording that a call happened — because the
+ * ViewModel tests that matter here are round-trip ones: tap the control,
+ * observe the resulting [CallUiState].
+ */
 internal class FakeBoundCall(initial: CallState = CallState.Requesting) : BoundCall {
 
     private val _state = MutableStateFlow(initial)
     override val state: StateFlow<CallState> = _state
 
+    /** Live collectors of [state] -- how many things are watching this call right now. */
+    val stateSubscriptionCount: Int get() = _state.subscriptionCount.value
+
     override var contextFramesDropped: Long = 0L
+
+    override val inCallSinceMillis = MutableStateFlow<Long?>(null)
+
+    private val _muted = MutableStateFlow(false)
+    override val muted: StateFlow<Boolean> = _muted
+
+    private val _audioRoute = MutableStateFlow(AudioRoute.EARPIECE)
+    override val audioRoute: StateFlow<AudioRoute> = _audioRoute
 
     var hangUpCount: Int = 0
         private set
 
+    var toggleMuteCount: Int = 0
+        private set
+
+    var toggleSpeakerCount: Int = 0
+        private set
+
     override fun hangUp() {
         hangUpCount++
+    }
+
+    override fun toggleMute() {
+        toggleMuteCount++
+        _muted.value = !_muted.value
+    }
+
+    override fun toggleSpeaker() {
+        toggleSpeakerCount++
+        _audioRoute.value = if (_audioRoute.value == AudioRoute.SPEAKER) AudioRoute.EARPIECE else AudioRoute.SPEAKER
     }
 
     fun emit(next: CallState) {

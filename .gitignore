@@ -55,3 +55,6 @@ infra/docker/volumes/
 # ignore-contents-not-marker shape as the .env.* / !.env.example pair).
 backend/app/voice/models/*
 !backend/app/voice/models/.gitkeep
+
+# Git-Bash (msys) crash dumps -- a local artifact that was accidentally tracked until 2026-08-17
+*.stackdump

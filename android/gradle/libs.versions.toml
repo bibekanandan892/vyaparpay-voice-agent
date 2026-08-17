@@ -94,6 +94,10 @@ androidx-navigation-runtime = { module = "androidx.navigation:navigation-runtime
 androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
 androidx-compose-foundation = { module = "androidx.compose.foundation:foundation" }
 androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
+# Mic/MicOff/VolumeUp/VolumeOff/CallEnd for CallScreen's controls — R8 strips
+# every icon this module doesn't actually reference, so this is preferred
+# over hand-drawing vectors for the handful this app uses.
+androidx-compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
 androidx-compose-ui = { module = "androidx.compose.ui:ui" }
 # UiTreeCollector's own dependency, not a UI-authoring one: RootForTest,
 # SemanticsNode/SemanticsOwner/SemanticsProperties live in `ui`;

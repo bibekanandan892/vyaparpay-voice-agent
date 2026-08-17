@@ -85,7 +85,10 @@ class CallViewModelSessionBodyTest {
         collector.attachRoot(root)
 
         val launcher = FakeVoiceCallLauncher()
-        CallViewModel(appState, launcher).startCall()
+        // The observer is never reached here (the fake launcher never
+        // connects), so the same Unconfined scope serves; nothing about the
+        // session body depends on it.
+        CallViewModel(appState, launcher, CallLivenessObserver(CallActivitySignal(), scope)).startCall()
 
         val sent = Json.decodeFromString(SessionCreateRequestDto.serializer(), launcher.started.single())
 

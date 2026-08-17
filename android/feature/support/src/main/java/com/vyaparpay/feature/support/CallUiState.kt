@@ -59,12 +59,26 @@ public enum class CallNotice {
  *   its intended consumer). Surfaced because `:voice` carries no logger, so a
  *   silently blind agent would otherwise be invisible; non-zero after a call
  *   means part of it was spent reasoning about a stale screen.
+ * @param muted the effective mute state (`VoiceCallCoordinator.muted`) —
+ *   already reconciles a user mute against focus-driven auto-mute, so this
+ *   is exactly what a mute button's pressed/unpressed state should render.
+ * @param speakerOn whether the requested route is speaker rather than
+ *   earpiece (`VoiceCallCoordinator.audioRoute == AudioRoute.SPEAKER`, folded
+ *   to a `Boolean` here because v1 only offers that one toggle — see
+ *   `VoiceCallCoordinator.toggleSpeaker`'s kdoc).
+ * @param inCallSinceMillis wall-clock time the call first connected
+ *   (`CallController.inCallSinceMillis`), or `null` before that — the anchor
+ *   an elapsed-call timer renders against. Not cleared on end, matching
+ *   [contextFramesDropped]: a finished call's duration stays interesting.
  */
 public data class CallUiState(
     val phase: CallPhase = CallPhase.IDLE,
     val endReason: EndReason? = null,
     val notice: CallNotice? = null,
     val contextFramesDropped: Long = 0L,
+    val muted: Boolean = false,
+    val speakerOn: Boolean = false,
+    val inCallSinceMillis: Long? = null,
 ) {
     /** Whether there is anything at all to draw — [CallPhase.IDLE] with no [notice] draws nothing. */
     public val isVisible: Boolean get() = phase != CallPhase.IDLE || notice != null
@@ -74,6 +88,18 @@ public data class CallUiState(
         CallPhase.CONNECTING, CallPhase.IN_CALL, CallPhase.RECONNECTING -> true
         CallPhase.IDLE, CallPhase.ENDED -> false
     }
+
+    /**
+     * Whether [CallSurface] should show the full [CallScreen] instead of the
+     * [CallStatusPanel] banner.
+     *
+     * Aliases [canHangUp] rather than repeating its exhaustive `when`: the
+     * two questions ("can the merchant hang up" vs "which surface renders")
+     * happen to share an answer for every [CallPhase] today, and this
+     * codebase's own YAGNI convention says not to carry a second copy of the
+     * same branch on the speculation that they might diverge later.
+     */
+    public val isFullScreenCall: Boolean get() = canHangUp
 }
 
 /** [CallState] -> [CallPhase]. Exhaustive `when`, so a new `CallState` member fails compilation here rather than falling into a wrong bucket. */

@@ -219,6 +219,7 @@ public class VoiceCallService : LifecycleService() {
                 hangUp = newController::hangUp,
                 onForegroundServiceRequired = ::promoteToForeground,
                 onCallEnded = ::stopSelf,
+                inCallSinceMillis = { newController.inCallSinceMillis.value },
             )
         } catch (error: Throwable) {
             // HIGH fix (independent review of c767074): WebRtcClientFactory
@@ -339,6 +340,17 @@ public class VoiceCallService : LifecycleService() {
     /** Exposes the call for a future `:feature:support` bound client (docs/03 §3.12's `CallViewModel`). */
     public inner class LocalBinder : Binder() {
         public val callController: CallController? get() = controller
+
+        /**
+         * The mute/speaker policy brain, alongside [callController] — a bound
+         * UI needs both: the controller for call state and hang-up, the
+         * coordinator for [VoiceCallCoordinator.toggleMute]/[VoiceCallCoordinator.toggleSpeaker]
+         * and their observable [VoiceCallCoordinator.muted]/[VoiceCallCoordinator.audioRoute]
+         * flows. Calling [CallController.setMuted] directly instead would
+         * desync from the coordinator's own `userMuted`/`autoMuted`
+         * reconciliation — see that class's kdoc.
+         */
+        public val callCoordinator: VoiceCallCoordinator? get() = coordinator
     }
 
     public companion object {

@@ -7,6 +7,7 @@ import com.vyaparpay.core.network.SessionCreateRequestDto
 import com.vyaparpay.core.screencontext.AppStateManager
 import com.vyaparpay.voice.CallState
 import com.vyaparpay.voice.EndReason
+import com.vyaparpay.voice.audio.AudioRoute
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -15,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -89,6 +91,7 @@ import kotlinx.serialization.json.Json
 public class CallViewModel internal constructor(
     private val appState: AppStateManager,
     private val launcher: VoiceCallLauncher,
+    private val callLiveness: CallLivenessObserver,
 ) : ViewModel() {
 
     /**
@@ -96,7 +99,9 @@ public class CallViewModel internal constructor(
      * primary constructor takes the testable seam, and this one adapts the
      * graph to it. [AppStateManager] is a `@Singleton` with its own `@Inject`
      * constructor, so Hilt builds it (and the capture pipeline beneath it)
-     * without a module here.
+     * without a module here. [CallLivenessObserver] is likewise a
+     * `@Singleton` with its own `@Inject` constructor (which takes the
+     * `@Singleton` [CallActivitySignal] `:app`'s chip reads).
      *
      * `@ApplicationContext`, never an `Activity` context: [AndroidVoiceCallLauncher]
      * holds it for the life of the binding, which deliberately outlives the
@@ -106,7 +111,8 @@ public class CallViewModel internal constructor(
     public constructor(
         appState: AppStateManager,
         @ApplicationContext context: Context,
-    ) : this(appState, AndroidVoiceCallLauncher(context))
+        callLiveness: CallLivenessObserver,
+    ) : this(appState, AndroidVoiceCallLauncher(context), callLiveness)
 
     private val _state = MutableStateFlow(CallUiState())
     public val state: StateFlow<CallUiState> = _state.asStateFlow()
@@ -116,6 +122,9 @@ public class CallViewModel internal constructor(
 
     /** Collects [BoundCall.state]; replaced on rebind, cancelled on unbind. */
     private var stateJob: Job? = null
+
+    /** Collects [BoundCall.muted]/[BoundCall.audioRoute]; replaced on rebind, cancelled on unbind. */
+    private var controlsJob: Job? = null
 
     /**
      * A hang-up that arrived before the binding did.
@@ -147,14 +156,14 @@ public class CallViewModel internal constructor(
      * [launcher] `bind` can invoke [onBound] *synchronously*: the MEDIUM fix
      * in [AndroidVoiceCallLauncher.bind] reports `onBound(null)` inline when
      * `bindService` refuses. So this constructor can reach [onBound] — and
-     * through it write [call], [stateJob], [pendingHangUp] and
+     * through it write [call], [stateJob], [controlsJob], [pendingHangUp] and
      * [attachAttemptsLeft] — before construction finishes. Every one of those
      * declarations must therefore be *above* this block, or its initializer
      * would run afterwards and silently overwrite what the callback just
      * wrote.
      *
      * That hazard is currently masked: Kotlin elides initializers that only
-     * store a JVM default (`null`/`false`/`0`), which is what all four happen
+     * store a JVM default (`null`/`false`/`0`), which is what all five happen
      * to be, so a disassembly of this constructor shows no such writes today.
      * Masked is not fixed — giving any of those fields a non-default initial
      * value, or adding a new field [onBound] touches, brings the clobber
@@ -169,6 +178,14 @@ public class CallViewModel internal constructor(
      * The service is bound-only throughout — never started — so no
      * foreground-service obligations attach (`VoiceCallService` only takes
      * those on through `ACTION_START`).
+     *
+     * This ViewModel does **not** publish "is a call live" itself. It used
+     * to (a `state.collect` here fed [CallActivitySignal]), and that was the
+     * bug: the publisher died with the ViewModel, so a call ending while the
+     * merchant was on another screen left the "Return to call" chip offered
+     * indefinitely. [onBound] now hands the bound call's own state flow to
+     * [callLiveness], a process-lifetime observer that publishes until the
+     * call itself ends — see [CallLivenessObserver]'s kdoc for the design.
      */
     init {
         launcher.bind(onBound = ::onBound, onUnbound = ::onUnbound)
@@ -210,7 +227,19 @@ public class CallViewModel internal constructor(
 
         val request = appState.sessionCreateBody(DEMO_USER_ID)
         attachAttemptsLeft = CONTROLLER_ATTACH_ATTEMPTS
-        _state.update { it.copy(phase = CallPhase.CONNECTING, endReason = null, contextFramesDropped = 0L) }
+        // A fresh attempt must not show the previous call's leftovers: a
+        // stale "muted"/"speaker on" from before hang-up, or an elapsed-time
+        // anchor pointing at a call that already ended.
+        _state.update {
+            it.copy(
+                phase = CallPhase.CONNECTING,
+                endReason = null,
+                contextFramesDropped = 0L,
+                muted = false,
+                speakerOn = false,
+                inCallSinceMillis = null,
+            )
+        }
 
         // Default Json configuration on purpose: VoiceCallService.decodeSessionRequest
         // decodes with a bare `Json`, and the two must agree.
@@ -304,6 +333,31 @@ public class CallViewModel internal constructor(
         bound.hangUp()
     }
 
+    /**
+     * The merchant tapped Mute/Unmute.
+     *
+     * Unlike [hangUp], a tap that arrives before the binding connects is
+     * simply dropped rather than queued. The window is real but tiny and
+     * self-evident: `CallScreen` (mute/speaker included) mounts the instant
+     * [startCall] flips the phase to [CallPhase.CONNECTING], and [call] is
+     * bound one `bindService` round-trip later — tens of milliseconds, in
+     * which the merchant has just lifted their finger from "Call Support".
+     * [hangUp] queues because a hang-up must never be lost (`pendingHangUp`'s
+     * kdoc); a lost mute tap costs nothing and lies about nothing — the
+     * button renders the coordinator's *actual* `muted` flow, so a dropped
+     * tap is a button that visibly did not change, and the next tap works.
+     * A pending-toggle mechanism would be complexity for a case that
+     * corrects itself on the merchant's next glance.
+     */
+    internal fun toggleMute() {
+        call?.toggleMute()
+    }
+
+    /** The merchant tapped Speaker. Same "no pending queue" reasoning as [toggleMute]. */
+    internal fun toggleSpeaker() {
+        call?.toggleSpeaker()
+    }
+
     /** Dismiss a terminal call summary or a permission notice, returning the surface to nothing. */
     internal fun dismiss() {
         if (_state.value.canHangUp) return
@@ -323,10 +377,67 @@ public class CallViewModel internal constructor(
             bound.hangUp()
         }
 
+        // Hand the call's own state flow to the process-lifetime observer:
+        // from here on the "Return to call" chip tracks the call itself, not
+        // this ViewModel's lifetime (CallLivenessObserver's kdoc). Order
+        // relative to the collectors below is not load-bearing -- track()
+        // takes the flow reference and touches none of this class's fields,
+        // and releaseBinding never touches the observer -- it simply reads
+        // better to register the outliving observer first.
+        //
+        // Known narrow gap: track() only runs from here, i.e. once a bind
+        // has produced a controller. A ViewModel cleared between startCall()
+        // and its first controller-bearing onServiceConnected (or during
+        // handleControllerlessBinding's short retry gap) leaves that call
+        // running with the signal still false, so no chip until the next
+        // ViewModel's reconnaissance bind hands the call over. That is a
+        // sub-second window right after "Call Support" is tapped, and it
+        // self-heals on the next visit to Support; accepted.
+        callLiveness.track(bound.state)
+
+        // Reentrancy hazard: viewModelScope runs on Dispatchers.Main.immediate,
+        // and StateFlow.collect delivers its current value synchronously
+        // before ever suspending. If `bound.state.value` is already a
+        // terminal CallState.Ended the moment we bind to it — reachable via
+        // handleControllerlessBinding's retry loop racing a fast
+        // session-mint failure — the launch{} below runs onCallStateChanged
+        // synchronously, which calls releaseBinding() and nulls `call`,
+        // `stateJob`, `controlsJob` *before* this statement's own
+        // `stateJob = ...` assignment completes. That outer assignment then
+        // clobbers the null releaseBinding just wrote, leaving a live,
+        // never-cancelled Job collecting a call this ViewModel no longer
+        // references. Checking `call !== bound` afterwards detects exactly
+        // that reentrant release and cancels the orphaned job — a normal
+        // (non-terminal) bind leaves `call` unchanged, so the check is a
+        // no-op there.
         stateJob?.cancel()
         stateJob = viewModelScope.launch {
             bound.state.collect { callState -> onCallStateChanged(bound, callState) }
         }
+        if (call !== bound) stateJob?.cancel()
+
+        // A second, independent collector: muted/audioRoute change on their
+        // own schedule (a focus-loss auto-mute, a mid-call speaker tap), not
+        // in lockstep with CallState transitions, so folding them into
+        // onCallStateChanged would miss every update that isn't also a phase
+        // change. inCallSinceMillis rides here too, and for a related
+        // reason: CallController publishes InCall one dispatch-loop turn
+        // BEFORE it stamps the anchor (its own "not atomic with state" kdoc),
+        // so a per-transition snapshot in onCallStateChanged could read null
+        // and never look again -- a bare "Connected" with no timer for the
+        // whole call. Collecting the flow means the stamp lands whenever it
+        // lands. Same reentrancy hazard as stateJob above, same guard.
+        controlsJob?.cancel()
+        controlsJob = viewModelScope.launch {
+            combine(bound.muted, bound.audioRoute, bound.inCallSinceMillis) { muted, route, since ->
+                Triple(muted, route, since)
+            }.collect { (muted, route, since) ->
+                _state.update {
+                    it.copy(muted = muted, speakerOn = route == AudioRoute.SPEAKER, inCallSinceMillis = since)
+                }
+            }
+        }
+        if (call !== bound) controlsJob?.cancel()
     }
 
     /**
@@ -400,6 +511,10 @@ public class CallViewModel internal constructor(
                 // cheap enough to refresh on every transition, and the value is
                 // only meaningful once frames have actually flowed.
                 contextFramesDropped = bound.contextFramesDropped,
+                // inCallSinceMillis is deliberately NOT snapshotted here --
+                // it is collected by controlsJob (see onBound) because the
+                // controller stamps it one dispatch-loop turn AFTER
+                // publishing InCall.
             )
         }
 
@@ -429,6 +544,8 @@ public class CallViewModel internal constructor(
     private fun releaseBinding() {
         stateJob?.cancel()
         stateJob = null
+        controlsJob?.cancel()
+        controlsJob = null
         call = null
         pendingHangUp = false
         attachAttemptsLeft = 0

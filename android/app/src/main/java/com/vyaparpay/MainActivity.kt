@@ -5,16 +5,26 @@ import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.node.RootForTest
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.vyaparpay.core.analytics.EventTracker
 import com.vyaparpay.core.screencontext.NavigationTracker
 import com.vyaparpay.core.screencontext.UiTreeCollector
 import com.vyaparpay.core.ui.theme.VyaparTheme
+import com.vyaparpay.feature.support.CallActivitySignal
 import com.vyaparpay.navigation.AppNavHost
+import com.vyaparpay.navigation.AppRoute
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 
@@ -137,6 +147,21 @@ import javax.inject.Inject
  *    trade a mechanism proven by [MainActivityScreenContextTest] for one that
  *    has to re-derive the same answer through a process-wide query — no gain,
  *    real risk.
+ *
+ * 8. **[ReturnToCallChip] is composed here, wrapping `AppNavHost` in a `Box`,
+ *    for the same reason the `NavHostController` is hoisted here (judgment
+ *    call 3).** `SupportButton`'s own kdoc names this exact composition root
+ *    as the one place a floating, always-available affordance can live above
+ *    every operational screen — this activity does not own any part of
+ *    driving the call (that stays `:feature:support`'s job via
+ *    `CallViewModel`); it only reads [CallActivitySignal.isCallLive], a
+ *    `@Singleton` whose sole writer is `:feature:support`'s
+ *    `CallLivenessObserver` (a process-lifetime collector of the call's
+ *    own state, so it stays right after `CallViewModel` is destroyed), and the current
+ *    route off the same `navController` hoisted for judgment call 3. Visible
+ *    whenever a call is live and the merchant is not already on
+ *    `AppRoute.SUPPORT` — showing it there would be a second way back into a
+ *    screen already showing the call.
  */
 @AndroidEntryPoint
 public class MainActivity : ComponentActivity() {
@@ -146,6 +171,12 @@ public class MainActivity : ComponentActivity() {
 
     @Inject
     internal lateinit var navigationTracker: NavigationTracker
+
+    @Inject
+    internal lateinit var callActivitySignal: CallActivitySignal
+
+    @Inject
+    internal lateinit var eventTracker: EventTracker
 
     /**
      * Created eagerly in `onCreate` but only armed once the Compose tree
@@ -172,7 +203,32 @@ public class MainActivity : ComponentActivity() {
             }
             VyaparTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppNavHost(navController = navController)
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        AppNavHost(navController = navController)
+
+                        val isCallLive by callActivitySignal.isCallLive.collectAsStateWithLifecycle()
+                        val currentRoute = navController.currentBackStackEntryAsState().value
+                            ?.destination?.route
+                        if (shouldShowReturnToCallChip(isCallLive, currentRoute)) {
+                            ReturnToCallChip(
+                                events = eventTracker,
+                                // launchSingleTop: the chip hides on SUPPORT,
+                                // but currentBackStackEntryAsState updates a
+                                // frame after navigate(), so a fast double-tap
+                                // would otherwise push SUPPORT twice -- two
+                                // CallViewModels, two service bindings, and a
+                                // Back that lands on a second Help screen.
+                                onClick = {
+                                    navController.navigate(AppRoute.SUPPORT.route) {
+                                        launchSingleTop = true
+                                    }
+                                },
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(bottom = 24.dp),
+                            )
+                        }
+                    }
                 }
             }
         }

@@ -2,13 +2,17 @@ package com.vyaparpay.voice.service
 
 import com.vyaparpay.voice.CallState
 import com.vyaparpay.voice.audio.AudioFocusChange
+import com.vyaparpay.voice.audio.AudioRoute
 import com.vyaparpay.voice.audio.CallAudioSession
 import com.vyaparpay.voice.notification.CallNotificationPhase
 import com.vyaparpay.voice.notification.CallNotificationState
 import com.vyaparpay.voice.notification.CallNotifier
 import com.vyaparpay.voice.requiresForegroundService
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -52,6 +56,16 @@ public class VoiceCallCoordinator(
     private val hangUp: () -> Unit,
     private val onForegroundServiceRequired: () -> Unit,
     private val onCallEnded: () -> Unit,
+    /**
+     * `CallController.inCallSinceMillis`, read fresh on every notification
+     * push rather than passed once — a plain lambda, not a `CallController`
+     * reference, so this class stays framework/`CallController`-free the same
+     * way [callState] is handed in as a bare `StateFlow` rather than the
+     * controller that owns it. Defaults to `{ null }` so every existing
+     * caller/test that does not care about the notification's duration
+     * (docs/03 §3.3) is unaffected.
+     */
+    private val inCallSinceMillis: () -> Long? = { null },
 ) {
 
     // Not @Volatile: safety comes from confinement to `scope` (see the
@@ -63,8 +77,51 @@ public class VoiceCallCoordinator(
     private var autoMuted: Boolean = false
     private var everForegrounded: Boolean = false
 
-    /** Begin driving policy off [callState] and [CallAudioSession.focusChanges]. Call once. */
+    private val _muted = MutableStateFlow(false)
+
+    /**
+     * The effective mute state (`userMuted || autoMuted`) a bound UI renders
+     * a mute button against — the same value [applyMuteState] already pushes
+     * into the notification, made observable for an in-app control too.
+     */
+    public val muted: StateFlow<Boolean> = _muted.asStateFlow()
+
+    private val _audioRoute = MutableStateFlow(AudioRoute.EARPIECE)
+
+    /**
+     * The last route this class *asked for* via [CallAudioSession.setRoute],
+     * not a confirmed hardware state — [AndroidCallAudioSession]'s modern
+     * path silently no-ops when a device type is absent (e.g. no earpiece on
+     * a tablet), and there is no callback that reports the real outcome. Good
+     * enough for a toggle button's pressed/unpressed state; not a promise
+     * that audio is actually coming out of that path.
+     *
+     * Defaults to [AudioRoute.EARPIECE] because that is what
+     * [CallAudioSession.acquire] hard-sets the moment the call takes audio
+     * focus (see [collectCallState]) — true from the start of every call,
+     * not a guess.
+     */
+    public val audioRoute: StateFlow<AudioRoute> = _audioRoute.asStateFlow()
+
+    private val started = AtomicBoolean(false)
+
+    /**
+     * Begin driving policy off [callState] and [CallAudioSession.focusChanges].
+     *
+     * **Idempotent — a second call is a no-op.** `VoiceCallService.handleStart`
+     * has only ever called this once, but `VoiceCallService.LocalBinder` now
+     * also hands out this instance directly to any bound client, so a
+     * mistaken second [start] from that side must not double the collectors
+     * — that would double `audioSession.acquire()`, double every
+     * notification push, and fire `onForegroundServiceRequired`/`onCallEnded`
+     * more than once. Guarded with [AtomicBoolean.compareAndSet] rather than
+     * dispatching the check onto [scope] like every other mutation here (see
+     * the threading contract above): this is the one entry point that must
+     * decide *before* anything is dispatched onto `scope`, so it has to work
+     * correctly from whichever thread calls it, not from `scope` itself.
+     */
     public fun start() {
+        if (!started.compareAndSet(false, true)) return
         scope.launch { collectCallState() }
         scope.launch { collectFocusChanges() }
     }
@@ -85,6 +142,24 @@ public class VoiceCallCoordinator(
         scope.launch {
             userMuted = !userMuted
             applyMuteState()
+        }
+    }
+
+    /**
+     * The user tapped the in-app speaker control. Earpiece <-> speaker only
+     * (v1 scope, per docs/06 §6.5's earpiece-default rationale) — Bluetooth
+     * is a separate, unrouted device the platform picks on its own, not a
+     * third position this toggle cycles through.
+     *
+     * Dispatched onto [scope] like [toggleMute], for the same reason: the
+     * caller may be on the service's main thread, and [CallAudioSession] has
+     * no threading contract of its own to lean on.
+     */
+    public fun toggleSpeaker() {
+        scope.launch {
+            val next = if (_audioRoute.value == AudioRoute.SPEAKER) AudioRoute.EARPIECE else AudioRoute.SPEAKER
+            audioSession.setRoute(next)
+            _audioRoute.value = next
         }
     }
 
@@ -146,13 +221,25 @@ public class VoiceCallCoordinator(
     }
 
     private fun applyMuteState() {
-        setMuted(userMuted || autoMuted)
+        val effective = userMuted || autoMuted
+        setMuted(effective)
+        _muted.value = effective
         pushNotification()
     }
 
     private fun pushNotification() {
         val phase = currentPhase ?: return
-        notifier.show(CallNotificationState(phase = phase, muted = userMuted || autoMuted))
+        notifier.show(
+            CallNotificationState(
+                phase = phase,
+                muted = userMuted || autoMuted,
+                // Read fresh each push (including every mute-driven push —
+                // applyMuteState() calls this too) rather than cached once,
+                // so a mute toggle mid-call carries the same stable anchor
+                // forward instead of momentarily dropping/resetting it.
+                inCallSinceMillis = inCallSinceMillis(),
+            ),
+        )
     }
 }
 
