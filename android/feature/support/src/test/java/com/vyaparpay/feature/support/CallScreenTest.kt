@@ -2,6 +2,9 @@ package com.vyaparpay.feature.support
 
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -203,6 +206,48 @@ class CallScreenTest {
     @Test
     fun `formatElapsed handles a long call past an hour of seconds`() {
         assertEquals("61:05", formatElapsed(3_665L))
+    }
+
+    @Test
+    fun `a notifications-denied notice is shown DURING the call, not only after it`() {
+        // Regression (verification audit, 2026-08-17): PROCEED with
+        // notifications denied sets notice=NOTIFICATIONS_DENIED on the way
+        // into startCall; the old banner rendered it alongside the live
+        // phase, but this screen dropped it, so it surfaced only after
+        // "Call ended", where it meant nothing.
+        composeTestRule.setContent {
+            Screen(CallUiState(phase = CallPhase.CONNECTING, notice = CallNotice.NOTIFICATIONS_DENIED))
+        }
+
+        composeTestRule.onNodeWithTag(CALL_SCREEN_NOTICE_TEST_TAG).assertIsDisplayed()
+        composeTestRule.onNodeWithText("Notifications are off", substring = true).assertIsDisplayed()
+    }
+
+    @Test
+    fun `no notice line is composed when there is nothing to say`() {
+        composeTestRule.setContent { Screen(CallUiState(phase = CallPhase.IN_CALL)) }
+
+        composeTestRule.onNodeWithTag(CALL_SCREEN_NOTICE_TEST_TAG).assertDoesNotExist()
+    }
+
+    @Test
+    fun `the speaker toggle exposes its on-off state to accessibility services`() {
+        // Mute conveys state through its label flip; Speaker's label is
+        // constant, so it must carry a stateDescription or TalkBack reads
+        // "Speaker, Button" in both states.
+        val speakerOn = androidx.compose.runtime.mutableStateOf(false)
+        composeTestRule.setContent {
+            Screen(CallUiState(phase = CallPhase.IN_CALL, speakerOn = speakerOn.value))
+        }
+
+        composeTestRule.onNodeWithTag(CALL_SPEAKER_TOGGLE_TEST_TAG)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "Off"))
+
+        speakerOn.value = true
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag(CALL_SPEAKER_TOGGLE_TEST_TAG)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "On"))
     }
 
     @Composable

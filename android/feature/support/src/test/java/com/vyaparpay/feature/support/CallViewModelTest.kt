@@ -989,19 +989,24 @@ class CallViewModelTest {
 
     @Test
     fun `a dead service process ends the call rather than leaving a spinner`() = runTest {
-        // docs/03 §7: end the call honestly, never fake a live one.
+        // docs/03 §7: end the call honestly, never fake a live one -- and
+        // the return-to-call signal with it: the observer's flow will
+        // never reach Ended by itself once the service is gone.
+        val signal = CallActivitySignal()
         val launcher = FakeVoiceCallLauncher()
-        val viewModel = newViewModel(launcher)
+        val viewModel = newViewModel(launcher, newLivenessObserver(signal))
         viewModel.startCall()
         val call = FakeBoundCall()
         launcher.connect(call)
         dispatcher.scheduler.advanceUntilIdle()
         call.emit(CallState.InCall)
         dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(signal.isCallLive.value)
 
         launcher.disconnect()
         dispatcher.scheduler.advanceUntilIdle()
 
+        assertFalse("the chip must not outlive a dead service", signal.isCallLive.value)
         assertEquals(CallPhase.ENDED, viewModel.state.value.phase)
         assertFalse(launcher.isBound)
     }

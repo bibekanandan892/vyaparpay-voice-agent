@@ -182,14 +182,34 @@ def setup_observability(settings: Settings, *, exporter: SpanExporter | None = N
     Tests inject an `InMemorySpanExporter` here to assert on real exported
     spans instead of just "did this not raise" (`tests/obs/test_tracing.py`).
 
-    Shuts down whatever `TracerProvider` is currently installed FIRST
+    **Retires the provider it replaces, and never leaks the one it built**
     (test-suite thread-leak fix, discovered auditing an intermittent full-
-    suite stall): each call below constructs a fresh `BatchSpanProcessor`,
-    which starts its own background worker thread, and nothing was ever
-    stopping the PREVIOUS one. Production calls this exactly once per
-    process (this function's own "call once at startup" contract) so
-    `trace.get_tracer_provider()` returns the no-op default there and this
-    is a harmless no-op (`ProxyTracerProvider` has no `shutdown`). Several
+    suite stall, corrected 2026-08-17): each call below constructs a fresh
+    `BatchSpanProcessor`, which starts its own background worker thread,
+    and nothing was ever stopping the PREVIOUS one. The first version of
+    this fix shut down "whatever is currently installed" BEFORE building
+    the new provider — which is wrong under `opentelemetry.trace`'s
+    set-ONCE global: when the `Once()` guard has already fired (nobody
+    reset it), the new provider's install is silently refused, so that
+    version killed the still-installed provider (spans stop exporting)
+    and then leaked the new provider's thread instead. Now: build, try to
+    install, and only THEN retire — the previously-installed provider
+    when the install succeeded, or the just-built orphan when it was
+    refused. Deliberately NOT retired: a provider that a caller has
+    already unhooked by resetting opentelemetry's globals (`tests/obs`'s
+    fixtures, `tests/api/test_middleware.py`, ...). Whoever resets the
+    globals owns that provider — and must, because `tests/conftest.py`'s
+    session-wide provider is exactly such an unhooked-but-live object:
+    every module-level `tracer = get_tracer(__name__)` cached its real
+    tracer against it on first use and keeps exporting through it for the
+    whole session (see that fixture's docstring). Retiring "whatever this
+    function last installed" would shut that provider down the first
+    time any later test installed its own, and every span opened by a
+    cached module tracer would silently vanish for the rest of the run.
+    Production calls this exactly once per process (this function's own
+    "call once at startup" contract), so all of that is a no-op there:
+    `trace.get_tracer_provider()` returns the no-op default
+    (`ProxyTracerProvider` has no `shutdown`) and the install succeeds. Several
     test files deliberately call this more than once per session on
     purpose — `tests/obs/test_tracing.py` tests this function itself
     under different settings, `tests/api/test_middleware.py`,
@@ -206,11 +226,6 @@ def setup_observability(settings: Settings, *, exporter: SpanExporter | None = N
     leak) — cheap, safe insurance either way, since a provider this
     function is about to replace has no further use once replaced.
     """
-    current_provider = trace.get_tracer_provider()
-    shutdown_current = getattr(current_provider, "shutdown", None)
-    if callable(shutdown_current):
-        shutdown_current()
-
     resolved_exporter = exporter if exporter is not None else (
         OTLPSpanExporter(endpoint=settings.otel_exporter_otlp_endpoint)
         if settings.otel_exporter_otlp_endpoint
@@ -225,7 +240,24 @@ def setup_observability(settings: Settings, *, exporter: SpanExporter | None = N
         resource=Resource.create({"service.name": settings.otel_service_name})
     )
     provider.add_span_processor(BatchSpanProcessor(resolved_exporter))
-    trace.set_tracer_provider(provider)
+
+    previous_global = trace.get_tracer_provider()
+    trace.set_tracer_provider(provider)  # set-once: may be refused (logs a warning)
+
+    if trace.get_tracer_provider() is provider:
+        # Installed. Retire the provider that was globally installed a
+        # moment ago -- a real SDK provider only when nobody reset the
+        # globals (the no-op ProxyTracerProvider has no shutdown). Never
+        # anything the caller already unhooked: see the docstring.
+        shutdown_previous = getattr(previous_global, "shutdown", None)
+        if callable(shutdown_previous):
+            shutdown_previous()
+    else:
+        # Refused by the set-once guard: the previously installed provider
+        # stays live and untouched (spans keep exporting through it), and
+        # the provider we just built -- whose BatchSpanProcessor thread is
+        # already running -- is retired immediately so it cannot leak.
+        provider.shutdown()
 
 
 def get_tracer(name: str) -> trace.Tracer:

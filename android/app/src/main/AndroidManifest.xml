@@ -76,23 +76,27 @@
           DemoAuthInterceptor (:core:network) reads this the same way, off
           <application> rather than a specific component since the OkHttp
           client it decorates is shared by every VyaparApi call, not just
-          VoiceCallService's. Absent or blank = no Authorization header, the
-          exact behavior before this meta-data existed.
+          VoiceCallService's. Absent or blank = no Authorization header.
 
-          Mint one against whatever JWT_SECRET backend/.env actually has:
+          DO NOT put a token here. `${demoBearerToken}` is a manifest
+          placeholder filled by app/build.gradle.kts from the gitignored
+          android/local.properties (`vyaparpay.demoBearerToken=...`) or the
+          VYAPARPAY_DEMO_BEARER_TOKEN environment variable, and is empty
+          otherwise. Mint one against whatever JWT_SECRET backend/.env has:
             python -c "
             import jwt, datetime
             print(jwt.encode(
                 {'sub': 'usr_rajesh01',
-                 'exp': datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=12)},
+                 'exp': datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=7)},
                 '<JWT_SECRET from backend/.env>', algorithm='HS256'))
             "
-          Demo-only: one static token for the process lifetime, no refresh.
-          See DemoAuthInterceptor's own kdoc.
+          and paste it into local.properties, never into this file. Demo-only:
+          one static token for the process lifetime, no refresh. See
+          DemoAuthInterceptor's own kdoc.
         -->
         <meta-data
             android:name="com.vyaparpay.core.network.DEMO_BEARER_TOKEN"
-            android:value="REPLACE_WITH_MINTED_DEMO_JWT" />
+            android:value="${demoBearerToken}" />
 
     </application>
 

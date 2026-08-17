@@ -198,6 +198,21 @@ services:
     # `alembic upgrade head` against one database is a lock-contention bug
     # waiting for a demo audience.
     command: python -m app.voice.run
+    # 75 s, not Docker's default 10 s. `docker compose stop/restart/down`
+    # sends SIGTERM, run.py's graceful shutdown awaits every
+    # CallSession.close(), and close() now waits (never cancels -- PR #71)
+    # for the shielded post-call finalize: up to _CLOSE_TIMEOUT_S +
+    # _FINALIZE_TIMEOUT_S (5 s + 60 s, call_session.py). Docker's default
+    # would SIGKILL the worker 10 s in, mid-write -- the one thing that
+    # shielding exists to prevent, defeated at the process level instead
+    # of the asyncio level (verification audit, 2026-08-17). Sized just
+    # above ONE call's worst-case budget so a wedged finalize still cannot
+    # hold a deploy hostage. Honest limit: SignalingServer.close_all()
+    # closes live calls one at a time, so with N calls in flight at
+    # shutdown the worst case is roughly N x 65 s and later calls can
+    # still be cut short -- acceptable for a demo-scale worker; making
+    # close_all() concurrent is the follow-up if that ever matters.
+    stop_grace_period: 75s
     env_file:
       # Carries the whole Phase-3 voice set: DEEPGRAM_API_KEY,
       # ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID, TURN_SECRET, COTURN_HOST,

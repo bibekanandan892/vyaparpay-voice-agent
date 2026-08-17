@@ -20,6 +20,7 @@ git history — from an earlier version that only asserted "does not raise"):
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 
 import pytest
@@ -120,6 +121,71 @@ def test_setup_observability_no_endpoint_does_not_raise() -> None:
     settings = _settings(otel_exporter_otlp_endpoint=None)
 
     setup_observability(settings)
+
+
+def _otel_worker_thread_ids() -> set[int]:
+    """Idents of live BatchSpanProcessor worker threads (one per un-retired provider)."""
+    return {
+        t.ident for t in threading.enumerate() if t.ident is not None and "OtelBatchSpan" in t.name
+    }
+
+
+def test_a_globals_reset_then_setup_leaves_the_earlier_provider_alive() -> None:
+    """The contract tests/conftest.py's session-wide provider depends on:
+    a provider that a caller unhooked by resetting opentelemetry's set-once
+    globals is NOT retired by the next setup_observability -- module-level
+    tracers cached against it (ProxyTracer._real_tracer) must keep
+    exporting for the rest of the process. Whoever resets the globals owns
+    the shutdown (every fixture in this suite that resets them does)."""
+    settings = _settings(otel_exporter_otlp_endpoint=None)
+    baseline_threads = _otel_worker_thread_ids()  # other test files may have left providers alive
+    first_exporter = InMemorySpanExporter()
+    setup_observability(settings, exporter=first_exporter)
+    first = otel_trace.get_tracer_provider()
+    # Resolves against `first` on first use and stays cached there.
+    cached_tracer = otel_trace.get_tracer("module.level.tracer")
+    with cached_tracer.start_as_current_span("before.reset"):
+        pass
+
+    otel_trace._TRACER_PROVIDER = None  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE = Once()  # type: ignore[attr-defined]
+    setup_observability(settings, exporter=InMemorySpanExporter())
+    assert otel_trace.get_tracer_provider() is not first
+
+    with cached_tracer.start_as_current_span("after.reset"):
+        pass
+    first.force_flush()
+    exported = [span.name for span in first_exporter.get_finished_spans()]
+    assert exported == ["before.reset", "after.reset"], (
+        "the earlier provider was retired out from under tracers still cached against it"
+    )
+    # Both providers alive (the fixture retires both at teardown) -- measured
+    # relative to the baseline, since sibling test files may leave their own.
+    assert len(_otel_worker_thread_ids() - baseline_threads) == 2
+
+
+def test_second_setup_without_a_globals_reset_keeps_the_live_provider_and_leaks_nothing() -> None:
+    """The set-once guard refuses the second install. The pre-2026-08-17
+    version shut the INSTALLED provider down first (spans silently stopped
+    exporting) and then leaked the refused provider's worker thread. Now
+    the installed provider is left untouched and still exporting, and the
+    orphan is retired on the spot -- exactly one worker thread alive."""
+    settings = _settings(otel_exporter_otlp_endpoint=None)
+    first_exporter = InMemorySpanExporter()
+    setup_observability(settings, exporter=first_exporter)
+    first = otel_trace.get_tracer_provider()
+    first_threads = _otel_worker_thread_ids()
+
+    setup_observability(settings, exporter=InMemorySpanExporter())  # refused by set-once
+
+    assert otel_trace.get_tracer_provider() is first
+    assert _otel_worker_thread_ids() == first_threads, (
+        "the refused provider's worker thread leaked, or the live one was stopped"
+    )
+    with otel_trace.get_tracer("probe").start_as_current_span("still.exporting"):
+        pass
+    first.force_flush()
+    assert [span.name for span in first_exporter.get_finished_spans()] == ["still.exporting"]
 
 
 def test_setup_observability_unreachable_endpoint_does_not_raise() -> None:

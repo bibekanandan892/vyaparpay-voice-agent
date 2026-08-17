@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -5,6 +7,27 @@ plugins {
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)
 }
+
+// The demo bearer token the app sends (DemoAuthInterceptor, :core:network)
+// comes from OUTSIDE the tracked tree: `vyaparpay.demoBearerToken` in the
+// gitignored android/local.properties, or the VYAPARPAY_DEMO_BEARER_TOKEN
+// environment variable, else empty (= no Authorization header at all, the
+// interceptor's documented "absent or blank" behaviour). Until 2026-08-17
+// the value lived in AndroidManifest.xml itself behind a REPLACE_WITH_...
+// placeholder that had to be hand-edited before every device run -- which
+// left a live, signed JWT sitting as an uncommitted diff in a TRACKED file,
+// one `git add -A` away from history (flagged CRITICAL by a security
+// review; it was caught before it ever landed, twice). A manifest
+// placeholder moves the secret to where secrets already live here.
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+val demoBearerToken: String = (
+    localProperties.getProperty("vyaparpay.demoBearerToken")
+        ?: System.getenv("VYAPARPAY_DEMO_BEARER_TOKEN")
+        ?: ""
+    ).trim()
 
 android {
     namespace = "com.vyaparpay"
@@ -16,6 +39,7 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.1.0"
+        manifestPlaceholders["demoBearerToken"] = demoBearerToken
     }
 
     compileOptions {
